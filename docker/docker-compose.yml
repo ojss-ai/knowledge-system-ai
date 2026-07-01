@@ -1,0 +1,41 @@
+services:
+  postgres:
+    build: ./postgres
+    environment:
+      POSTGRES_USER: kb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kb_dev_password}
+      POSTGRES_DB: kb
+    ports: ["5432:5432"]
+    volumes: ["./pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kb"]
+      interval: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-kb_dev_password}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_server_memory_heap_initial__size: 512M
+      NEO4J_server_memory_heap_max__size: 1G
+    ports: ["7687:7687", "7474:7474"]
+    volumes: ["./neo4jdata:/data", "./neo4jlogs:/logs"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: kb
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-kb_dev_password}
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["./miniodata:/data"]
