@@ -16,18 +16,24 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def login(payload: LoginIn, db: AsyncSession = Depends(get_db)) -> TokensOut:
     user = await auth_service.authenticate(db, payload.email, payload.password)
     if user is None:
-        raise HTTPException(status_code=401, detail="invalid credentials")  # auth boundary, not domain
+        raise HTTPException(
+            status_code=401, detail="invalid credentials"
+        )  # auth boundary, not domain
     return TokensOut(
         access_token=make_access_token(user.id, user.role.value),
         refresh_token=make_refresh_token(user.id, user.role.value),
     )
 
 
-@router.post("/refresh", response_model=TokensOut, summary="Rotate tokens", operation_id="refreshTokens")
+@router.post(
+    "/refresh", response_model=TokensOut, summary="Rotate tokens", operation_id="refreshTokens"
+)
 async def refresh(payload: RefreshIn) -> TokensOut:
     try:
         claims = decode_token(payload.refresh_token, "refresh")
-    except pyjwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="invalid refresh token")
+    except pyjwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="invalid refresh token") from exc
     uid, role = uuid.UUID(claims["sub"]), claims["role"]
-    return TokensOut(access_token=make_access_token(uid, role), refresh_token=make_refresh_token(uid, role))
+    return TokensOut(
+        access_token=make_access_token(uid, role), refresh_token=make_refresh_token(uid, role)
+    )

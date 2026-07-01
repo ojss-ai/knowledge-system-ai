@@ -9,7 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.db import Base
 
 
-class GroupRole(str, enum.Enum):
+class GroupRole(enum.StrEnum):
     member = "member"
     manager = "manager"
 
@@ -33,4 +33,6 @@ class GroupMember(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
     )
-    role: Mapped[GroupRole] = mapped_column(Enum(GroupRole, name="group_role"), default=GroupRole.member)
+    role: Mapped[GroupRole] = mapped_column(
+        Enum(GroupRole, name="group_role"), default=GroupRole.member
+    )

@@ -21,4 +21,6 @@ class ConflictError(DomainError):
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(DomainError)
     async def domain_error_handler(_: Request, exc: DomainError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": str(exc) or exc.__class__.__name__})
+        return JSONResponse(
+            status_code=exc.status_code, content={"detail": str(exc) or exc.__class__.__name__}
+        )

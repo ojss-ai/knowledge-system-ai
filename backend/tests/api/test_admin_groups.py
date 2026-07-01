@@ -8,17 +8,27 @@ async def _token(client, email, pw):
 
 
 async def test_admin_creates_group_and_adds_member(db, client) -> None:
-    await auth_service.register(db, email="root@x.com", password="rootpw!123", display_name="Root", role=Role.admin)
-    member = await auth_service.register(db, email="m@x.com", password="mpw!12345", display_name="M")
+    await auth_service.register(
+        db, email="root@x.com", password="rootpw!123", display_name="Root", role=Role.admin
+    )
+    member = await auth_service.register(
+        db, email="m@x.com", password="mpw!12345", display_name="M"
+    )
     headers = await _token(client, "root@x.com", "rootpw!123")
 
-    resp = await client.post("/api/v1/admin/groups", headers=headers,
-                             json={"name": "game-team", "description": "Game dev"})
+    resp = await client.post(
+        "/api/v1/admin/groups",
+        headers=headers,
+        json={"name": "game-team", "description": "Game dev"},
+    )
     assert resp.status_code == 201
     gid = resp.json()["id"]
 
-    resp = await client.post(f"/api/v1/admin/groups/{gid}/members", headers=headers,
-                             json={"user_id": str(member.id), "role": "member"})
+    resp = await client.post(
+        f"/api/v1/admin/groups/{gid}/members",
+        headers=headers,
+        json={"user_id": str(member.id), "role": "member"},
+    )
     assert resp.status_code == 204
 
     resp = await client.get(f"/api/v1/admin/groups/{gid}", headers=headers)

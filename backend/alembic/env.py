@@ -1,16 +1,14 @@
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 import app.models  # noqa: F401  (register all tables on Base.metadata)
+from alembic import context
 from app.core.config import settings
 from app.core.db import Base
 
 config = context.config
-config.set_main_option(
-    "sqlalchemy.url", settings.database_url.replace("+asyncpg", "+psycopg")
-)
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("+asyncpg", "+psycopg"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

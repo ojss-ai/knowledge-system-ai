@@ -5,7 +5,9 @@ from app.services import auth_service
 
 
 async def test_register_and_authenticate(db) -> None:
-    user = await auth_service.register(db, email="a@example.com", password="s3cret!pw", display_name="A")
+    user = await auth_service.register(
+        db, email="a@example.com", password="s3cret!pw", display_name="A"
+    )
     assert user.password_hash != "s3cret!pw"  # hashed, never plaintext
 
     ok = await auth_service.authenticate(db, "a@example.com", "s3cret!pw")

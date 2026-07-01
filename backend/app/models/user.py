@@ -9,13 +9,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.db import Base
 
 
-class Role(str, enum.Enum):
+class Role(enum.StrEnum):
     admin = "admin"
     user = "user"
     service = "service"
 
 
-class Visibility(str, enum.Enum):
+class Visibility(enum.StrEnum):
     private = "private"
     public = "public"
     shared = "shared"
