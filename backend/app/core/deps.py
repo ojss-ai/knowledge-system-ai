@@ -30,8 +30,8 @@ async def get_current_viewer(
         raise HTTPException(status_code=401, detail="not authenticated")
     try:
         claims = decode_token(creds.credentials, "access")
-    except pyjwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="invalid token")
+    except pyjwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="invalid token") from exc
     uid = uuid.UUID(claims["sub"])
     rows = await db.scalars(select(GroupMember.group_id).where(GroupMember.user_id == uid))
     return Viewer(user_id=uid, role=Role(claims["role"]), group_ids=frozenset(rows))

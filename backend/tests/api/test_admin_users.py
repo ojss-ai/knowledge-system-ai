@@ -8,11 +8,16 @@ async def _token(client, email, pw):
 
 
 async def test_admin_creates_and_lists_users(db, client) -> None:
-    await auth_service.register(db, email="root@x.com", password="rootpw!123", display_name="Root", role=Role.admin)
+    await auth_service.register(
+        db, email="root@x.com", password="rootpw!123", display_name="Root", role=Role.admin
+    )
     headers = await _token(client, "root@x.com", "rootpw!123")
 
-    resp = await client.post("/api/v1/admin/users", headers=headers,
-                             json={"email": "b@x.com", "password": "bpw!12345", "display_name": "B"})
+    resp = await client.post(
+        "/api/v1/admin/users",
+        headers=headers,
+        json={"email": "b@x.com", "password": "bpw!12345", "display_name": "B"},
+    )
     assert resp.status_code == 201
 
     resp = await client.get("/api/v1/admin/users?limit=50&offset=0", headers=headers)

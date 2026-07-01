@@ -15,7 +15,9 @@ async def register(
     existing = await db.scalar(select(User).where(User.email == email))
     if existing is not None:
         raise ConflictError(f"email already registered: {email}")
-    user = User(email=email, password_hash=_hasher.hash(password), display_name=display_name, role=role)
+    user = User(
+        email=email, password_hash=_hasher.hash(password), display_name=display_name, role=role
+    )
     db.add(user)
     await db.flush()
     return user

@@ -16,18 +16,28 @@ class UserListOut(BaseModel):
     total: int
 
 
-@router.post("", response_model=UserOut, status_code=201, summary="Create user", operation_id="adminCreateUser")
+@router.post(
+    "",
+    response_model=UserOut,
+    status_code=201,
+    summary="Create user",
+    operation_id="adminCreateUser",
+)
 async def create_user(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> UserOut:
     user = await auth_service.register(
-        db, email=payload.email, password=payload.password,
-        display_name=payload.display_name, role=payload.role,
+        db,
+        email=payload.email,
+        password=payload.password,
+        display_name=payload.display_name,
+        role=payload.role,
     )
     return UserOut.model_validate(user)
 
 
 @router.get("", response_model=UserListOut, summary="List users", operation_id="adminListUsers")
 async def list_users(
-    limit: int = Query(50, le=100), offset: int = Query(0, ge=0),
+    limit: int = Query(50, le=100),
+    offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
 ) -> UserListOut:
     total = await db.scalar(select(func.count()).select_from(User))

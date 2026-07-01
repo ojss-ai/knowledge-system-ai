@@ -1,6 +1,6 @@
 # Phase 0: Foundation — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: `kb-executing-plans`. Steps use checkbox (`- [ ]`) syntax for tracking. One task at a time.
+> **For agentic workers:** REQUIRED SUB-SKILL: `kb-executing-plans`. Steps use checkbox (`- [x]`) syntax for tracking. One task at a time.
 
 **Goal:** Running dev environment: Postgres(+pgvector)/Neo4j/Redis/MinIO in Docker, FastAPI skeleton with JWT auth, users & groups managed by an admin, full test infrastructure.
 
@@ -21,7 +21,7 @@
 **Files:**
 - Create: `.gitignore`, `Makefile`, `backend/pyproject.toml`, `backend/app/__init__.py`, `backend/tests/__init__.py`
 
-- [ ] **Step 1: Create branch and structure**
+- [x] **Step 1: Create branch and structure**
 
 ```bash
 git checkout -b phase-0-foundation
@@ -29,7 +29,7 @@ mkdir -p backend/app backend/tests frontend tools docker
 touch backend/app/__init__.py backend/tests/__init__.py
 ```
 
-- [ ] **Step 2: Write `backend/pyproject.toml`**
+- [x] **Step 2: Write `backend/pyproject.toml`**
 
 ```toml
 [project]
@@ -72,7 +72,7 @@ asyncio_mode = "auto"
 markers = ["integration: needs real models/services"]
 ```
 
-- [ ] **Step 3: Write `.gitignore`**
+- [x] **Step 3: Write `.gitignore`**
 
 ```gitignore
 __pycache__/
@@ -90,7 +90,7 @@ docker/pgdata/
 docker/miniodata/
 ```
 
-- [ ] **Step 4: Write `Makefile`**
+- [x] **Step 4: Write `Makefile`**
 
 ```makefile
 .PHONY: up down api test lint type verify openapi
@@ -105,7 +105,7 @@ verify: lint type test
 openapi: ; cd backend && python -m app.scripts.export_openapi && cd ../frontend && npm run codegen
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A && git commit -m "chore: scaffold repo, tooling, makefile"
@@ -118,7 +118,7 @@ git add -A && git commit -m "chore: scaffold repo, tooling, makefile"
 **Files:**
 - Create: `docker/postgres/Dockerfile`, `docker/docker-compose.yml`, `.env.example`
 
-- [ ] **Step 1: Write `docker/postgres/Dockerfile`**
+- [x] **Step 1: Write `docker/postgres/Dockerfile`**
 
 ```dockerfile
 FROM postgres:16
@@ -129,13 +129,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY init-extensions.sql /docker-entrypoint-initdb.d/01-init-extensions.sql
 ```
 
-- [ ] **Step 2: Write `docker/postgres/init-extensions.sql`**
+- [x] **Step 2: Write `docker/postgres/init-extensions.sql`**
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-- [ ] **Step 3: Write `docker/docker-compose.yml`**
+- [x] **Step 3: Write `docker/docker-compose.yml`**
 
 ```yaml
 services:
@@ -181,7 +181,7 @@ services:
     volumes: ["./miniodata:/data"]
 ```
 
-- [ ] **Step 4: Write `.env.example`**
+- [x] **Step 4: Write `.env.example`**
 
 ```env
 DATABASE_URL=postgresql+asyncpg://kb:kb_dev_password@localhost:5432/kb
@@ -197,7 +197,7 @@ MINIO_ACCESS_KEY=kb
 MINIO_SECRET_KEY=kb_dev_password
 ```
 
-- [ ] **Step 5: Verify the stack**
+- [x] **Step 5: Verify the stack**
 
 ```bash
 make up && sleep 20
@@ -212,7 +212,7 @@ docker compose -f docker/docker-compose.yml exec neo4j \
 # Expected: ok = 1
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -m "chore(docker): postgres+pgvector, neo4j community, redis, minio"
@@ -226,7 +226,7 @@ git add -A && git commit -m "chore(docker): postgres+pgvector, neo4j community, 
 - Create: `backend/app/core/config.py`, `backend/app/core/errors.py`, `backend/app/main.py`
 - Test: `backend/tests/test_health.py`
 
-- [ ] **Step 1: Write the failing test `backend/tests/test_health.py`**
+- [x] **Step 1: Write the failing test `backend/tests/test_health.py`**
 
 ```python
 import httpx
@@ -248,14 +248,14 @@ async def test_healthz_returns_ok(client: httpx.AsyncClient) -> None:
     assert resp.json() == {"status": "ok"}
 ```
 
-- [ ] **Step 2: Run it — verify FAIL**
+- [x] **Step 2: Run it — verify FAIL**
 
 ```bash
 cd backend && pip install -e ".[dev]" && pytest tests/test_health.py -v
 ```
 Expected: FAIL — `ModuleNotFoundError: No module named 'app.main'`.
 
-- [ ] **Step 3: Write `backend/app/core/config.py`**
+- [x] **Step 3: Write `backend/app/core/config.py`**
 
 ```python
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -274,7 +274,7 @@ class Settings(BaseSettings):
 settings = Settings()
 ```
 
-- [ ] **Step 4: Write `backend/app/core/errors.py`**
+- [x] **Step 4: Write `backend/app/core/errors.py`**
 
 ```python
 from fastapi import FastAPI, Request
@@ -303,7 +303,7 @@ def register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(status_code=exc.status_code, content={"detail": str(exc) or exc.__class__.__name__})
 ```
 
-- [ ] **Step 5: Write `backend/app/main.py`**
+- [x] **Step 5: Write `backend/app/main.py`**
 
 ```python
 from fastapi import FastAPI
@@ -325,14 +325,14 @@ def create_app() -> FastAPI:
 app = create_app()
 ```
 
-- [ ] **Step 6: Run test — verify PASS**
+- [x] **Step 6: Run test — verify PASS**
 
 ```bash
 pytest tests/test_health.py -v
 ```
 Expected: 1 passed.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add -A && git commit -m "feat(api): app factory, settings, domain errors, healthz"
@@ -346,7 +346,7 @@ git add -A && git commit -m "feat(api): app factory, settings, domain errors, he
 - Create: `backend/app/core/db.py`, `backend/tests/conftest.py`
 - Test: `backend/tests/test_db.py`
 
-- [ ] **Step 1: Write the failing test `backend/tests/test_db.py`**
+- [x] **Step 1: Write the failing test `backend/tests/test_db.py`**
 
 ```python
 from sqlalchemy import text
@@ -363,13 +363,13 @@ async def test_extensions_present(db) -> None:
     assert {"vector"} <= names
 ```
 
-- [ ] **Step 2: Run — verify FAIL** (`fixture 'db' not found`)
+- [x] **Step 2: Run — verify FAIL** (`fixture 'db' not found`)
 
 ```bash
 pytest tests/test_db.py -v
 ```
 
-- [ ] **Step 3: Write `backend/app/core/db.py`**
+- [x] **Step 3: Write `backend/app/core/db.py`**
 
 ```python
 from collections.abc import AsyncIterator
@@ -393,7 +393,7 @@ async def get_db() -> AsyncIterator[AsyncSession]:
         yield session
 ```
 
-- [ ] **Step 4: Write `backend/tests/conftest.py`**
+- [x] **Step 4: Write `backend/tests/conftest.py`**
 
 ```python
 import httpx
@@ -429,14 +429,14 @@ async def client(db):
         yield c
 ```
 
-- [ ] **Step 5: Run — verify PASS** (stack must be up: `make up`)
+- [x] **Step 5: Run — verify PASS** (stack must be up: `make up`)
 
 ```bash
 pytest tests/test_db.py -v
 ```
 Expected: 2 passed.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A && git commit -m "feat(db): async engine, session dependency, transactional test fixtures"
@@ -451,7 +451,7 @@ git add -A && git commit -m "feat(db): async engine, session dependency, transac
 - Migration: `backend/alembic/versions/0001_users_groups.py` (autogenerated then reviewed)
 - Test: `backend/tests/models/test_user_model.py`
 
-- [ ] **Step 1: Write the failing test `backend/tests/models/test_user_model.py`**
+- [x] **Step 1: Write the failing test `backend/tests/models/test_user_model.py`**
 
 ```python
 from app.models.user import Role, User
@@ -466,9 +466,9 @@ async def test_user_roundtrip(db) -> None:
     assert user.is_active is True
 ```
 
-- [ ] **Step 2: Run — verify FAIL** (`No module named 'app.models.user'`)
+- [x] **Step 2: Run — verify FAIL** (`No module named 'app.models.user'`)
 
-- [ ] **Step 3: Write `backend/app/models/user.py`**
+- [x] **Step 3: Write `backend/app/models/user.py`**
 
 ```python
 import enum
@@ -509,7 +509,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 ```
 
-- [ ] **Step 4: Write `backend/app/models/group.py`**
+- [x] **Step 4: Write `backend/app/models/group.py`**
 
 ```python
 import enum
@@ -550,7 +550,7 @@ class GroupMember(Base):
     role: Mapped[GroupRole] = mapped_column(Enum(GroupRole, name="group_role"), default=GroupRole.member)
 ```
 
-- [ ] **Step 5: Write `backend/app/models/__init__.py`**
+- [x] **Step 5: Write `backend/app/models/__init__.py`**
 
 ```python
 from app.models.group import Group, GroupMember, GroupRole
@@ -559,7 +559,7 @@ from app.models.user import Role, User, Visibility
 __all__ = ["Group", "GroupMember", "GroupRole", "Role", "User", "Visibility"]
 ```
 
-- [ ] **Step 6: Init Alembic and generate the baseline**
+- [x] **Step 6: Init Alembic and generate the baseline**
 
 ```bash
 cd backend && alembic init alembic
@@ -576,13 +576,13 @@ alembic upgrade head
 ```
 Expected: migration file created; upgrade succeeds. Review the generated file: it must create `users`, `groups`, `group_members` and the three enums — delete any noise.
 
-- [ ] **Step 7: Run test — verify PASS**
+- [x] **Step 7: Run test — verify PASS**
 
 ```bash
 pytest tests/models/test_user_model.py -v
 ```
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add -A && git commit -m "feat(db): users, groups, group_members models + baseline migration"
@@ -596,7 +596,7 @@ git add -A && git commit -m "feat(db): users, groups, group_members models + bas
 - Create: `backend/app/services/auth_service.py`
 - Test: `backend/tests/services/test_auth_service.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 import pytest
@@ -622,9 +622,9 @@ async def test_register_duplicate_email_conflicts(db) -> None:
         await auth_service.register(db, email="a@example.com", password="other", display_name="B")
 ```
 
-- [ ] **Step 2: Run — verify FAIL** (`No module named 'app.services.auth_service'`)
+- [x] **Step 2: Run — verify FAIL** (`No module named 'app.services.auth_service'`)
 
-- [ ] **Step 3: Write `backend/app/services/auth_service.py`**
+- [x] **Step 3: Write `backend/app/services/auth_service.py`**
 
 ```python
 from argon2 import PasswordHasher
@@ -661,7 +661,7 @@ async def authenticate(db: AsyncSession, email: str, password: str) -> User | No
     return user
 ```
 
-- [ ] **Step 4: Run — verify PASS**, then **commit**
+- [x] **Step 4: Run — verify PASS**, then **commit**
 
 ```bash
 pytest tests/services/test_auth_service.py -v
@@ -677,7 +677,7 @@ git add -A && git commit -m "feat(auth): argon2 registration and authentication"
 - Modify: `backend/app/main.py` (include router)
 - Test: `backend/tests/api/test_auth_api.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from app.services import auth_service
@@ -706,9 +706,9 @@ async def test_refresh_rotates(db, client) -> None:
     assert resp.json()["access_token"]
 ```
 
-- [ ] **Step 2: Run — verify FAIL** (404 on /api/v1/auth/login)
+- [x] **Step 2: Run — verify FAIL** (404 on /api/v1/auth/login)
 
-- [ ] **Step 3: Write `backend/app/core/security.py`**
+- [x] **Step 3: Write `backend/app/core/security.py`**
 
 ```python
 import uuid
@@ -745,7 +745,7 @@ def decode_token(token: str, expected_kind: str) -> dict:
     return payload
 ```
 
-- [ ] **Step 4: Write `backend/app/schemas/auth.py`**
+- [x] **Step 4: Write `backend/app/schemas/auth.py`**
 
 ```python
 from pydantic import BaseModel, EmailStr
@@ -766,7 +766,7 @@ class TokensOut(BaseModel):
     token_type: str = "bearer"
 ```
 
-- [ ] **Step 5: Write `backend/app/api/v1/auth.py`**
+- [x] **Step 5: Write `backend/app/api/v1/auth.py`**
 
 ```python
 import uuid
@@ -805,14 +805,14 @@ async def refresh(payload: RefreshIn) -> TokensOut:
 ```
 (Refresh revocation list in Redis is added in Phase 7 hardening; noted in that plan.)
 
-- [ ] **Step 6: Modify `backend/app/main.py`** — add inside `create_app()` after error registration:
+- [x] **Step 6: Modify `backend/app/main.py`** — add inside `create_app()` after error registration:
 
 ```python
 from app.api.v1.auth import router as auth_router
 app.include_router(auth_router, prefix="/api/v1")
 ```
 
-- [ ] **Step 7: Run — verify PASS**, **commit**
+- [x] **Step 7: Run — verify PASS**, **commit**
 
 ```bash
 pytest tests/api/test_auth_api.py -v
@@ -828,7 +828,7 @@ git add -A && git commit -m "feat(auth): JWT login and refresh endpoints"
 - Modify: `backend/app/main.py`
 - Test: `backend/tests/api/test_users_me.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 from app.services import auth_service
@@ -854,9 +854,9 @@ async def test_me_unauthenticated_401(client) -> None:
     assert resp.status_code == 401
 ```
 
-- [ ] **Step 2: Run — verify FAIL** (404)
+- [x] **Step 2: Run — verify FAIL** (404)
 
-- [ ] **Step 3: Write `backend/app/core/deps.py`**
+- [x] **Step 3: Write `backend/app/core/deps.py`**
 
 ```python
 import uuid
@@ -904,7 +904,7 @@ async def require_admin(viewer: Viewer = Depends(get_current_viewer)) -> Viewer:
     return viewer
 ```
 
-- [ ] **Step 4: Write `backend/app/schemas/user.py`**
+- [x] **Step 4: Write `backend/app/schemas/user.py`**
 
 ```python
 import uuid
@@ -934,7 +934,7 @@ class UserCreate(BaseModel):
     role: Role = Role.user
 ```
 
-- [ ] **Step 5: Write `backend/app/api/v1/users.py`**
+- [x] **Step 5: Write `backend/app/api/v1/users.py`**
 
 ```python
 from fastapi import APIRouter, Depends
@@ -958,7 +958,7 @@ async def me(viewer: Viewer = Depends(get_current_viewer), db: AsyncSession = De
 ```
 Include in `main.py`: `app.include_router(users_router, prefix="/api/v1")`.
 
-- [ ] **Step 6: Run — verify PASS**, **commit**
+- [x] **Step 6: Run — verify PASS**, **commit**
 
 ```bash
 pytest tests/api/test_users_me.py -v
@@ -974,7 +974,7 @@ git add -A && git commit -m "feat(auth): Viewer dependency and /users/me"
 - Modify: `backend/app/main.py`
 - Test: `backend/tests/api/test_admin_users.py`, `backend/tests/api/test_admin_groups.py`
 
-- [ ] **Step 1: Write the failing tests `backend/tests/api/test_admin_users.py`**
+- [x] **Step 1: Write the failing tests `backend/tests/api/test_admin_users.py`**
 
 ```python
 from app.models.user import Role
@@ -1037,9 +1037,9 @@ async def test_admin_creates_group_and_adds_member(db, client) -> None:
     assert str(member.id) in [m["user_id"] for m in resp.json()["members"]]
 ```
 
-- [ ] **Step 2: Run — verify FAIL** (404s)
+- [x] **Step 2: Run — verify FAIL** (404s)
 
-- [ ] **Step 3: Write `backend/app/schemas/group.py`**
+- [x] **Step 3: Write `backend/app/schemas/group.py`**
 
 ```python
 import uuid
@@ -1076,7 +1076,7 @@ class GroupDetailOut(GroupOut):
     members: list[GroupMemberOut]
 ```
 
-- [ ] **Step 4: Write `backend/app/api/v1/admin/users.py`**
+- [x] **Step 4: Write `backend/app/api/v1/admin/users.py`**
 
 ```python
 from fastapi import APIRouter, Depends, Query
@@ -1116,7 +1116,7 @@ async def list_users(
     return UserListOut(items=[UserOut.model_validate(u) for u in rows], total=total or 0)
 ```
 
-- [ ] **Step 5: Write `backend/app/api/v1/admin/groups.py`**
+- [x] **Step 5: Write `backend/app/api/v1/admin/groups.py`**
 
 ```python
 import uuid
@@ -1166,7 +1166,7 @@ async def add_member(group_id: uuid.UUID, payload: GroupMemberIn, db: AsyncSessi
     await db.flush()
 ```
 
-- [ ] **Step 6: Write `backend/app/api/v1/admin/__init__.py`** and wire with admin gate
+- [x] **Step 6: Write `backend/app/api/v1/admin/__init__.py`** and wire with admin gate
 
 ```python
 from fastapi import APIRouter, Depends
@@ -1181,7 +1181,7 @@ router.include_router(groups_router)
 ```
 In `main.py`: `app.include_router(admin_router, prefix="/api/v1")`.
 
-- [ ] **Step 7: Run — verify PASS**, **commit**
+- [x] **Step 7: Run — verify PASS**, **commit**
 
 ```bash
 pytest tests/api -v
@@ -1195,7 +1195,7 @@ git add -A && git commit -m "feat(admin): user and group management endpoints"
 **Files:**
 - Create: `backend/app/scripts/__init__.py`, `backend/app/scripts/seed_admin.py`, `backend/app/scripts/export_openapi.py`, `.github/workflows/ci.yml`
 
-- [ ] **Step 1: Write `backend/app/scripts/seed_admin.py`**
+- [x] **Step 1: Write `backend/app/scripts/seed_admin.py`**
 
 ```python
 """Idempotent admin seeder: python -m app.scripts.seed_admin email password"""
@@ -1222,7 +1222,7 @@ if __name__ == "__main__":
     asyncio.run(main(sys.argv[1], sys.argv[2]))
 ```
 
-- [ ] **Step 2: Write `backend/app/scripts/export_openapi.py`**
+- [x] **Step 2: Write `backend/app/scripts/export_openapi.py`**
 
 ```python
 """Writes openapi.json for frontend codegen: python -m app.scripts.export_openapi"""
@@ -1235,7 +1235,7 @@ Path("openapi.json").write_text(json.dumps(create_app().openapi(), indent=2))
 print("wrote backend/openapi.json")
 ```
 
-- [ ] **Step 3: Write `.github/workflows/ci.yml`**
+- [x] **Step 3: Write `.github/workflows/ci.yml`**
 
 ```yaml
 name: ci
@@ -1277,14 +1277,14 @@ jobs:
           NEO4J_PASSWORD: kb_dev_password
 ```
 
-- [ ] **Step 4: Run the full gate**
+- [x] **Step 4: Run the full gate**
 
 ```bash
 make verify
 ```
 Expected: lint, type, and tests all green.
 
-- [ ] **Step 5: Demonstrate exit criteria end-to-end**
+- [x] **Step 5: Demonstrate exit criteria end-to-end**
 
 ```bash
 make up
@@ -1297,9 +1297,23 @@ curl -s -X POST localhost:8000/api/v1/auth/login \
 ```
 Expected: JSON with `access_token`. Paste output as evidence.
 
-- [ ] **Step 6: Commit, update status, PR**
+- [x] **Step 6: Commit, update status, PR**
 
 ```bash
 git add -A && git commit -m "chore: seed script, openapi export, CI"
 ```
 Update `docs/plans/README.md` Phase 0 → Done. Open PR for human review.
+
+---
+
+## Notes / Deviations (recorded during execution)
+
+Small corrections were required for the plan's verbatim code to satisfy its own exit gate (`/kb-verify`: ruff + mypy strict + tests) and exit criteria. Each is behavior-preserving or a bug fix:
+
+1. **`get_db` now commits (bug fix).** As written, `get_db` yielded a session that was never committed, so writes issued via API endpoints (`POST /admin/users`, `POST /admin/groups`) returned 201 but rolled back at request end and did not persist — directly failing the exit criterion "admin can create a user and a group via API" and the "PG commits first" invariant. `get_db` now commits on success and rolls back on error. Tests are unaffected because the `client` fixture overrides `get_db` with the transactional (always-rolled-back) session.
+2. **Enums use `enum.StrEnum`** (`Role`, `Visibility`, `GroupRole`) instead of `(str, enum.Enum)` — ruff `UP042` for the declared py312 target. Values/storage are identical; migration unchanged.
+3. **`decode_token` return type** widened `dict` → `dict[str, Any]` for mypy strict (`type-arg`).
+4. **`raise ... from exc`** added in `auth.py` refresh and `deps.py` viewer for ruff `B904`.
+5. **`pyproject.toml`**: added `[tool.ruff.lint.flake8-bugbear] extend-immutable-calls` for FastAPI `Depends`/`Query`/etc. (standard `B008` exemption), and pinned `[tool.mypy] python_version = "3.12"`. Added `backend/openapi.json` (generated) to `.gitignore`.
+
+**Verification evidence:** `ruff check` + `ruff format --check` clean; `mypy app` → no issues (27 files); `pytest` → 14 passed; end-to-end (seed admin → login 200 → create user/group via API → list shows 2 users) confirmed against a live server.
