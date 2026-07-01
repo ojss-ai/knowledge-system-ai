@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+node_modules/
+.next/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+docker/pgdata/
+docker/miniodata/
+docker/neo4jdata/
+docker/neo4jlogs/
