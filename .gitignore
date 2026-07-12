@@ -14,3 +14,4 @@ docker/miniodata/
 docker/neo4jdata/
 docker/neo4jlogs/
 backend/openapi.json
+*.bundle
