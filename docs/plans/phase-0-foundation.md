@@ -1306,6 +1306,99 @@ Update `docs/plans/README.md` Phase 0 → Done. Open PR for human review.
 
 ---
 
+---
+
+### Task 11: Containerize the API (docs/03 Phase A alignment)
+
+> Added after phase exit; not required for the original exit criteria (`docker compose up` was scoped to Postgres/Neo4j/Redis/MinIO only, deliberately, so `make api` could keep host `--reload` for TDD). `docs/03-scalability-deployment.md` §1.1 specifies an `api` service in the compose stack for real deployments — this task closes that gap without disturbing the dev loop.
+
+**Files:**
+- Create: `backend/Dockerfile`, `backend/.dockerignore`
+- Modify: `docker/docker-compose.yml`, `Makefile`
+
+- [x] **Step 1: Write `backend/Dockerfile`**
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+
+COPY pyproject.toml ./
+COPY app ./app
+COPY alembic.ini ./
+COPY alembic ./alembic
+
+RUN pip install --no-cache-dir .
+
+EXPOSE 8000
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+```
+
+- [x] **Step 2: Write `backend/.dockerignore`**
+
+```
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+openapi.json
+.env
+```
+
+- [x] **Step 3: Add `api` service to `docker/docker-compose.yml`**, gated behind a `full` profile so the default `make up` (used by every earlier task in this plan) is unaffected:
+
+```yaml
+  api:
+    profiles: ["full"]
+    build: ../backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://kb:${POSTGRES_PASSWORD:-kb_dev_password}@postgres:5432/kb
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-kb_dev_password}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-prod}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+    ports: ["8000:8000"]
+```
+
+Note: the container talks to sibling services by compose service name (`postgres`, `neo4j`, `redis`), not `localhost` — a separate set of values from `.env.example`, which is written for the host-run `make api` path.
+
+- [x] **Step 4: Add `up-full` to `Makefile`** (and make `down` tear down the `full` profile too):
+
+```makefile
+up-full: ; docker compose -f docker/docker-compose.yml --profile full up -d --build
+down: ; docker compose -f docker/docker-compose.yml --profile full down
+```
+
+- [x] **Step 5: Verify**
+
+```bash
+make up-full && sleep 5
+curl -s -X POST localhost:8000/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@company.com","password":"Adm1n!ChangeMe"}'
+```
+Expected: the `api` container runs `alembic upgrade head` then serves on :8000; login responds per the seeded admin (seed it first via `docker compose -f docker/docker-compose.yml --profile full exec api python -m app.scripts.seed_admin admin@company.com 'Adm1n!ChangeMe'` if not already seeded).
+
+- [x] **Step 6: Commit**
+
+```bash
+git add -A && git commit -m "feat(docker): containerize the API behind a 'full' compose profile"
+```
+
+---
+
 ## Notes / Deviations (recorded during execution)
 
 Small corrections were required for the plan's verbatim code to satisfy its own exit gate (`/kb-verify`: ruff + mypy strict + tests) and exit criteria. Each is behavior-preserving or a bug fix:

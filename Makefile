@@ -1,7 +1,8 @@
-.PHONY: up down api test lint type verify openapi
+.PHONY: up up-full down api test lint type verify openapi
 
 up: ; docker compose -f docker/docker-compose.yml up -d
-down: ; docker compose -f docker/docker-compose.yml down
+up-full: ; docker compose -f docker/docker-compose.yml --profile full up -d --build
+down: ; docker compose -f docker/docker-compose.yml --profile full down
 api: ; cd backend && uvicorn app.main:app --reload --port 8000
 test: ; cd backend && pytest -q
 lint: ; cd backend && ruff check . && ruff format --check .

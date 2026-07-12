@@ -39,3 +39,27 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-kb_dev_password}
     ports: ["9000:9000", "9001:9001"]
     volumes: ["./miniodata:/data"]
+
+  api:
+    # Containerized FastAPI, per docs/03-scalability-deployment.md Phase A.
+    # Not started by default `make up` (dev uses `make api` + host uvicorn for --reload);
+    # opt in with `make up-full` when you need the prod-shaped stack end to end.
+    profiles: ["full"]
+    build: ../backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://kb:${POSTGRES_PASSWORD:-kb_dev_password}@postgres:5432/kb
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-kb_dev_password}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-prod}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+    ports: ["8000:8000"]
