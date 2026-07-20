@@ -41,6 +41,23 @@ async def test_embed_node_idempotent(db, make_user, make_node, fake_embedder):
     )
 
 
+async def test_embed_node_skips_soft_deleted(db, make_user, make_node, fake_embedder):
+    """A soft-deleted node must not be (re)embedded — no chunks written (SYSTEM_VIEWER path)."""
+    from datetime import UTC, datetime
+
+    owner = await make_user(email="embed4@test.com")
+    node = await make_node(owner, body="# Gone\n\nDeleted content.")
+    node.deleted_at = datetime.now(UTC)
+    await db.flush()
+
+    await _embed_node_impl(db, node.id, fake_embedder)
+
+    count = await db.scalar(
+        select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id)
+    )
+    assert count == 0
+
+
 async def test_embed_node_stores_vectors(db, make_user, make_node, fake_embedder):
     owner = await make_user(email="embed3@test.com")
     node = await make_node(owner, body="Some text to embed.")

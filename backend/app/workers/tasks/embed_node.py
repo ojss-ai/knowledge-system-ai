@@ -11,6 +11,7 @@ from app.models.chunk import NodeChunk
 from app.models.knowledge import KnowledgeNode
 from app.services.chunking import chunk_markdown
 from app.services.embedding_service import Embedder, get_embedder
+from app.services.visibility import SYSTEM_VIEWER, visible_nodes_clause
 from app.workers.celery_app import celery_app, task_session
 
 
@@ -19,8 +20,17 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
     Core logic extracted for unit-testability (no Celery dependency).
     Idempotent: deletes existing chunks for the node before reinserting.
     """
-    node = await db.scalar(select(KnowledgeNode).where(KnowledgeNode.id == node_id))
-    if node is None or node.deleted_at is not None:
+    # SYSTEM_VIEWER justification (kb-visibility-filter rule 1): embedding is a
+    # system job that must (re)index any LIVE node regardless of owner. Going
+    # through visible_nodes_clause keeps the single visibility choke point and
+    # still excludes soft-deleted rows; the result is never shown to a user.
+    node = await db.scalar(
+        select(KnowledgeNode).where(
+            KnowledgeNode.id == node_id,
+            visible_nodes_clause(SYSTEM_VIEWER),
+        )
+    )
+    if node is None:
         return
 
     texts = chunk_markdown(node.body)

@@ -811,6 +811,20 @@ cd backend && pytest tests/workers/test_embed_node.py -v
 feat(workers): embed_node task — idempotent chunking + vector storage
 ```
 
+### 5.R — Review fixes (post c6a7cc5, `/kb-review` findings)
+
+> [plan-fix] The 5.2 code block above is kept in sync with these fixes.
+
+- [x] **5.R.1 (CRITICAL)** `_embed_node_impl` read `knowledge_nodes` with a raw
+  `select` + hand-rolled `deleted_at` check, violating kb-visibility-filter rule 1
+  (system jobs use an explicit `SYSTEM_VIEWER`). Added module-level `SYSTEM_VIEWER`
+  (admin role, all-zeros sentinel user id, justification docstring) to
+  `app/services/visibility.py`; the task now reads via
+  `visible_nodes_clause(SYSTEM_VIEWER)` with a use-site justification comment —
+  soft-deleted rows stay excluded. Tests: `test_system_viewer_is_audited_admin_sentinel`,
+  `test_system_viewer_sees_private_but_not_deleted` (test_visibility.py, RED via
+  ImportError first) and `test_embed_node_skips_soft_deleted` (regression guard).
+
 ---
 
 ## Task 6 — autolink_node Celery task
