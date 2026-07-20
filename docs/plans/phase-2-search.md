@@ -33,7 +33,13 @@
 
 ### Steps
 
-- [ ] **1.1** Write the failing test:
+> **[plan-fix] notes (applied during execution):**
+> - Migration `down_revision` is `38ca9223b637` (actual phase-1 head), not `0003`.
+> - Migration adds `CREATE EXTENSION IF NOT EXISTS vector` so it applies on a fresh DB.
+> - No single-column `ix_node_chunks_node_id` (neither `index=True` nor `op.create_index`):
+>   `uq_chunk_node_idx` leads with `node_id`, matching the phase-1 redundant-index removal.
+
+- [x] **1.1** Write the failing test:
 
 ```python
 # backend/tests/models/test_chunk_model.py
@@ -75,12 +81,12 @@ async def test_hnsw_index_exists(db):
     assert len(rows) >= 1, "HNSW index on node_chunks.embedding must exist"
 ```
 
-- [ ] **1.2** Run — expect ImportError:
+- [x] **1.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/models/test_chunk_model.py -x 2>&1 | head -20
 ```
 
-- [ ] **1.3** Create the model:
+- [x] **1.3** Create the model:
 
 ```python
 # backend/app/models/chunk.py
@@ -119,12 +125,12 @@ class NodeChunk(Base):
     )
 ```
 
-- [ ] **1.4** Add to `backend/app/models/__init__.py`:
+- [x] **1.4** Add to `backend/app/models/__init__.py`:
 ```python
 from app.models.chunk import NodeChunk  # noqa: F401
 ```
 
-- [ ] **1.5** Write the Alembic migration:
+- [x] **1.5** Write the Alembic migration:
 
 ```python
 # backend/alembic/versions/0004_node_chunks.py
@@ -171,14 +177,14 @@ def downgrade() -> None:
     op.drop_table("node_chunks")
 ```
 
-- [ ] **1.6** Apply and test:
+- [x] **1.6** Apply and test:
 ```bash
 cd backend && alembic upgrade head
 pytest tests/models/test_chunk_model.py -v
 # Expected: 2 passed
 ```
 
-- [ ] **1.7** Commit:
+- [x] **1.7** Commit:
 ```
 feat(models): node_chunks model + migration 0004 with HNSW index (m=16, ef=64, cosine)
 ```

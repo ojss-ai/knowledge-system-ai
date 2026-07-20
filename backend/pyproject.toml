@@ -13,6 +13,7 @@ dependencies = [
   "argon2-cffi>=23.1",
   "pyjwt>=2.8",
   "structlog>=24.1",
+  "pgvector>=0.2.5",
   "redis>=5.0",
   "neo4j>=5.20",
 ]
