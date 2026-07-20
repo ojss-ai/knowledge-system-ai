@@ -60,6 +60,36 @@ async def client(db):
         yield c
 
 
+async def _register_and_login(db, client, email: str, *, role: Role = Role.user) -> dict[str, str]:
+    """Register via auth_service (there is no /auth/register endpoint) and log in.
+
+    [plan-fix, Task 8.5]: the plan's fixture used POST /api/v1/auth/register and
+    form-data login; the real API has JSON login only and no register endpoint.
+    """
+    from app.services import auth_service
+
+    await auth_service.register(
+        db, email=email, password="pass1234", display_name=email.split("@")[0], role=role
+    )
+    r = await client.post("/api/v1/auth/login", json={"email": email, "password": "pass1234"})
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
+
+@pytest_asyncio.fixture
+async def auth_headers(db, client):
+    return await _register_and_login(db, client, "owner@test.com")
+
+
+@pytest_asyncio.fixture
+async def auth_headers_other(db, client):
+    return await _register_and_login(db, client, "other@test.com")
+
+
+@pytest_asyncio.fixture
+async def auth_headers_admin(db, client):
+    return await _register_and_login(db, client, "admin@test.com", role=Role.admin)
+
+
 @pytest_asyncio.fixture
 async def make_user(db):
     """Factory: create a User in the test DB and return it."""

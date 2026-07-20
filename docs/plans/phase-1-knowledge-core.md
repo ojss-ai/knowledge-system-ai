@@ -1526,14 +1526,26 @@ feat(schemas): node schemas (NodeCreate, NodeUpdate, NodeOut, NodeListOut, Graph
 > audit log entry wherever an admin Viewer is used to read another user's non-public
 > node (ADR-004 / kb-visibility-filter rule 5).
 
+> **Carry-over resolution (Task 8):** guard implemented as `get_scoped_viewer` in
+> `app/core/deps.py` — on all routes outside `/api/v1/admin/*` an admin's Viewer is
+> scoped down to `role=user` before it reaches `visible_nodes_clause`, so the admin
+> bypass is unreachable here (regression test:
+> `test_admin_gets_no_visibility_bypass_outside_admin_routes`). The **audit-log part is
+> deferred**: no audit mechanism exists yet (`audit_log` is in the canonical vocabulary
+> but unimplemented). Phase 7 hardening must add the `audit_log` table and log every
+> admin read of another user's non-public node on `/api/v1/admin/*` routes.
+
 **Files:**
 - Create: `backend/app/api/v1/nodes.py`
-- Modify: `backend/app/main.py`
+- Modify: `backend/app/main.py`, `backend/app/core/deps.py` ([plan-fix] `get_scoped_viewer` + `Pagination`), `backend/app/services/node_service.py` ([plan-fix] `share_node` moved into the service), `backend/tests/conftest.py`
 - Create: `backend/tests/api/test_nodes_api.py`
 
 ### Steps
 
-- [ ] **8.1** Write the failing tests:
+- [x] **8.1** Write the failing tests ([plan-fix]: the file as written below plus 6 more —
+  401 unauthenticated, 422 missing title, list hides other users' private nodes
+  (kb-visibility-filter mandatory test), admin-bypass guard (carry-over above), and two
+  share tests: share grants visibility to a `shared` node, non-owner share attempt → 403):
 
 ```python
 # backend/tests/api/test_nodes_api.py
@@ -1601,140 +1613,66 @@ async def test_delete_node(client: AsyncClient, auth_headers):
 
 > **Note:** `auth_headers_other` fixture must be added to conftest (create a second user and return its headers).
 
-- [ ] **8.2** Run — expect 404 (router not registered):
+- [x] **8.2** Run — expect 404 (router not registered):
 ```bash
 cd backend && pytest tests/api/test_nodes_api.py -x 2>&1 | head -20
+# observed RED: 12 failed — "assert 404 == 201" etc. (router missing)
 ```
 
-- [ ] **8.3** Create the router ([plan-fix, review of 24e5685]: mutation handlers must run
+- [x] **8.3** Create the router ([plan-fix, review of 24e5685]: mutation handlers must run
   `await ns.run_pending_graph_ops(db)` AFTER `await db.commit()` — the service only queues
-  Neo4j ops on the session; the router is the post-commit caller):
+  Neo4j ops on the session; the router is the post-commit caller).
+  Further [plan-fix]es applied to the code as originally written here:
+  - `viewer=Depends(get_current_viewer)` → `viewer: Viewer = Depends(get_scoped_viewer)`
+    (admin-bypass guard, carry-over above);
+  - the share handler's `payload: "NodeShareCreate"` string annotation with an in-function
+    import cannot be resolved by FastAPI — `NodeShareCreate` is imported at module level;
+  - the share handler contained business logic (`db.add(NodeShare(...))`) in the router and
+    **no owner check** — any viewer of a shared node could re-share it to anyone (ADR-004
+    leak). Moved to `node_service.share_node()`, which raises `ForbiddenError` unless the
+    viewer is the owner (admin included in the service check, but admins are scoped to
+    `user` on this router);
+  - handlers return `NodeOut.model_validate(node)` (never ORM objects) and every route has
+    `summary` + `operation_id` per kb-api-conventions.
+  Final router code is `backend/app/api/v1/nodes.py` (implemented as described).
 
-```python
-# backend/app/api/v1/nodes.py
-from __future__ import annotations
-
-import uuid
-
-from fastapi import APIRouter, Depends, status
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.deps import get_current_viewer, Pagination
-from app.core.db import get_db
-from app.schemas.node import NodeCreate, NodeListOut, NodeOut, NodeUpdate
-from app.services import node_service as ns
-
-router = APIRouter(prefix="/nodes", tags=["nodes"])
-
-
-@router.post("", response_model=NodeOut, status_code=status.HTTP_201_CREATED)
-async def create_node(
-    payload: NodeCreate,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    node = await ns.create_node(
-        db,
-        viewer=viewer,
-        title=payload.title,
-        body=payload.body,
-        node_type=payload.node_type,
-        visibility=payload.visibility,
-        source=payload.source,
-        source_ref=payload.source_ref,
-        meta=payload.meta,
-    )
-    await db.commit()
-    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
-    return node
-
-
-@router.get("", response_model=NodeListOut)
-async def list_nodes(
-    pagination: Pagination = Depends(),
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    items, total = await ns.list_nodes(db, viewer, offset=pagination.offset, limit=pagination.limit)
-    return NodeListOut(items=items, total=total, offset=pagination.offset, limit=pagination.limit)
-
-
-@router.get("/{node_id}", response_model=NodeOut)
-async def get_node(
-    node_id: uuid.UUID,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    return await ns.get_node(db, node_id, viewer)
-
-
-@router.patch("/{node_id}", response_model=NodeOut)
-async def update_node(
-    node_id: uuid.UUID,
-    payload: NodeUpdate,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    node = await ns.update_node(
-        db, node_id, viewer,
-        title=payload.title,
-        body=payload.body,
-        visibility=payload.visibility,
-        meta=payload.meta,
-    )
-    await db.commit()
-    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
-    return node
-
-
-@router.delete("/{node_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_node(
-    node_id: uuid.UUID,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    await ns.delete_node(db, node_id, viewer)
-    await db.commit()
-    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
-
-
-@router.post("/{node_id}/shares", response_model=NodeOut, status_code=status.HTTP_201_CREATED)
-async def share_node(
-    node_id: uuid.UUID,
-    payload: "NodeShareCreate",
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    from app.schemas.node import NodeShareCreate as NSC
-    from app.models.knowledge import NodeShare
-    node = await ns.get_node(db, node_id, viewer)
-    share = NodeShare(node_id=node.id, user_id=payload.user_id, group_id=payload.group_id, can_edit=payload.can_edit)
-    db.add(share)
-    await db.commit()
-    await db.refresh(node)
-    return node
-```
-
-- [ ] **8.4** Register router in `main.py`:
+- [x] **8.4** Register router in `main.py` ([plan-fix]: matched the file's existing import
+  style):
 
 ```python
 # backend/app/main.py  (add inside create_app, after existing routers)
-from app.api.v1 import nodes as nodes_router
-app.include_router(nodes_router.router, prefix="/api/v1")
+from app.api.v1.nodes import router as nodes_router
+app.include_router(nodes_router, prefix="/api/v1")
 ```
 
-- [ ] **8.5** Add `auth_headers_other` fixture and `Pagination` dep if not present:
+- [x] **8.5** Add `auth_headers_other` fixture and `Pagination` dep if not present
+  ([plan-fix]: there is no `/api/v1/auth/register` endpoint and login is JSON
+  (`{"email", "password"}`), not OAuth form data; also `auth_headers` itself did not
+  exist yet and an `auth_headers_admin` fixture was needed for the carry-over guard test —
+  all three now share a `_register_and_login` helper that registers via
+  `auth_service.register`):
 
 ```python
-# backend/tests/conftest.py  (add auth_headers_other fixture)
+# backend/tests/conftest.py  (actual)
+async def _register_and_login(db, client, email: str, *, role: Role = Role.user) -> dict[str, str]:
+    from app.services import auth_service
+    await auth_service.register(
+        db, email=email, password="pass1234", display_name=email.split("@")[0], role=role
+    )
+    r = await client.post("/api/v1/auth/login", json={"email": email, "password": "pass1234"})
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
 @pytest_asyncio.fixture
-async def auth_headers_other(client):
-    await client.post("/api/v1/auth/register", json={
-        "email": "other@test.com", "password": "pass1234", "display_name": "Other"
-    })
-    r = await client.post("/api/v1/auth/login", data={"username": "other@test.com", "password": "pass1234"})
-    token = r.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+async def auth_headers(db, client):
+    return await _register_and_login(db, client, "owner@test.com")
+
+@pytest_asyncio.fixture
+async def auth_headers_other(db, client):
+    return await _register_and_login(db, client, "other@test.com")
+
+@pytest_asyncio.fixture
+async def auth_headers_admin(db, client):
+    return await _register_and_login(db, client, "admin@test.com", role=Role.admin)
 ```
 
 ```python
@@ -1747,30 +1685,49 @@ class Pagination:
         self.limit = limit
 ```
 
-- [ ] **8.6** Run tests:
+- [x] **8.6** Run tests:
 ```bash
 cd backend && pytest tests/api/test_nodes_api.py -v
-# Expected: 6 passed
+# Observed GREEN: 12 passed in 3.99s (6 plan tests + 6 auth/guard/share tests, see 8.1)
+# Full suite: 61 passed, 6 skipped (Neo4j-unreachable skips) · ruff clean ·
+# mypy app/services app/schemas: Success: no issues found in 10 source files
 ```
 
-- [ ] **8.7** curl evidence:
+- [x] **8.7** curl evidence ([plan-fix]: login is JSON `{"email","password"}`, not form
+  data, and `*.local` addresses are rejected by pydantic EmailStr — evidence user is
+  `admin@example.com`):
+
 ```bash
-# Obtain token
 TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
-  -d "username=admin@kb.local&password=admin1234" | jq -r .access_token)
-
-# Create node
-curl -s -X POST http://localhost:8000/api/v1/nodes \
-  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"title":"First Node","body":"hello [[Second Node]]","visibility":"public"}' | jq .
-
-# List nodes
-curl -s http://localhost:8000/api/v1/nodes \
-  -H "Authorization: Bearer $TOKEN" | jq .total
+  -d '{"email":"admin@example.com","password":"admin1234"}' | jq -r .access_token)
+curl -s -X POST http://localhost:8000/api/v1/nodes -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"First Node","body":"hello [[Second Node]]","visibility":"public"}'
+# ... GET /nodes/{id}, GET /nodes, PATCH, POST /nodes/{id}/shares, DELETE
 ```
 
-- [ ] **8.8** Commit:
+Observed (live uvicorn, Neo4j down → post-commit graph sync logged as warning, API
+unaffected per ADR-011):
+
+```
+== POST /api/v1/nodes ==            201
+{ "id": "a921ddf2-a98b-4189-a724-086643d3a285",
+  "owner_id": "5583fac0-2d1c-4e3d-b6dd-cd31f0077f23",
+  "title": "First Node", "body": "hello [[Second Node]]", "node_type": "note",
+  "visibility": "public", "source": null, "source_ref": null, "meta": {},
+  "created_at": "2026-07-20T22:18:08.474229Z", "updated_at": "2026-07-20T22:18:08.474229Z" }
+== GET /api/v1/nodes/{id} ==        200
+{'id': 'a921ddf2-...', 'title': 'First Node', 'visibility': 'public'}
+== GET /api/v1/nodes (list) ==      200  total= 1 items= ['First Node']
+== PATCH /api/v1/nodes/{id} ==      200  {'id': 'a921ddf2-...', 'title': 'First Node v2'}
+== POST /api/v1/nodes/{id}/shares == [201]  (shared node, user_id=bob)
+== bob GET shared node: 200 ==
+== DELETE /api/v1/nodes/{id} ==     [204]
+== GET after delete: 404 ==
+```
+
+- [x] **8.8** Commit:
 ```
 feat(api): POST/GET/PATCH/DELETE /api/v1/nodes with visibility enforcement
 ```

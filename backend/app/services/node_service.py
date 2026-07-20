@@ -32,7 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ConflictError, ForbiddenError, NotFoundError
-from app.models.knowledge import KnowledgeNode, NodeRevision, NodeType
+from app.models.knowledge import KnowledgeNode, NodeRevision, NodeShare, NodeType
 from app.models.user import Role, Visibility
 from app.services import graph_service as gs
 from app.services.visibility import Viewer, visible_nodes_clause
@@ -214,6 +214,28 @@ async def delete_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> N
     node.deleted_at = datetime.now(UTC)
     await db.flush()
     _queue_graph_op(db, partial(gs.soft_delete_vertex, node_id))
+
+
+async def share_node(
+    db: AsyncSession,
+    node_id: uuid.UUID,
+    viewer: Viewer,
+    *,
+    user_id: uuid.UUID | None = None,
+    group_id: uuid.UUID | None = None,
+    can_edit: bool = False,
+) -> KnowledgeNode:
+    """Add a node_shares row. Only the owner (or admin) may extend visibility —
+    letting any viewer share would leak nodes shared *with* them (ADR-004)."""
+    node = await get_node(db, node_id, viewer)
+    if node.owner_id != viewer.user_id and viewer.role != Role.admin:
+        raise ForbiddenError("Only owner or admin can share a node")
+    share = NodeShare(
+        id=uuid.uuid4(), node_id=node.id, user_id=user_id, group_id=group_id, can_edit=can_edit
+    )
+    db.add(share)
+    await db.flush()
+    return node
 
 
 async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewer) -> None:
