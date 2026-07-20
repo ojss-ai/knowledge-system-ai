@@ -338,13 +338,16 @@ feat(models): knowledge_nodes, node_shares, node_revisions, tags, node_tags + mi
 ## Task 3 — Neo4j graph initialisation (constraint + driver singleton)
 
 **Files:**
-- Create: `backend/app/services/graph_service.py` (driver setup only; full service in Task 5)
 - Create: `backend/app/core/neo4j.py`
 - Create: `backend/tests/db/test_neo4j_init.py`
 
+> [plan-fix] `graph_service.py` removed from this task's file list: the steps below define no
+> content for it (driver lives in `app/core/neo4j.py`); the full service lands in Task 5.
+> Also added `neo4j>=5.20` to `backend/pyproject.toml` dependencies (was missing).
+
 ### Steps
 
-- [ ] **3.1** Write the failing test first:
+- [x] **3.1** Write the failing test first:
 
 ```python
 # backend/tests/db/test_neo4j_init.py
@@ -371,12 +374,13 @@ async def test_node_id_constraint_exists(neo4j_session: Neo4jSession):
     assert len(records) >= 1, "Missing uniqueness constraint on :Node(node_id)"
 ```
 
-- [ ] **3.2** Run — expect FAIL (driver not configured yet):
+- [x] **3.2** Run — expect FAIL (driver not configured yet):
 ```bash
 cd backend && pytest tests/db/test_neo4j_init.py -x 2>&1 | head -20
 ```
+Observed RED: `fixture 'neo4j_session' not found` (both tests error at setup).
 
-- [ ] **3.3** Write `backend/app/core/neo4j.py`:
+- [x] **3.3** Write `backend/app/core/neo4j.py`:
 
 ```python
 # backend/app/core/neo4j.py
@@ -391,8 +395,8 @@ def get_driver() -> AsyncDriver:
     global _driver
     if _driver is None:
         _driver = AsyncGraphDatabase.driver(
-            settings.NEO4J_URI,
-            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+            settings.neo4j_uri,
+            auth=(settings.neo4j_user, settings.neo4j_password),
         )
     return _driver
 
@@ -413,45 +417,53 @@ async def ensure_constraints() -> None:
         )
 ```
 
-- [ ] **3.4** Wire `ensure_constraints()` + `close_driver()` into FastAPI lifespan (`backend/app/main.py`):
+- [x] **3.4** Wire `ensure_constraints()` + `close_driver()` into FastAPI lifespan (`backend/app/main.py`):
 
 ```python
 from contextlib import asynccontextmanager
 from app.core.neo4j import close_driver, ensure_constraints
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await ensure_constraints()
     yield
     await close_driver()
-
-app = FastAPI(lifespan=lifespan, ...)
 ```
+> [plan-fix] `main.py` uses the existing `create_app()` factory, so `lifespan` is passed as
+> `FastAPI(..., lifespan=lifespan)` inside the factory rather than a module-level `app = FastAPI(...)`.
 
-- [ ] **3.5** Add `neo4j_session` fixture to `backend/tests/conftest.py`:
+- [x] **3.5** Add `neo4j_session` fixture to `backend/tests/conftest.py`:
 
 ```python
-import pytest
-from app.core.neo4j import get_driver
-
 @pytest.fixture
 async def neo4j_session():
+    if not _neo4j_available():
+        pytest.skip("Neo4j unreachable")
+    await ensure_constraints()  # tests must not depend on app lifespan having run
     async with get_driver().session() as session:
         yield session
         # Teardown: wipe all test nodes
         await session.run("MATCH (n:Node) WHERE n.test = true DETACH DELETE n")
 ```
+> [plan-fix] (approved deviation) The fixture first probes `settings.neo4j_uri` with a 1 s TCP
+> connect (`_neo4j_available()`) and skips when Neo4j is down, so the suite stays green in
+> environments without Neo4j. It also calls `ensure_constraints()` because httpx's ASGITransport
+> never runs the app lifespan (per kb-neo4j-graph: fixture runs the constraint migration).
 
-- [ ] **3.6** Add Neo4j env vars to `backend/tests/conftest.py` / pytest fixtures (already in `.env.example`; ensure `settings` reads them).
+- [x] **3.6** Add Neo4j env vars to `backend/tests/conftest.py` / pytest fixtures (already in `.env.example`; ensure `settings` reads them).
+> [plan-fix] No `.env.example` exists; vars live in `backend/.env` (uncommitted). Added
+> `neo4j_uri` / `neo4j_user` / `neo4j_password` fields (lowercase, matching existing
+> `Settings` style; env matching is case-insensitive) with docker-compose dev defaults.
 
-- [ ] **3.7** Apply and run tests:
+- [x] **3.7** Apply and run tests:
 
 ```bash
 cd backend && pytest tests/db/test_neo4j_init.py -v
-# Expected: 2 passed
+# Expected: 2 passed (sandbox without Neo4j: 2 skipped "Neo4j unreachable" — verify
+# "2 passed" on the Docker stack)
 ```
 
-- [ ] **3.8** Commit:
+- [x] **3.8** Commit:
 ```
 feat(db): Neo4j driver singleton, ensure_constraints on startup, init tests
 ```

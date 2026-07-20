@@ -1,4 +1,6 @@
+import socket
 import uuid as _uuid
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -7,10 +9,33 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.core.config import settings
 from app.core.db import get_db
+from app.core.neo4j import ensure_constraints, get_driver
 from app.main import create_app
 from app.models.user import Role, User, Visibility
 
 TEST_DB_URL = settings.database_url  # same dockerized PG; tests roll back
+
+
+def _neo4j_available() -> bool:
+    """Fast TCP probe so Neo4j tests skip (not hang/error) when the service is down."""
+    parsed = urlparse(settings.neo4j_uri)
+    host, port = parsed.hostname or "localhost", parsed.port or 7687
+    try:
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
+@pytest.fixture
+async def neo4j_session():
+    if not _neo4j_available():
+        pytest.skip("Neo4j unreachable")
+    await ensure_constraints()  # tests must not depend on app lifespan having run
+    async with get_driver().session() as session:
+        yield session
+        # Teardown: wipe all test nodes
+        await session.run("MATCH (n:Node) WHERE n.test = true DETACH DELETE n")
 
 
 @pytest.fixture
