@@ -28,17 +28,19 @@
 
 ### Steps
 
-- [ ] **1.1** Open `backend/tests/conftest.py` and add these fixtures after the existing `auth_headers` fixture:
+- [x] **1.1** Open `backend/tests/conftest.py` and add these fixtures after the existing `client` fixture (plan-fix: there is no `auth_headers` fixture in conftest; `client` is the last existing fixture). The `app.models.knowledge` imports are done lazily inside each fixture because that module is only created in Task 2 — a top-level import would break collection of the whole suite (`NodeTag` is not needed by these fixtures and is not imported):
 
 ```python
 # backend/tests/conftest.py  (additions only)
 import uuid as _uuid
-from app.models.knowledge import KnowledgeNode, Tag, NodeTag
+import pytest_asyncio
 from app.models.user import Visibility
 
 @pytest_asyncio.fixture
 async def make_node(db):
     """Factory: create a KnowledgeNode in the test DB and return it."""
+    from app.models.knowledge import KnowledgeNode  # lazy: model lands in Task 2
+
     created: list[KnowledgeNode] = []
 
     async def _factory(
@@ -72,6 +74,8 @@ async def make_node(db):
 @pytest_asyncio.fixture
 async def make_tag(db):
     """Factory: create a Tag."""
+    from app.models.knowledge import Tag  # lazy: model lands in Task 2
+
     async def _factory(name: str = "test-tag") -> Tag:
         tag = Tag(id=_uuid.uuid4(), name=name, slug=name.lower().replace(" ", "-"))
         db.add(tag)
@@ -80,14 +84,14 @@ async def make_tag(db):
     return _factory
 ```
 
-- [ ] **1.2** Run tests to confirm fixtures load (no production code yet — test file just imports):
+- [x] **1.2** Run tests to confirm fixtures load (no production code yet — test file just imports):
 
 ```bash
 cd backend && pytest tests/conftest.py --collect-only -q
 # Expected: collected 0 items (fixtures load without error)
 ```
 
-- [ ] **1.3** Commit:
+- [x] **1.3** Commit:
 ```
 chore(test): extend conftest with make_node and make_tag fixtures
 ```
