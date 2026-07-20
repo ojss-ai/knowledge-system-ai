@@ -38,8 +38,9 @@ class KnowledgeNode(Base):
     __tablename__ = "knowledge_nodes"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No single-column index on owner_id: the composite ix_kn_owner_deleted leads with it.
     owner_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -90,11 +91,11 @@ class NodeShare(Base):
     __tablename__ = "node_shares"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No single-column index on node_id: uq_share_node_user/_group unique indexes lead with it.
     node_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
@@ -123,11 +124,11 @@ class NodeRevision(Base):
     __tablename__ = "node_revisions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No single-column index on node_id: uq_revision_version unique index leads with it.
     node_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     version: Mapped[int] = mapped_column(nullable=False)
     title_snapshot: Mapped[str] = mapped_column(String(512), nullable=False)

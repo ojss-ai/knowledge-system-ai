@@ -84,9 +84,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_kn_tsv", "knowledge_nodes", ["body_tsv"], unique=False, postgresql_using="gin"
     )
-    op.create_index(
-        op.f("ix_knowledge_nodes_owner_id"), "knowledge_nodes", ["owner_id"], unique=False
-    )
+    # No single-column owner_id index: ix_kn_owner_deleted leads with owner_id.
     op.create_table(
         "node_revisions",
         sa.Column("id", sa.UUID(), nullable=False),
@@ -106,7 +104,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("node_id", "version", name="uq_revision_version"),
     )
-    op.create_index(op.f("ix_node_revisions_node_id"), "node_revisions", ["node_id"], unique=False)
+    # No single-column node_id index: uq_revision_version leads with node_id.
     op.create_table(
         "node_shares",
         sa.Column("id", sa.UUID(), nullable=False),
@@ -130,7 +128,7 @@ def upgrade() -> None:
             "(user_id IS NULL) != (group_id IS NULL)", name="ck_node_shares_user_xor_group"
         ),
     )
-    op.create_index(op.f("ix_node_shares_node_id"), "node_shares", ["node_id"], unique=False)
+    # No single-column node_id index: uq_share_node_user/_group lead with node_id.
     op.create_table(
         "node_tags",
         sa.Column("node_id", sa.UUID(), nullable=False),
@@ -150,11 +148,8 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Downgrade schema."""
     op.drop_table("node_tags")
-    op.drop_index(op.f("ix_node_shares_node_id"), table_name="node_shares")
     op.drop_table("node_shares")
-    op.drop_index(op.f("ix_node_revisions_node_id"), table_name="node_revisions")
     op.drop_table("node_revisions")
-    op.drop_index(op.f("ix_knowledge_nodes_owner_id"), table_name="knowledge_nodes")
     op.drop_index("ix_kn_tsv", table_name="knowledge_nodes", postgresql_using="gin")
     op.drop_index("ix_kn_owner_deleted", table_name="knowledge_nodes")
     op.drop_table("knowledge_nodes")

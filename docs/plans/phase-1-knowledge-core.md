@@ -209,7 +209,7 @@ class KnowledgeNode(Base):
     __tablename__ = "knowledge_nodes"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False, default="")
     node_type: Mapped[str] = mapped_column(String(64), nullable=False, default=NodeType.note.value)
@@ -244,7 +244,7 @@ class NodeShare(Base):
     __tablename__ = "node_shares"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
     group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"))
     can_edit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -263,7 +263,7 @@ class NodeRevision(Base):
     __tablename__ = "node_revisions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False)
     version: Mapped[int] = mapped_column(nullable=False)
     title_snapshot: Mapped[str] = mapped_column(String(512), nullable=False)
     body_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
@@ -307,7 +307,7 @@ class NodeTag(Base):
 from app.models.knowledge import KnowledgeNode, NodeShare, NodeRevision, Tag, NodeTag, NodeType  # noqa: F401
 ```
 
-- [x] **2.5** Generate Alembic migration (plan-fix: autogenerate DID include the `body_tsv` Computed column; the `visibility` column had to be switched to `postgresql.ENUM(..., name="visibility", create_type=False)` because the enum type already exists from migration 0001 and `sa.Enum` would try to re-create it):
+- [x] **2.5** Generate Alembic migration (plan-fix: autogenerate DID include the `body_tsv` Computed column; the `visibility` column had to be switched to `postgresql.ENUM(..., name="visibility", create_type=False)` because the enum type already exists from migration 0001 and `sa.Enum` would try to re-create it. Post-review, migration 0002 was amended in place — it is unreleased: added `ck_node_shares_user_xor_group` check constraint; dropped redundant single-column indexes `ix_knowledge_nodes_owner_id` (covered by `ix_kn_owner_deleted`), `ix_node_shares_node_id` (covered by `uq_share_node_user`/`_group`), `ix_node_revisions_node_id` (covered by `uq_revision_version`) — model `index=True` flags removed to match):
 
 ```bash
 cd backend && alembic revision --autogenerate -m "knowledge_core"
