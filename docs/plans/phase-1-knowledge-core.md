@@ -1944,6 +1944,22 @@ feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborh
   `create_edge` (invisible == nonexistent → 404, ADR-004). RED→GREEN:
   `test_delete_edge_invisible_target_looks_not_found` — pure-PG, runs without Neo4j.)
 
+- [x] **9.R3** ([plan-fix]: the plan never stated an ownership policy for edge mutations —
+  visibility alone let anyone draw/detach edges on any node they could merely see.)
+
+  > **Decision:** creating or deleting an edge requires the viewer to OWN the source node
+  > (or be admin via audited `/api/v1/admin/*` routes — i.e. effectively owner-only here,
+  > since `/edges` uses `get_scoped_viewer`). Same standard as node mutations.
+  > Visible-but-not-owned source → 403 (the node is visible, so 403 leaks nothing;
+  > invisible endpoints still 404 first, ADR-004). Wikilink-generated edges are unaffected —
+  > they run as the owner inside `node_service`. Approved by the orchestrator in Task 9 review.
+
+  Gate order (shared `_check_endpoints` helper in `edges.py`): source visible (404) →
+  source owned (403) → target visible (404) → only then Neo4j. RED→GREEN:
+  `test_create_edge_non_owned_source_403`, `test_delete_edge_non_owned_source_403`
+  (auth fires before any Neo4j call, so both run without Neo4j; owner success paths
+  remain the `neo4j_session`-skipped tests).
+
 ---
 
 ## Task 10 — Daily logs API

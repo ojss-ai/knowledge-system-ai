@@ -130,6 +130,38 @@ async def test_delete_edge_invisible_target_looks_not_found(
     assert "del-secret" not in r.text  # content
 
 
+async def test_create_edge_non_owned_source_403(
+    client: AsyncClient, auth_headers, auth_headers_other
+):
+    """Edge mutations require OWNING the source node (same standard as node
+    mutations). The source is public — visible to the caller — so a 403 here
+    confirms nothing they could not already see. Auth fires before any Neo4j
+    call, so this runs without Neo4j."""
+    theirs_id = await _create_node(client, auth_headers, "TheirsPublic")
+    mine_id = await _create_node(client, auth_headers_other, "MineTarget")
+    r = await client.post(
+        "/api/v1/edges",
+        json={"source_id": theirs_id, "target_id": mine_id, "label": "LINKS_TO"},
+        headers=auth_headers_other,
+    )
+    assert r.status_code == 403
+
+
+async def test_delete_edge_non_owned_source_403(
+    client: AsyncClient, auth_headers, auth_headers_other
+):
+    """Same ownership rule on DELETE: visible-but-not-owned source is 403."""
+    theirs_id = await _create_node(client, auth_headers, "TheirsPublicDel")
+    mine_id = await _create_node(client, auth_headers_other, "MineTargetDel")
+    r = await client.request(
+        "DELETE",
+        "/api/v1/edges",
+        json={"source_id": theirs_id, "target_id": mine_id, "label": "LINKS_TO"},
+        headers=auth_headers_other,
+    )
+    assert r.status_code == 403
+
+
 async def test_neighborhood_invisible_center_looks_not_found(
     client: AsyncClient, auth_headers, auth_headers_other
 ):
