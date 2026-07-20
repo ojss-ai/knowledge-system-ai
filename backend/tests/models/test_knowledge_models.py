@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.models.group import Group
-from app.models.knowledge import KnowledgeNode, NodeShare, Tag
+from app.models.knowledge import KnowledgeNode, NodeRevision, NodeShare, Tag
 from app.models.user import Visibility
 
 pytestmark = pytest.mark.asyncio
@@ -70,6 +70,44 @@ async def test_share_requires_exactly_one_grantee_both(db, make_user, make_node)
     with pytest.raises(IntegrityError):
         async with db.begin_nested():
             db.add(NodeShare(node_id=node.id, user_id=other.id, group_id=group.id))
+            await db.flush()
+
+
+async def test_revision_version_unique_per_node(db, make_user, make_node):
+    """Revisions accumulate per node; version is unique per node but reusable across nodes."""
+    user = await make_user(email="rev@test.com")
+    node = await make_node(user, title="v1", body="first")
+    other_node = await make_node(user, title="other")
+
+    def _rev(target, version: int) -> NodeRevision:
+        return NodeRevision(
+            node_id=target.id,
+            version=version,
+            title_snapshot=target.title,
+            body_snapshot=target.body,
+            changed_by=user.id,
+        )
+
+    db.add_all([_rev(node, 1), _rev(node, 2)])
+    await db.flush()
+
+    revisions = (
+        await db.scalars(
+            select(NodeRevision)
+            .where(NodeRevision.node_id == node.id)
+            .order_by(NodeRevision.version)
+        )
+    ).all()
+    assert [r.version for r in revisions] == [1, 2]
+
+    # Same version on a different node is fine.
+    db.add(_rev(other_node, 1))
+    await db.flush()
+
+    # Duplicate version on the same node violates uq_revision_version.
+    with pytest.raises(IntegrityError):
+        async with db.begin_nested():
+            db.add(_rev(node, 2))
             await db.flush()
 
 
