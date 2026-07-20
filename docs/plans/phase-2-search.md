@@ -657,15 +657,17 @@ feat(embedding): Embedder protocol, FakeEmbedder (deterministic), SentenceTransf
 
 ### Steps
 
-- [ ] **5.1** Write the failing tests (idempotency test is MANDATORY per kb-celery-jobs):
+- [x] **5.1** Write the failing tests (idempotency test is MANDATORY per kb-celery-jobs):
+
+> [plan-fix] dropped unused `uuid` / `FakeEmbedder` imports (ruff F401; the fixture provides the
+> embedder). Added empty `backend/tests/workers/__init__.py` and `backend/app/workers/tasks/__init__.py`
+> (test dirs are packages here, mirroring `tests/services/`).
 
 ```python
 # backend/tests/workers/test_embed_node.py
-import uuid
 import pytest
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from app.models.chunk import NodeChunk
-from app.services.embedding_service import FakeEmbedder
 from app.workers.tasks.embed_node import _embed_node_impl
 
 pytestmark = pytest.mark.asyncio
@@ -678,7 +680,9 @@ async def test_embed_node_creates_chunks(db, make_user, make_node, fake_embedder
 
     await _embed_node_impl(db, node.id, fake_embedder)
 
-    count = await db.scalar(select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id))
+    count = await db.scalar(
+        select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id)
+    )
     assert count >= 1
 
 
@@ -698,7 +702,9 @@ async def test_embed_node_idempotent(db, make_user, make_node, fake_embedder):
         select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id)
     )
 
-    assert count_after_first == count_after_second, "Re-running embed must not create duplicate chunks"
+    assert count_after_first == count_after_second, (
+        "Re-running embed must not create duplicate chunks"
+    )
 
 
 async def test_embed_node_stores_vectors(db, make_user, make_node, fake_embedder):
@@ -712,16 +718,23 @@ async def test_embed_node_stores_vectors(db, make_user, make_node, fake_embedder
     assert len(chunk.embedding) == 768
 ```
 
-- [ ] **5.2** Implement:
+- [x] **5.2** Implement:
+
+> [plan-fix] deviations from the original block, all lint/type driven, behavior identical:
+> `asyncio.run(_run())` instead of `asyncio.get_event_loop().run_until_complete(...)`
+> (deprecated on 3.12, breaks off the main thread); `zip(..., strict=True)` (ruff B905);
+> `raise self.retry(exc=exc) from exc` (ruff B904); removed unused `shared_task` import and
+> empty `TYPE_CHECKING` block; `self: Task` annotation + `type: ignore[untyped-decorator]`
+> so `mypy --strict app/workers` passes (celery is untyped).
 
 ```python
 # backend/app/workers/tasks/embed_node.py
 from __future__ import annotations
 
+import asyncio
 import uuid
-from typing import TYPE_CHECKING
 
-from celery import shared_task
+from celery import Task
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -730,9 +743,6 @@ from app.models.knowledge import KnowledgeNode
 from app.services.chunking import chunk_markdown
 from app.services.embedding_service import Embedder, get_embedder
 from app.workers.celery_app import celery_app, task_session
-
-if TYPE_CHECKING:
-    pass
 
 
 async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embedder) -> None:
@@ -753,7 +763,7 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
 
     vectors = embedder.embed(texts)
 
-    for idx, (text, vec) in enumerate(zip(texts, vectors)):
+    for idx, (text, vec) in enumerate(zip(texts, vectors, strict=True)):
         chunk = NodeChunk(
             node_id=node_id,
             chunk_index=idx,
@@ -765,40 +775,38 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
     await db.flush()
 
 
-@celery_app.task(
+@celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
     bind=True,
     name="kb.embed_node",
     acks_late=True,
     max_retries=3,
     default_retry_delay=30,
 )
-def embed_node(self, node_id: str) -> None:
+def embed_node(self: Task, node_id: str) -> None:
     """
     Celery task: chunk and embed a knowledge node.
     Args must be primitives (str, not UUID).
     """
-    import asyncio
-
     nid = uuid.UUID(node_id)
     embedder = get_embedder()
 
-    async def _run():
+    async def _run() -> None:
         async with task_session() as db:
             await _embed_node_impl(db, nid, embedder)
 
     try:
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
     except Exception as exc:
-        raise self.retry(exc=exc)
+        raise self.retry(exc=exc) from exc
 ```
 
-- [ ] **5.3** Run tests:
+- [x] **5.3** Run tests:
 ```bash
 cd backend && pytest tests/workers/test_embed_node.py -v
 # Expected: 3 passed (including idempotency test)
 ```
 
-- [ ] **5.4** Commit:
+- [x] **5.4** Commit:
 ```
 feat(workers): embed_node task — idempotent chunking + vector storage
 ```
