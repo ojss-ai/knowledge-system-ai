@@ -211,11 +211,22 @@ feat(models): node_chunks model + migration 0004 with HNSW index (m=16, ef=64, c
 **Files:**
 - Create: `backend/app/workers/__init__.py`
 - Create: `backend/app/workers/celery_app.py`
+- Create: `backend/tests/workers/__init__.py`
 - Create: `backend/tests/workers/test_celery_app.py`
+- Modify: `backend/pyproject.toml` — declare `celery>=5.4` dependency + mypy override for untyped `celery.*`
 
 ### Steps
 
-- [ ] **2.1** Write the failing test:
+> **[plan-fix] notes (applied during execution):**
+> - Test 3 originally asserted on the `task_session` function object, but `@asynccontextmanager`
+>   returns a plain wrapper (neither an asyncgen function nor owning `__aenter__`) — the plan's
+>   own implementation failed it. The test now asserts on what `task_session()` returns,
+>   matching its stated intent.
+> - `from typing import AsyncIterator` → `collections.abc` (ruff UP035, matches `app/core/db.py`).
+> - `celery` was not declared in `pyproject.toml`; added, with a `celery.*` mypy
+>   `ignore_missing_imports` override (celery ships no py.typed marker).
+
+- [x] **2.1** Write the failing test:
 
 ```python
 # backend/tests/workers/test_celery_app.py
@@ -234,24 +245,25 @@ def test_celery_config():
 
 
 def test_task_session_is_context_manager():
-    """task_session must be usable as an async context manager."""
-    import inspect
-    assert inspect.isasyncgenfunction(task_session) or hasattr(task_session, "__aenter__")
+    """task_session() must produce an async context manager."""
+    cm = task_session()
+    assert hasattr(cm, "__aenter__")
+    assert hasattr(cm, "__aexit__")
 ```
 
-- [ ] **2.2** Run — expect ImportError:
+- [x] **2.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/workers/test_celery_app.py -x 2>&1 | head -10
 ```
 
-- [ ] **2.3** Implement:
+- [x] **2.3** Implement:
 
 ```python
 # backend/app/workers/celery_app.py
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
 
 from celery import Celery
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -286,18 +298,19 @@ async def task_session() -> AsyncIterator[AsyncSession]:
     Separate from the API session — never share sessions across boundaries.
     """
     from app.core.db import SessionLocal
+
     async with SessionLocal() as session:
         async with session.begin():
             yield session
 ```
 
-- [ ] **2.4** Run tests:
+- [x] **2.4** Run tests:
 ```bash
 cd backend && pytest tests/workers/test_celery_app.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **2.5** Commit:
+- [x] **2.5** Commit:
 ```
 feat(workers): Celery app setup with task_session context manager
 ```

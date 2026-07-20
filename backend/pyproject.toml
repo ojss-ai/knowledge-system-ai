@@ -16,6 +16,7 @@ dependencies = [
   "pgvector>=0.2.5",
   "redis>=5.0",
   "neo4j>=5.20",
+  "celery>=5.4",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +39,10 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "f
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
