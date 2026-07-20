@@ -55,6 +55,9 @@ async def test_wikilink_extraction(db, neo4j_session, make_user, make_node):
     await db.flush()
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     await ns.resolve_wikilinks(db, n1, viewer)
+    # [plan-fix] resolve_wikilinks only QUEUES graph ops (PG-first, ADR-011);
+    # run them as the post-commit caller would.
+    await ns.run_pending_graph_ops(db)
     # edges should have been created — verify via graph service
     from app.services import graph_service as gs
 
@@ -72,3 +75,86 @@ async def test_soft_delete(db, make_user, make_node):
     await ns.delete_node(db, node.id, viewer)
     with pytest.raises(NotFoundError):
         await ns.get_node(db, node.id, viewer)
+
+
+# --- PG-first invariant: no Neo4j work inside the transaction (ADR-011) ---
+
+
+def _graph_recorder(monkeypatch):
+    """Patch graph_service functions with recorders; return the call log."""
+    from app.services import graph_service as gs
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_upsert(node):
+        calls.append(("upsert", str(node.id)))
+
+    async def fake_soft_delete(node_id):
+        calls.append(("soft_delete", str(node_id)))
+
+    async def fake_merge(source_id, target_id, label, created_by, score=None):
+        calls.append(("edge", str(source_id), str(target_id), label))
+
+    monkeypatch.setattr(gs, "upsert_vertex", fake_upsert)
+    monkeypatch.setattr(gs, "soft_delete_vertex", fake_soft_delete)
+    monkeypatch.setattr(gs, "merge_edge", fake_merge)
+    return calls
+
+
+async def test_create_node_queues_graph_op(db, make_user, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ns_q_create@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    node = await ns.create_node(db, viewer=viewer, title="Queued")
+    assert calls == []  # nothing hit Neo4j inside the transaction
+    assert len(ns.pending_graph_ops(db)) == 1
+    await ns.run_pending_graph_ops(db)
+    assert calls == [("upsert", str(node.id))]
+    assert ns.pending_graph_ops(db) == []
+
+
+async def test_update_node_defers_graph_sync(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ns_q_upd@test.com")
+    node = await make_node(owner, title="Sync Later")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await ns.update_node(db, node.id, viewer, title="Synced")
+    assert calls == []  # graph op queued, not executed, pre-commit
+    assert len(ns.pending_graph_ops(db)) == 1
+    await ns.run_pending_graph_ops(db)
+    assert calls == [("upsert", str(node.id))]
+
+
+async def test_delete_node_defers_graph_sync(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ns_q_del@test.com")
+    node = await make_node(owner)
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await ns.delete_node(db, node.id, viewer)
+    assert calls == []
+    assert len(ns.pending_graph_ops(db)) == 1
+    await ns.run_pending_graph_ops(db)
+    assert calls == [("soft_delete", str(node.id))]
+
+
+async def test_resolve_wikilinks_defers_graph_sync(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ns_q_wl@test.com")
+    n1 = await make_node(owner, title="WL Source", body="see [[WL Target]]")
+    n2 = await make_node(owner, title="WL Target", body="")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await ns.resolve_wikilinks(db, n1, viewer)
+    assert calls == []  # edges queued for post-commit, not merged in-transaction
+    assert len(ns.pending_graph_ops(db)) == 3  # upsert n1, upsert n2, edge
+    await ns.run_pending_graph_ops(db)
+    assert ("edge", str(n1.id), str(n2.id), "LINKS_TO") in calls
+
+
+async def test_resolve_wikilinks_skips_self_link(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ns_self_wl@test.com")
+    node = await make_node(owner, title="Self Note", body="loop [[Self Note]]")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await ns.resolve_wikilinks(db, node, viewer)
+    await ns.run_pending_graph_ops(db)
+    assert all(c[0] != "edge" for c in calls)  # [[Own Title]] must not self-link

@@ -1041,7 +1041,7 @@ feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edg
 
 ### Steps
 
-- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable):
+- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable. Review-fix of 24e5685 added: PG-first deferral tests (`_graph_recorder` + create/update/delete/wikilinks queue tests) and a self-link guard test — see the final `backend/tests/services/test_node_service.py`; the wikilink live test now calls `run_pending_graph_ops` after `resolve_wikilinks`):
 
 ```python
 # backend/tests/services/test_node_service.py
@@ -1099,6 +1099,9 @@ async def test_wikilink_extraction(db, neo4j_session, make_user, make_node):
     await db.flush()
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     await ns.resolve_wikilinks(db, n1, viewer)
+    # resolve_wikilinks only QUEUES graph ops (PG-first); run them as the
+    # post-commit caller would.
+    await ns.run_pending_graph_ops(db)
     # edges should have been created — verify via graph service
     from app.services import graph_service as gs
     hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
@@ -1123,14 +1126,23 @@ cd backend && pytest tests/services/test_node_service.py -x 2>&1 | head -20
 
 - [x] **6.3** Implement `node_service.py` (plan-fix: matched the real `graph_service` API — `upsert_vertex(node)`, `soft_delete_vertex(node_id)`, `merge_edge(src, tgt, label, created_by=...)`; there is no `create_vertex`, no `db` arg, no `props` kwarg. Graph calls wrapped in best-effort `_graph_sync` so a Neo4j failure never fails/rolls back the PG write (CLAUDE.md invariant; Celery retry task lands with the workers phase). `func` imported at top instead of the bottom-of-file import):
 
+> [plan-fix, review of 24e5685] **PG-first invariant**: mutation functions must not run
+> Neo4j ops inside the transaction (get_db commits after the handler returns, so an
+> in-function `_graph_sync` ran pre-commit). All mutations now QUEUE ops on the session
+> (`db.info["pending_graph_ops"]` via `_queue_graph_op`) and the caller runs
+> `await node_service.run_pending_graph_ops(db)` AFTER `db.commit()` (see Task 8 router).
+> `create_node`'s old "caller calls gs.upsert_vertex post-commit" note is superseded by the
+> same queue. Also: `resolve_wikilinks` skips self-links (`[[Own Title]]`).
+
 ```python
 # backend/app/services/node_service.py
 from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 import structlog
@@ -1160,6 +1172,35 @@ async def _graph_sync(op: Coroutine[Any, Any, None]) -> None:
         logger.warning("graph_sync_failed", error=str(exc))
 
 
+# A pending graph operation: zero-arg callable producing the coroutine to await.
+# Stored as partials (not live coroutines) so discarding them on rollback is safe.
+GraphOp = Callable[[], Coroutine[Any, Any, None]]
+
+_PENDING_KEY = "pending_graph_ops"
+
+
+def _queue_graph_op(db: AsyncSession, op: GraphOp) -> None:
+    """Queue a Neo4j op to run after the PG commit — never inside it (ADR-011)."""
+    db.info.setdefault(_PENDING_KEY, []).append(op)
+
+
+def pending_graph_ops(db: AsyncSession) -> list[GraphOp]:
+    """Graph ops queued on this session, awaiting run_pending_graph_ops()."""
+    ops: list[GraphOp] = db.info.get(_PENDING_KEY, [])
+    return list(ops)
+
+
+async def run_pending_graph_ops(db: AsyncSession) -> None:
+    """Run (and clear) the session's queued Neo4j ops.
+
+    Callers MUST invoke this AFTER ``db.commit()``. Best-effort: each op is
+    wrapped in _graph_sync, so a Neo4j failure is logged, never raised.
+    """
+    ops: list[GraphOp] = db.info.pop(_PENDING_KEY, [])
+    for op in ops:
+        await _graph_sync(op())
+
+
 async def create_node(
     db: AsyncSession,
     *,
@@ -1185,9 +1226,9 @@ async def create_node(
     )
     db.add(node)
     await db.flush()
-    # NOTE: Neo4j vertex upsert happens AFTER db.commit() in the calling code path.
-    # node_service.create_node() callers must call gs.upsert_vertex(node) post-commit,
-    # or the router does so after awaiting the service (see kb-neo4j-graph skill).
+    # Neo4j vertex upsert runs AFTER db.commit(): queued here, executed by the
+    # caller via run_pending_graph_ops(db) (module docstring, kb-neo4j-graph).
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))
     return node
 
 
@@ -1261,7 +1302,7 @@ async def update_node(
 
     node.updated_at = datetime.now(UTC)
     await db.flush()
-    await _graph_sync(gs.upsert_vertex(node))  # sync vertex props
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
     return node
 
 
@@ -1271,40 +1312,46 @@ async def delete_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> N
         raise ForbiddenError("Only owner or admin can delete a node")
     node.deleted_at = datetime.now(UTC)
     await db.flush()
-    await _graph_sync(gs.soft_delete_vertex(node_id))
+    _queue_graph_op(db, partial(gs.soft_delete_vertex, node_id))
 
 
 async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewer) -> None:
     """
     Find [[Title]] references in node.body, resolve to node IDs by title,
-    and MERGE LINKS_TO edges in Neo4j via graph_service.
-    Unresolved titles are silently skipped.
+    and queue LINKS_TO edge MERGEs for post-commit run_pending_graph_ops().
+    Unresolved titles and self-references ([[Own Title]]) are silently skipped.
     """
     titles = _WIKILINK_RE.findall(node.body)
     if not titles:
         return
 
-    # Ensure source vertex exists
-    await _graph_sync(gs.upsert_vertex(node))
+    # Ensure source vertex exists (queued: runs post-commit, before the edges)
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))
 
     clause = visible_nodes_clause(viewer)
     for title in set(titles):
+        if title == node.title:
+            continue  # self-link guard: [[Own Title]] creates no edge
+        # Titles are not unique; MVP behavior is "first visible match wins"
+        # (.limit(1)). Revisit if titles ever get a uniqueness rule.
         target = await db.scalar(
             select(KnowledgeNode)
             .where(KnowledgeNode.title == title)
             .where(clause)
             .limit(1)
         )
-        if target is None:
+        if target is None or target.id == node.id:
             continue
-        await _graph_sync(gs.upsert_vertex(target))
-        await _graph_sync(gs.merge_edge(node.id, target.id, "LINKS_TO", created_by="wikilink"))
+        _queue_graph_op(db, partial(gs.upsert_vertex, target))
+        _queue_graph_op(
+            db, partial(gs.merge_edge, node.id, target.id, "LINKS_TO", created_by="wikilink")
+        )
 ```
 
 - [x] **6.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -v
-# Expected: 6 passed (5 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
+# Expected: 11 passed (10 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
 ```
 
 - [x] **6.5** Commit:
@@ -1538,7 +1585,9 @@ async def test_delete_node(client: AsyncClient, auth_headers):
 cd backend && pytest tests/api/test_nodes_api.py -x 2>&1 | head -20
 ```
 
-- [ ] **8.3** Create the router:
+- [ ] **8.3** Create the router ([plan-fix, review of 24e5685]: mutation handlers must run
+  `await ns.run_pending_graph_ops(db)` AFTER `await db.commit()` — the service only queues
+  Neo4j ops on the session; the router is the post-commit caller):
 
 ```python
 # backend/app/api/v1/nodes.py
@@ -1575,6 +1624,7 @@ async def create_node(
         meta=payload.meta,
     )
     await db.commit()
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
     return node
 
 
@@ -1612,6 +1662,7 @@ async def update_node(
         meta=payload.meta,
     )
     await db.commit()
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
     return node
 
 
@@ -1623,6 +1674,7 @@ async def delete_node(
 ):
     await ns.delete_node(db, node_id, viewer)
     await db.commit()
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
 
 
 @router.post("/{node_id}/shares", response_model=NodeOut, status_code=status.HTTP_201_CREATED)

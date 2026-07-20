@@ -2,15 +2,28 @@
 Knowledge node service: CRUD, revisions, wikilink resolution, soft-delete.
 
 Every read goes through app/services/visibility.py (ADR-004).
-PG is the source of truth; Neo4j sync is best-effort post-write (ADR-011).
+
+PG is the source of truth; Neo4j is synced strictly AFTER the PG commit
+(ADR-011, CLAUDE.md "PG first, Neo4j second"). Mutation functions never touch
+Neo4j themselves — they queue pending graph operations on the session
+(``db.info["pending_graph_ops"]``) and the caller (router/worker) runs them
+once the transaction is durable:
+
+    await db.commit()
+    await node_service.run_pending_graph_ops(db)
+
+Each op is best-effort: a Neo4j failure is logged and never fails (or rolls
+back) the relational write. If the session rolls back, the queued ops are
+simply discarded with it (they are only executed explicitly).
 """
 
 from __future__ import annotations
 
 import re
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 import structlog
@@ -40,6 +53,35 @@ async def _graph_sync(op: Coroutine[Any, Any, None]) -> None:
         logger.warning("graph_sync_failed", error=str(exc))
 
 
+# A pending graph operation: zero-arg callable producing the coroutine to await.
+# Stored as partials (not live coroutines) so discarding them on rollback is safe.
+GraphOp = Callable[[], Coroutine[Any, Any, None]]
+
+_PENDING_KEY = "pending_graph_ops"
+
+
+def _queue_graph_op(db: AsyncSession, op: GraphOp) -> None:
+    """Queue a Neo4j op to run after the PG commit — never inside it (ADR-011)."""
+    db.info.setdefault(_PENDING_KEY, []).append(op)
+
+
+def pending_graph_ops(db: AsyncSession) -> list[GraphOp]:
+    """Graph ops queued on this session, awaiting run_pending_graph_ops()."""
+    ops: list[GraphOp] = db.info.get(_PENDING_KEY, [])
+    return list(ops)
+
+
+async def run_pending_graph_ops(db: AsyncSession) -> None:
+    """Run (and clear) the session's queued Neo4j ops.
+
+    Callers MUST invoke this AFTER ``db.commit()``. Best-effort: each op is
+    wrapped in _graph_sync, so a Neo4j failure is logged, never raised.
+    """
+    ops: list[GraphOp] = db.info.pop(_PENDING_KEY, [])
+    for op in ops:
+        await _graph_sync(op())
+
+
 async def create_node(
     db: AsyncSession,
     *,
@@ -65,9 +107,9 @@ async def create_node(
     )
     db.add(node)
     await db.flush()
-    # NOTE: Neo4j vertex upsert happens AFTER db.commit() in the calling code path.
-    # node_service.create_node() callers must call gs.upsert_vertex(node) post-commit,
-    # or the router does so after awaiting the service (see kb-neo4j-graph skill).
+    # Neo4j vertex upsert runs AFTER db.commit(): queued here, executed by the
+    # caller via run_pending_graph_ops(db) (module docstring, kb-neo4j-graph).
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))
     return node
 
 
@@ -148,7 +190,7 @@ async def update_node(
 
     node.updated_at = datetime.now(UTC)
     await db.flush()
-    await _graph_sync(gs.upsert_vertex(node))  # sync vertex props
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
     return node
 
 
@@ -158,28 +200,34 @@ async def delete_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> N
         raise ForbiddenError("Only owner or admin can delete a node")
     node.deleted_at = datetime.now(UTC)
     await db.flush()
-    await _graph_sync(gs.soft_delete_vertex(node_id))
+    _queue_graph_op(db, partial(gs.soft_delete_vertex, node_id))
 
 
 async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewer) -> None:
     """
     Find [[Title]] references in node.body, resolve to node IDs by title,
-    and MERGE LINKS_TO edges in Neo4j via graph_service.
-    Unresolved titles are silently skipped.
+    and queue LINKS_TO edge MERGEs for post-commit run_pending_graph_ops().
+    Unresolved titles and self-references ([[Own Title]]) are silently skipped.
     """
     titles = _WIKILINK_RE.findall(node.body)
     if not titles:
         return
 
-    # Ensure source vertex exists
-    await _graph_sync(gs.upsert_vertex(node))
+    # Ensure source vertex exists (queued: runs post-commit, before the edges)
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))
 
     clause = visible_nodes_clause(viewer)
     for title in set(titles):
+        if title == node.title:
+            continue  # self-link guard: [[Own Title]] creates no edge
+        # Titles are not unique; MVP behavior is "first visible match wins"
+        # (.limit(1)). Revisit if titles ever get a uniqueness rule.
         target = await db.scalar(
             select(KnowledgeNode).where(KnowledgeNode.title == title).where(clause).limit(1)
         )
-        if target is None:
+        if target is None or target.id == node.id:
             continue
-        await _graph_sync(gs.upsert_vertex(target))
-        await _graph_sync(gs.merge_edge(node.id, target.id, "LINKS_TO", created_by="wikilink"))
+        _queue_graph_op(db, partial(gs.upsert_vertex, target))
+        _queue_graph_op(
+            db, partial(gs.merge_edge, node.id, target.id, "LINKS_TO", created_by="wikilink")
+        )
