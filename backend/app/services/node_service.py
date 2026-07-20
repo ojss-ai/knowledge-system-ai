@@ -28,9 +28,10 @@ from typing import Any
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ForbiddenError, NotFoundError
+from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.models.knowledge import KnowledgeNode, NodeRevision, NodeType
 from app.models.user import Role, Visibility
 from app.services import graph_service as gs
@@ -162,17 +163,22 @@ async def update_node(
     if node.owner_id != viewer.user_id and viewer.role != Role.admin:
         raise ForbiddenError("Only owner or admin can edit a node")
 
-    # Save revision before mutating
-    rev_count = (
+    # Save revision before mutating. Lock the node row so concurrent updates
+    # serialize their revision numbering, then take max(version)+1 —
+    # COUNT(*)+1 is racy and breaks when versions have gaps.
+    await db.execute(
+        select(KnowledgeNode.id).where(KnowledgeNode.id == node_id).with_for_update()
+    )
+    max_version = (
         await db.scalar(
-            select(func.count()).select_from(NodeRevision).where(NodeRevision.node_id == node_id)
+            select(func.max(NodeRevision.version)).where(NodeRevision.node_id == node_id)
         )
         or 0
     )
     revision = NodeRevision(
         id=uuid.uuid4(),
         node_id=node.id,
-        version=rev_count + 1,
+        version=max_version + 1,
         title_snapshot=node.title,
         body_snapshot=node.body,
         changed_by=viewer.user_id,
@@ -189,7 +195,14 @@ async def update_node(
         node.meta = {**node.meta, **meta}
 
     node.updated_at = datetime.now(UTC)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Residual duplicate (node_id, version) despite the row lock —
+        # e.g. a writer path that skipped the lock. Surface as a 409.
+        if "uq_revision_version" in str(exc.orig):
+            raise ConflictError(f"Concurrent revision conflict for node {node_id}") from exc
+        raise
     _queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
     return node
 

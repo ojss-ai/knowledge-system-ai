@@ -158,3 +158,29 @@ async def test_resolve_wikilinks_skips_self_link(db, make_user, make_node, monke
     await ns.resolve_wikilinks(db, node, viewer)
     await ns.run_pending_graph_ops(db)
     assert all(c[0] != "edge" for c in calls)  # [[Own Title]] must not self-link
+
+
+async def test_revision_version_uses_max_not_count(db, make_user, make_node):
+    """COUNT(*)+1 breaks when versions have gaps → duplicate (node_id, version)."""
+    import uuid
+
+    from app.models.knowledge import NodeRevision
+
+    owner = await make_user(email="ns_ver@test.com")
+    node = await make_node(owner, title="Versioned", body="b")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    # Pre-existing gap: a lone revision at version 2 (COUNT=1 would compute "2" again)
+    db.add(
+        NodeRevision(
+            id=uuid.uuid4(),
+            node_id=node.id,
+            version=2,
+            title_snapshot="old",
+            body_snapshot="old",
+            changed_by=owner.id,
+        )
+    )
+    await db.flush()
+    await ns.update_node(db, node.id, viewer, body="b2")
+    await db.refresh(node, ["revisions"])
+    assert sorted(r.version for r in node.revisions) == [2, 3]

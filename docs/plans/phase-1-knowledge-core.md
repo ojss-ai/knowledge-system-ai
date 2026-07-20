@@ -1041,7 +1041,7 @@ feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edg
 
 ### Steps
 
-- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable. Review-fix of 24e5685 added: PG-first deferral tests (`_graph_recorder` + create/update/delete/wikilinks queue tests) and a self-link guard test — see the final `backend/tests/services/test_node_service.py`; the wikilink live test now calls `run_pending_graph_ops` after `resolve_wikilinks`):
+- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable. Review-fix of 24e5685 added: PG-first deferral tests (`_graph_recorder` + create/update/delete/wikilinks queue tests) a self-link guard test, and a `max(version)+1` revision-gap test — see the final `backend/tests/services/test_node_service.py`; the wikilink live test now calls `run_pending_graph_ops` after `resolve_wikilinks`):
 
 ```python
 # backend/tests/services/test_node_service.py
@@ -1132,7 +1132,9 @@ cd backend && pytest tests/services/test_node_service.py -x 2>&1 | head -20
 > (`db.info["pending_graph_ops"]` via `_queue_graph_op`) and the caller runs
 > `await node_service.run_pending_graph_ops(db)` AFTER `db.commit()` (see Task 8 router).
 > `create_node`'s old "caller calls gs.upsert_vertex post-commit" note is superseded by the
-> same queue. Also: `resolve_wikilinks` skips self-links (`[[Own Title]]`).
+> same queue. Also: `resolve_wikilinks` skips self-links (`[[Own Title]]`), and revision
+> numbering uses `max(version)+1` under a `FOR UPDATE` lock on the node row instead of the
+> racy `COUNT(*)+1`; a residual duplicate `(node_id, version)` maps to `ConflictError` (409).
 
 ```python
 # backend/app/services/node_service.py
@@ -1147,9 +1149,10 @@ from typing import Any
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ForbiddenError, NotFoundError
+from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.models.knowledge import KnowledgeNode, NodeRevision, NodeType
 from app.models.user import Role, Visibility
 from app.services import graph_service as gs
@@ -1277,14 +1280,22 @@ async def update_node(
     if node.owner_id != viewer.user_id and viewer.role != Role.admin:
         raise ForbiddenError("Only owner or admin can edit a node")
 
-    # Save revision before mutating
-    rev_count = await db.scalar(
-        select(func.count()).select_from(NodeRevision).where(NodeRevision.node_id == node_id)
-    ) or 0
+    # Save revision before mutating. Lock the node row so concurrent updates
+    # serialize their revision numbering, then take max(version)+1 —
+    # COUNT(*)+1 is racy and breaks when versions have gaps.
+    await db.execute(
+        select(KnowledgeNode.id).where(KnowledgeNode.id == node_id).with_for_update()
+    )
+    max_version = (
+        await db.scalar(
+            select(func.max(NodeRevision.version)).where(NodeRevision.node_id == node_id)
+        )
+        or 0
+    )
     revision = NodeRevision(
         id=uuid.uuid4(),
         node_id=node.id,
-        version=rev_count + 1,
+        version=max_version + 1,
         title_snapshot=node.title,
         body_snapshot=node.body,
         changed_by=viewer.user_id,
@@ -1301,7 +1312,14 @@ async def update_node(
         node.meta = {**node.meta, **meta}
 
     node.updated_at = datetime.now(UTC)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Residual duplicate (node_id, version) despite the row lock —
+        # e.g. a writer path that skipped the lock. Surface as a 409.
+        if "uq_revision_version" in str(exc.orig):
+            raise ConflictError(f"Concurrent revision conflict for node {node_id}") from exc
+        raise
     _queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
     return node
 
@@ -1351,7 +1369,7 @@ async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewe
 - [x] **6.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -v
-# Expected: 11 passed (10 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
+# Expected: 12 passed (11 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
 ```
 
 - [x] **6.5** Commit:
