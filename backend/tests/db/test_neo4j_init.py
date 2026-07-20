@@ -1,6 +1,9 @@
 import pytest
 from neo4j import AsyncSession as Neo4jSession
 
+from app.core.config import settings
+from app.main import create_app
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -19,3 +22,11 @@ async def test_node_id_constraint_exists(neo4j_session: Neo4jSession):
     )
     records = await result.data()
     assert len(records) >= 1, "Missing uniqueness constraint on :Node(node_id)"
+
+
+async def test_app_starts_when_neo4j_down(monkeypatch):
+    """Startup must not crash if Neo4j is unreachable: constraints are retried later."""
+    monkeypatch.setattr(settings, "neo4j_uri", "bolt://localhost:1")  # nothing listens here
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        pass  # reaching here means startup survived Neo4j being down
