@@ -742,6 +742,7 @@ from app.models.chunk import NodeChunk
 from app.models.knowledge import KnowledgeNode
 from app.services.chunking import chunk_markdown
 from app.services.embedding_service import Embedder, get_embedder
+from app.services.visibility import SYSTEM_VIEWER, visible_nodes_clause
 from app.workers.celery_app import celery_app, task_session
 
 
@@ -750,16 +751,27 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
     Core logic extracted for unit-testability (no Celery dependency).
     Idempotent: deletes existing chunks for the node before reinserting.
     """
-    node = await db.scalar(select(KnowledgeNode).where(KnowledgeNode.id == node_id))
-    if node is None or node.deleted_at is not None:
+    # SYSTEM_VIEWER justification (kb-visibility-filter rule 1): embedding is a
+    # system job that must (re)index any LIVE node regardless of owner. Going
+    # through visible_nodes_clause keeps the single visibility choke point and
+    # still excludes soft-deleted rows; the result is never shown to a user.
+    node = await db.scalar(
+        select(KnowledgeNode).where(
+            KnowledgeNode.id == node_id,
+            visible_nodes_clause(SYSTEM_VIEWER),
+        )
+    )
+    if node is None:
         return
 
     texts = chunk_markdown(node.body)
+
+    # Idempotent replace: the delete ALWAYS runs, even when the new chunk list
+    # is empty — a body edited down to nothing must clear its stale chunks.
+    await db.execute(delete(NodeChunk).where(NodeChunk.node_id == node_id))
+
     if not texts:
         return
-
-    # Idempotent: replace all chunks
-    await db.execute(delete(NodeChunk).where(NodeChunk.node_id == node_id))
 
     vectors = embedder.embed(texts)
 
@@ -778,9 +790,10 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
 @celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
     bind=True,
     name="kb.embed_node",
+    queue="embed",  # CPU/GPU-bound work (kb-celery-jobs rule 6); workers must consume -Q embed
     acks_late=True,
     max_retries=3,
-    default_retry_delay=30,
+    retry_backoff=True,
 )
 def embed_node(self: Task, node_id: str) -> None:
     """
@@ -830,6 +843,24 @@ feat(workers): embed_node task — idempotent chunking + vector storage
   delete. The delete now always runs; the early return only skips the insert.
   Test (RED first): `test_reembed_empty_body_clears_stale_chunks` — embed, set
   `body=""`, re-embed, assert chunk count 0.
+
+- [x] **5.R.3 (IMPORTANT)** Added `queue="embed"` to the task decorator per the
+  kb-celery-jobs canonical shape (rule 6: embed queue for CPU/GPU work).
+  **Operational note:** embedding workers must consume that queue —
+  `celery -A app.workers.celery_app worker -Q embed`.
+
+- [x] **5.R.4 (IMPORTANT)** Replaced `default_retry_delay=30` with
+  `retry_backoff=True`, matching the skill template (`max_retries=3,
+  retry_backoff=True, acks_late=True`). The skill does not prescribe
+  `retry_jitter`, so it is not set. RED first for both via
+  `test_embed_node_task_options` (asserts queue/backoff/acks_late/max_retries).
+
+- [x] **5.R.5 (NIT)** Retry-path unit test: `test_embed_failure_propagates_for_retry`
+  monkey-style BoomEmbedder raises; asserts `_embed_node_impl` propagates the
+  exception (so the wrapper's `raise self.retry(exc=exc)` fires). Asserting
+  `celery.exceptions.Retry` from the bound task directly requires a broker /
+  task request context; per kb-celery-jobs that is integration territory —
+  the design was not distorted for testability.
 
 ---
 

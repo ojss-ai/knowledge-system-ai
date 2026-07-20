@@ -2,9 +2,17 @@ import pytest
 from sqlalchemy import func, select
 
 from app.models.chunk import NodeChunk
-from app.workers.tasks.embed_node import _embed_node_impl
+from app.workers.tasks.embed_node import _embed_node_impl, embed_node
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_embed_node_task_options():
+    """Canonical kb-celery-jobs task shape: embed queue, backoff retries, late acks."""
+    assert embed_node.queue == "embed", "CPU-bound embedding must route to the embed queue"
+    assert embed_node.retry_backoff is True
+    assert embed_node.acks_late is True
+    assert embed_node.max_retries == 3
 
 
 async def test_embed_node_creates_chunks(db, make_user, make_node, fake_embedder):
@@ -89,3 +97,21 @@ async def test_embed_node_stores_vectors(db, make_user, make_node, fake_embedder
     chunk = await db.scalar(select(NodeChunk).where(NodeChunk.node_id == node.id))
     assert chunk.embedding is not None
     assert len(chunk.embedding) == 768
+
+
+async def test_embed_failure_propagates_for_retry(db, make_user, make_node):
+    """Transient embedder failures must escape _embed_node_impl (not be swallowed),
+    so the Celery wrapper's `raise self.retry(exc=exc)` fires. The bound task's
+    retry itself needs a broker and is exercised only in integration
+    (kb-celery-jobs: no live broker in unit tests)."""
+
+    class BoomEmbedder:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            raise RuntimeError("transient embedding backend failure")
+
+    owner = await make_user(email="embed6@test.com")
+    node = await make_node(owner, body="Content that will fail to embed.")
+    await db.flush()
+
+    with pytest.raises(RuntimeError, match="transient embedding backend failure"):
+        await _embed_node_impl(db, node.id, BoomEmbedder())

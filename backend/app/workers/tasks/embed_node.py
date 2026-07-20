@@ -59,9 +59,10 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
 @celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
     bind=True,
     name="kb.embed_node",
+    queue="embed",  # CPU/GPU-bound work (kb-celery-jobs rule 6); workers must consume -Q embed
     acks_late=True,
     max_retries=3,
-    default_retry_delay=30,
+    retry_backoff=True,
 )
 def embed_node(self: Task, node_id: str) -> None:
     """
