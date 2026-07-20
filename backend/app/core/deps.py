@@ -1,5 +1,4 @@
 import uuid
-from dataclasses import dataclass
 
 import jwt as pyjwt
 from fastapi import Depends, HTTPException, Query
@@ -12,14 +11,14 @@ from app.core.security import decode_token
 from app.models.group import GroupMember
 from app.models.user import Role
 
+# THE auth-context type (kb-conventions): the canonical Viewer lives in the
+# visibility service. deps re-exports it so routers depend on one type only —
+# a structural duplicate here breaks mypy at every service call site.
+from app.services.visibility import Viewer
+
 _bearer = HTTPBearer(auto_error=False)
 
-
-@dataclass(frozen=True)
-class Viewer:
-    user_id: uuid.UUID
-    role: Role
-    group_ids: frozenset[uuid.UUID]
+__all__ = ["Viewer", "get_current_viewer", "get_scoped_viewer", "require_admin", "Pagination"]
 
 
 async def get_current_viewer(

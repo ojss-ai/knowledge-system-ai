@@ -1929,6 +1929,15 @@ cd backend && pytest tests/api/test_graph_api.py -v
 feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborhood, /overview
 ```
 
+### Review fixes (Task 9 `/kb-review`)
+
+- [x] **9.R1** ([plan-fix]: `app/core/deps.py` defined its own `Viewer` dataclass, structurally
+  identical to `app.services.visibility.Viewer` — mypy on `app/api` failed with 12 arg-type
+  errors at every service call site. deps now imports and re-exports the canonical Viewer
+  (kb-conventions: Viewer is THE auth-context type). Verification gate widened:
+  `mypy app/api app/services app/schemas` must pass — observed
+  `Success: no issues found in 20 source files` with no strictness loosened.)
+
 ---
 
 ## Task 10 — Daily logs API
