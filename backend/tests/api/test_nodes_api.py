@@ -136,9 +136,7 @@ async def test_share_grants_visibility(client: AsyncClient, auth_headers, auth_h
     assert post.status_code == 200
 
 
-async def test_share_by_non_owner_forbidden(
-    client: AsyncClient, auth_headers, auth_headers_other
-):
+async def test_share_by_non_owner_forbidden(client: AsyncClient, auth_headers, auth_headers_other):
     """A viewer must not be able to extend visibility of a node they do not own."""
     me = await client.get("/api/v1/users/me", headers=auth_headers_other)
     other_id = me.json()["id"]

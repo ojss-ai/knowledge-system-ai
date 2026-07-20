@@ -176,9 +176,7 @@ async def update_node(
     # Save revision before mutating. Lock the node row so concurrent updates
     # serialize their revision numbering, then take max(version)+1 —
     # COUNT(*)+1 is racy and breaks when versions have gaps.
-    await db.execute(
-        select(KnowledgeNode.id).where(KnowledgeNode.id == node_id).with_for_update()
-    )
+    await db.execute(select(KnowledgeNode.id).where(KnowledgeNode.id == node_id).with_for_update())
     max_version = (
         await db.scalar(
             select(func.max(NodeRevision.version)).where(NodeRevision.node_id == node_id)

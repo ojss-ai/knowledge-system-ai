@@ -32,9 +32,7 @@ class DailyLogCreate(BaseModel):
     body: str = ""
 
 
-async def _existing_log(
-    db: AsyncSession, viewer: Viewer, date_str: str
-) -> KnowledgeNode | None:
+async def _existing_log(db: AsyncSession, viewer: Viewer, date_str: str) -> KnowledgeNode | None:
     """The sanctioned existence probe (module docstring): this user's log for a date."""
     row: KnowledgeNode | None = await db.scalar(
         select(KnowledgeNode).where(

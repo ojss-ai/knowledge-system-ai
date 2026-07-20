@@ -47,10 +47,13 @@ async def test_create_node_duplicate_source_ref_conflict(db, make_user):
     await ns.create_node(
         db, viewer=viewer, title="Log A", source="daily_log", source_ref="2026-07-19"
     )
+    # Savepoint keeps the outer test transaction usable after the failed flush
+    # (same pattern as the model-level IntegrityError tests — no SAWarning).
     with pytest.raises(ConflictError):
-        await ns.create_node(
-            db, viewer=viewer, title="Log B", source="daily_log", source_ref="2026-07-19"
-        )
+        async with db.begin_nested():
+            await ns.create_node(
+                db, viewer=viewer, title="Log B", source="daily_log", source_ref="2026-07-19"
+            )
 
 
 async def test_update_node_creates_revision(db, make_user, make_node):

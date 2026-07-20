@@ -127,9 +127,7 @@ async def test_group_shared_node_visible_only_to_members(db, make_user, make_nod
 
     member_ids = {
         r.id
-        for r in await db.scalars(
-            select(KnowledgeNode).where(visible_nodes_clause(member_viewer))
-        )
+        for r in await db.scalars(select(KnowledgeNode).where(visible_nodes_clause(member_viewer)))
     }
     outsider_ids = {
         r.id

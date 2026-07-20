@@ -13,9 +13,7 @@ async def test_create_vertex(db, neo4j_session, make_user, make_node):
     await db.commit()
     await gs.upsert_vertex(node)
     # vertex should exist in Neo4j
-    result = await neo4j_session.run(
-        "MATCH (n:Node {node_id: $nid}) RETURN n", nid=str(node.id)
-    )
+    result = await neo4j_session.run("MATCH (n:Node {node_id: $nid}) RETURN n", nid=str(node.id))
     record = await result.single()
     assert record is not None
     assert record["n"]["title"] == "Graph Node"

@@ -55,9 +55,7 @@ async def list_nodes(
     viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
 ) -> NodeListOut:
-    items, total = await ns.list_nodes(
-        db, viewer, offset=pagination.offset, limit=pagination.limit
-    )
+    items, total = await ns.list_nodes(db, viewer, offset=pagination.offset, limit=pagination.limit)
     return NodeListOut(
         items=[NodeOut.model_validate(n) for n in items],
         total=total,

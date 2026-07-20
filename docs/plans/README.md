@@ -5,7 +5,7 @@
 | Phase | Plan | Scope | Status |
 |---|---|---|---|
 | 0 | [phase-0-foundation.md](phase-0-foundation.md) | Repo, Docker (PG+pgvector + Neo4j), FastAPI skeleton, auth, users/groups | Done |
-| 1 | [phase-1-knowledge-core.md](phase-1-knowledge-core.md) | Node CRUD + revisions + tags + visibility + Neo4j edges + wikilinks | Not started |
+| 1 | [phase-1-knowledge-core.md](phase-1-knowledge-core.md) | Node CRUD + revisions + tags + visibility + Neo4j edges + wikilinks | Done (Neo4j tests pending Docker-stack verification) |
 | 2 | [phase-2-search.md](phase-2-search.md) | Chunking, embeddings worker, hybrid search, auto-link | Not started |
 | 3 | [phase-3-graph-ui.md](phase-3-graph-ui.md) | Next.js app, auth BFF, Sigma.js explorer, node page, daily logs | Not started |
 | 4 | [phase-4-md-import.md](phase-4-md-import.md) | Bulk MD upload, two-pass links, WS progress | Not started |

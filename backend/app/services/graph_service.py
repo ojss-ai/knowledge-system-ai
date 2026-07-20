@@ -24,11 +24,22 @@ from app.services.visibility import Viewer, visible_nodes_clause
 _HOP_LIMIT = 3
 _NODE_LIMIT = 500
 
-ALLOWED_EDGE_LABELS = frozenset({
-    "LINKS_TO", "REFERENCES", "DERIVED_FROM", "TAGGED_WITH", "SIMILAR_TO",
-    "PARENT_OF", "AUTHORED_BY", "MENTIONS", "IMPORTS", "CALLS", "DEFINES",
-    "BELONGS_TO_PROJECT",
-})
+ALLOWED_EDGE_LABELS = frozenset(
+    {
+        "LINKS_TO",
+        "REFERENCES",
+        "DERIVED_FROM",
+        "TAGGED_WITH",
+        "SIMILAR_TO",
+        "PARENT_OF",
+        "AUTHORED_BY",
+        "MENTIONS",
+        "IMPORTS",
+        "CALLS",
+        "DEFINES",
+        "BELONGS_TO_PROJECT",
+    }
+)
 
 
 async def upsert_vertex(node: KnowledgeNode) -> None:
@@ -146,11 +157,13 @@ async def get_neighborhood(
         for path_edges in record["edge_lists"]:
             if isinstance(path_edges, list):
                 for e in path_edges:
-                    raw_edges.append({
-                        "source": e.start_node["node_id"] if hasattr(e, "start_node") else None,
-                        "target": e.end_node["node_id"] if hasattr(e, "end_node") else None,
-                        "label": e.type if hasattr(e, "type") else "",
-                    })
+                    raw_edges.append(
+                        {
+                            "source": e.start_node["node_id"] if hasattr(e, "start_node") else None,
+                            "target": e.end_node["node_id"] if hasattr(e, "end_node") else None,
+                            "label": e.type if hasattr(e, "type") else "",
+                        }
+                    )
 
     # Apply visibility filter via Postgres (authoritative)
     if not candidate_ids:
@@ -158,9 +171,7 @@ async def get_neighborhood(
 
     clause = visible_nodes_clause(viewer)
     visible_rows = await db.scalars(
-        select(KnowledgeNode)
-        .where(KnowledgeNode.id.in_(list(candidate_ids)))
-        .where(clause)
+        select(KnowledgeNode).where(KnowledgeNode.id.in_(list(candidate_ids))).where(clause)
     )
     visible_nodes = list(visible_rows)
     visible_ids = {str(n.id) for n in visible_nodes}
@@ -174,10 +185,7 @@ async def get_neighborhood(
         }
         for n in visible_nodes
     ]
-    edges_out = [
-        e for e in raw_edges
-        if e["source"] in visible_ids and e["target"] in visible_ids
-    ]
+    edges_out = [e for e in raw_edges if e["source"] in visible_ids and e["target"] in visible_ids]
     return {"nodes": nodes_out, "edges": edges_out}
 
 
@@ -189,10 +197,7 @@ async def get_overview(
     """Top visible nodes + edges between them for the initial graph viewport."""
     clause = visible_nodes_clause(viewer)
     rows = await db.scalars(
-        select(KnowledgeNode)
-        .where(clause)
-        .order_by(KnowledgeNode.updated_at.desc())
-        .limit(limit)
+        select(KnowledgeNode).where(clause).order_by(KnowledgeNode.updated_at.desc()).limit(limit)
     )
     nodes = list(rows)
     id_set = {str(n.id) for n in nodes}
