@@ -184,3 +184,55 @@ async def test_revision_version_uses_max_not_count(db, make_user, make_node):
     await ns.update_node(db, node.id, viewer, body="b2")
     await db.refresh(node, ["revisions"])
     assert sorted(r.version for r in node.revisions) == [2, 3]
+
+
+# --- Mutation authorization (owner or admin only — Task 6 plan) ---
+
+
+async def test_non_owner_cannot_update_node(db, make_user, make_node):
+    from app.core.errors import ForbiddenError
+
+    owner = await make_user(email="ns_au1@test.com")
+    other = await make_user(email="ns_au2@test.com")
+    # public → visible to `other`, so this exercises the ownership check itself
+    node = await make_node(owner, visibility=Visibility.public)
+    other_viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
+    with pytest.raises(ForbiddenError):
+        await ns.update_node(db, node.id, other_viewer, title="hijacked")
+
+
+async def test_non_owner_cannot_delete_node(db, make_user, make_node):
+    from app.core.errors import ForbiddenError
+
+    owner = await make_user(email="ns_ad1@test.com")
+    other = await make_user(email="ns_ad2@test.com")
+    node = await make_node(owner, visibility=Visibility.public)
+    other_viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
+    with pytest.raises(ForbiddenError):
+        await ns.delete_node(db, node.id, other_viewer)
+
+
+async def test_admin_can_update_other_users_node(db, make_user, make_node):
+    # Per the Task 6 plan: "Only owner or admin can edit a node" — admin mutation
+    # is allowed at the service layer (visibility.py already grants admin reads).
+    owner = await make_user(email="ns_aa1@test.com")
+    admin = await make_user(email="ns_aa2@test.com", role=Role.admin)
+    node = await make_node(owner, title="Before", visibility=Visibility.private)
+    admin_viewer = Viewer(user_id=admin.id, role=Role.admin, group_ids=frozenset())
+    updated = await ns.update_node(db, node.id, admin_viewer, title="After")
+    assert updated.title == "After"
+
+
+async def test_list_nodes_hides_other_users_private_nodes(db, make_user, make_node):
+    a = await make_user(email="ns_lv_a@test.com")
+    b = await make_user(email="ns_lv_b@test.com")
+    private_node = await make_node(a, title="A Private", visibility=Visibility.private)
+    public_node = await make_node(a, title="A Public", visibility=Visibility.public)
+    b_viewer = Viewer(user_id=b.id, role=Role.user, group_ids=frozenset())
+    items, _total = await ns.list_nodes(db, b_viewer)
+    ids = {n.id for n in items}
+    assert private_node.id not in ids
+    assert public_node.id in ids
+    a_viewer = Viewer(user_id=a.id, role=Role.user, group_ids=frozenset())
+    a_items, _ = await ns.list_nodes(db, a_viewer)
+    assert private_node.id in {n.id for n in a_items}

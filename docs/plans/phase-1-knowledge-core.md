@@ -1041,7 +1041,7 @@ feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edg
 
 ### Steps
 
-- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable. Review-fix of 24e5685 added: PG-first deferral tests (`_graph_recorder` + create/update/delete/wikilinks queue tests) a self-link guard test, and a `max(version)+1` revision-gap test — see the final `backend/tests/services/test_node_service.py`; the wikilink live test now calls `run_pending_graph_ops` after `resolve_wikilinks`):
+- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable. Review-fix of 24e5685 added: PG-first deferral tests (`_graph_recorder` + create/update/delete/wikilinks queue tests) a self-link guard test, a `max(version)+1` revision-gap test, mutation-authz tests (non-owner update/delete → `ForbiddenError`; admin CAN mutate, per this task's "Only owner or admin can edit/delete" check), and a `list_nodes` visibility test (user B never sees A's private node) — see the final `backend/tests/services/test_node_service.py`; the wikilink live test now calls `run_pending_graph_ops` after `resolve_wikilinks`):
 
 ```python
 # backend/tests/services/test_node_service.py
@@ -1369,7 +1369,7 @@ async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewe
 - [x] **6.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -v
-# Expected: 12 passed (11 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
+# Expected: 16 passed (15 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
 ```
 
 - [x] **6.5** Commit:
