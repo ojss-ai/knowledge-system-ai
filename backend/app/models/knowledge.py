@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Computed,
     DateTime,
     Enum,
@@ -111,6 +112,10 @@ class NodeShare(Base):
     __table_args__ = (
         UniqueConstraint("node_id", "user_id", name="uq_share_node_user"),
         UniqueConstraint("node_id", "group_id", name="uq_share_node_group"),
+        CheckConstraint(
+            "(user_id IS NULL) != (group_id IS NULL)",
+            name="ck_node_shares_user_xor_group",
+        ),
     )
 
 

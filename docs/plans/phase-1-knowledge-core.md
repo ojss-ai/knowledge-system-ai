@@ -109,7 +109,7 @@ chore(test): extend conftest with make_node and make_tag fixtures
 
 ### Steps
 
-- [x] **2.1** Write the failing test first (plan-fix applied to the code below: dropped unused `User`, `Role`, `NodeRevision`, `NodeTag` imports — ruff F401; `pytest.raises(Exception)` → `pytest.raises(IntegrityError)` — ruff B017; the failing flush runs inside `db.begin_nested()` so the outer test transaction stays usable and teardown emits no SAWarning):
+- [x] **2.1** Write the failing test first (plan-fix applied to the code below: dropped unused `User`, `Role`, `NodeRevision`, `NodeTag` imports — ruff F401; `pytest.raises(Exception)` → `pytest.raises(IntegrityError)` — ruff B017; the failing flush runs inside `db.begin_nested()` so the outer test transaction stays usable and teardown emits no SAWarning. Post-review additions not shown below: `test_share_requires_exactly_one_grantee_neither`/`_both` (XOR check on `node_shares`) and `test_revision_version_unique_per_node` — see `backend/tests/models/test_knowledge_models.py`):
 
 ```python
 # backend/tests/models/test_knowledge_models.py
@@ -174,7 +174,7 @@ async def test_tag_slug_unique(db):
 cd backend && pytest tests/models/test_knowledge_models.py -x 2>&1 | head -30
 ```
 
-- [x] **2.3** Create the model (plan-fix applied to the code below: added the `Computed` import per the note; removed unused `text`/`UTC` imports — ruff F401; `class NodeType(str, enum.Enum)` → `class NodeType(enum.StrEnum)` — ruff UP042, matches `Role`/`Visibility` in `user.py`):
+- [x] **2.3** Create the model (plan-fix applied to the code below: added the `Computed` and `CheckConstraint` imports; removed unused `text`/`UTC` imports — ruff F401; `class NodeType(str, enum.Enum)` → `class NodeType(enum.StrEnum)` — ruff UP042, matches `Role`/`Visibility` in `user.py`; post-review: `ck_node_shares_user_xor_group` CheckConstraint added to `NodeShare` — exactly one of `user_id`/`group_id` must be set; NodeType vocabulary confirmed canonical by ADR-012):
 
 ```python
 # backend/app/models/knowledge.py
@@ -255,6 +255,7 @@ class NodeShare(Base):
     __table_args__ = (
         UniqueConstraint("node_id", "user_id", name="uq_share_node_user"),
         UniqueConstraint("node_id", "group_id", name="uq_share_node_group"),
+        CheckConstraint("(user_id IS NULL) != (group_id IS NULL)", name="ck_node_shares_user_xor_group"),
     )
 
 

@@ -126,6 +126,9 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("node_id", "group_id", name="uq_share_node_group"),
         sa.UniqueConstraint("node_id", "user_id", name="uq_share_node_user"),
+        sa.CheckConstraint(
+            "(user_id IS NULL) != (group_id IS NULL)", name="ck_node_shares_user_xor_group"
+        ),
     )
     op.create_index(op.f("ix_node_shares_node_id"), "node_shares", ["node_id"], unique=False)
     op.create_table(

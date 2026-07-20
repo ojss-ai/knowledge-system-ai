@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.models.group import Group
 from app.models.knowledge import KnowledgeNode, NodeShare, Tag
 from app.models.user import Visibility
 
@@ -46,6 +47,30 @@ async def test_node_share(db, make_user, make_node):
         select(NodeShare).where(NodeShare.node_id == node.id, NodeShare.user_id == other.id)
     )
     assert result is not None
+
+
+async def test_share_requires_exactly_one_grantee_neither(db, make_user, make_node):
+    """A NodeShare with neither user_id nor group_id must be rejected (XOR check)."""
+    owner = await make_user(email="xor-none@test.com")
+    node = await make_node(owner, visibility=Visibility.shared)
+    with pytest.raises(IntegrityError):
+        async with db.begin_nested():
+            db.add(NodeShare(node_id=node.id, user_id=None, group_id=None))
+            await db.flush()
+
+
+async def test_share_requires_exactly_one_grantee_both(db, make_user, make_node):
+    """A NodeShare with both user_id and group_id set must be rejected (XOR check)."""
+    owner = await make_user(email="xor-both@test.com")
+    other = await make_user(email="xor-both-other@test.com")
+    group = Group(id=uuid.uuid4(), name="xor-group", created_by=owner.id)
+    db.add(group)
+    await db.flush()
+    node = await make_node(owner, visibility=Visibility.shared)
+    with pytest.raises(IntegrityError):
+        async with db.begin_nested():
+            db.add(NodeShare(node_id=node.id, user_id=other.id, group_id=group.id))
+            await db.flush()
 
 
 async def test_tag_slug_unique(db):
