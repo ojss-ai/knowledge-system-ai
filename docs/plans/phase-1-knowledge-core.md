@@ -1041,15 +1041,15 @@ feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edg
 
 ### Steps
 
-- [ ] **6.1** Write the failing tests:
+- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable):
 
 ```python
 # backend/tests/services/test_node_service.py
-import uuid
 import pytest
-from app.models.user import Visibility, Role
-from app.services.visibility import Viewer
+
+from app.models.user import Role, Visibility
 from app.services import node_service as ns
+from app.services.visibility import Viewer
 
 pytestmark = pytest.mark.asyncio
 
@@ -1092,7 +1092,7 @@ async def test_update_node_creates_revision(db, make_user, make_node):
     assert node.revisions[0].title_snapshot == "Old Title"
 
 
-async def test_wikilink_extraction(db, make_user, make_node):
+async def test_wikilink_extraction(db, neo4j_session, make_user, make_node):
     owner = await make_user(email="ns_wl@test.com")
     n1 = await make_node(owner, title="Source Note", body="see [[Target Note]] and [[Other]]")
     n2 = await make_node(owner, title="Target Note", body="")
@@ -1116,12 +1116,12 @@ async def test_soft_delete(db, make_user, make_node):
         await ns.get_node(db, node.id, viewer)
 ```
 
-- [ ] **6.2** Run — expect ImportError:
+- [x] **6.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -x 2>&1 | head -20
 ```
 
-- [ ] **6.3** Implement `node_service.py`:
+- [x] **6.3** Implement `node_service.py` (plan-fix: matched the real `graph_service` API — `upsert_vertex(node)`, `soft_delete_vertex(node_id)`, `merge_edge(src, tgt, label, created_by=...)`; there is no `create_vertex`, no `db` arg, no `props` kwarg. Graph calls wrapped in best-effort `_graph_sync` so a Neo4j failure never fails/rolls back the PG write (CLAUDE.md invariant; Celery retry task lands with the workers phase). `func` imported at top instead of the bottom-of-file import):
 
 ```python
 # backend/app/services/node_service.py
@@ -1129,10 +1129,12 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime, UTC
+from collections.abc import Coroutine
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+import structlog
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ForbiddenError, NotFoundError
@@ -1141,7 +1143,21 @@ from app.models.user import Role, Visibility
 from app.services import graph_service as gs
 from app.services.visibility import Viewer, visible_nodes_clause
 
+logger = structlog.get_logger(__name__)
+
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
+
+
+async def _graph_sync(op: Coroutine[Any, Any, None]) -> None:
+    """Best-effort Neo4j sync — PG is the source of truth (ADR-011).
+
+    A graph failure must never fail (or roll back) the relational write.
+    TODO(workers phase): enqueue tasks.sync_graph_vertex retry instead of log-only.
+    """
+    try:
+        await op
+    except Exception as exc:
+        logger.warning("graph_sync_failed", error=str(exc))
 
 
 async def create_node(
@@ -1198,7 +1214,6 @@ async def list_nodes(
     offset: int = 0,
     limit: int = 50,
 ) -> tuple[list[KnowledgeNode], int]:
-    from sqlalchemy import func
     clause = visible_nodes_clause(viewer)
     total = await db.scalar(select(func.count()).select_from(KnowledgeNode).where(clause)) or 0
     rows = await db.scalars(
@@ -1246,7 +1261,7 @@ async def update_node(
 
     node.updated_at = datetime.now(UTC)
     await db.flush()
-    await gs.create_vertex(db, node)  # sync vertex props
+    await _graph_sync(gs.upsert_vertex(node))  # sync vertex props
     return node
 
 
@@ -1256,7 +1271,7 @@ async def delete_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> N
         raise ForbiddenError("Only owner or admin can delete a node")
     node.deleted_at = datetime.now(UTC)
     await db.flush()
-    await gs.soft_delete_vertex(db, node_id)
+    await _graph_sync(gs.soft_delete_vertex(node_id))
 
 
 async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewer) -> None:
@@ -1270,7 +1285,7 @@ async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewe
         return
 
     # Ensure source vertex exists
-    await gs.create_vertex(db, node)
+    await _graph_sync(gs.upsert_vertex(node))
 
     clause = visible_nodes_clause(viewer)
     for title in set(titles):
@@ -1282,21 +1297,17 @@ async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewe
         )
         if target is None:
             continue
-        await gs.create_vertex(db, target)
-        await gs.merge_edge(db, node.id, target.id, "LINKS_TO", props={"created_by": "wikilink"})
-
-
-# Fix missing import
-from sqlalchemy import func  # noqa: E402 (moved here to avoid circular; OK in service layer)
+        await _graph_sync(gs.upsert_vertex(target))
+        await _graph_sync(gs.merge_edge(node.id, target.id, "LINKS_TO", created_by="wikilink"))
 ```
 
-- [ ] **6.4** Run tests:
+- [x] **6.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -v
-# Expected: 5 passed
+# Expected: 6 passed (5 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
 ```
 
-- [ ] **6.5** Commit:
+- [x] **6.5** Commit:
 ```
 feat(node_service): CRUD, revisions, wikilink resolution, soft-delete
 ```
