@@ -478,7 +478,7 @@ feat(db): Neo4j driver singleton, ensure_constraints on startup, init tests
 
 ### Steps
 
-- [ ] **4.1** Write the failing tests first:
+- [x] **4.1** Write the failing tests first:
 
 ```python
 # backend/tests/services/test_visibility.py
@@ -573,12 +573,16 @@ async def test_deleted_nodes_excluded(db, make_user, make_node):
     assert node.id not in ids, "Soft-deleted node must be excluded"
 ```
 
-- [ ] **4.2** Run — expect ImportError:
+> [plan-fix] Dropped the test file's unused `import uuid` (ruff F401) and added a seventh test,
+> `test_shared_node_ids_returns_direct_shares` — the plan imported `shared_node_ids` without
+> exercising it (F401 again, and production code must not land untested per kb-tdd-workflow).
+
+- [x] **4.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_visibility.py -x 2>&1 | head -20
 ```
 
-- [ ] **4.3** Implement `visibility.py`:
+- [x] **4.3** Implement `visibility.py`:
 
 ```python
 # backend/app/services/visibility.py
@@ -674,13 +678,19 @@ async def shared_node_ids(viewer: Viewer, db: AsyncSession) -> set[uuid.UUID]:
     return set(rows)
 ```
 
-- [ ] **4.4** Run tests:
+> [plan-fix] As implemented, minus dead weight that fails the gates: removed unused
+> function-local imports (`cast`, `PG_UUID`, `Visibility` in `shared_node_ids`), the empty
+> `TYPE_CHECKING` block, and the redundant `select as sa_select` alias (module-level `select`
+> already imported). Replaced `or_(True)` with `sqlalchemy.true()` — mypy --strict rejects
+> `or_(True)` (the `or_` identity literal is `False` only).
+
+- [x] **4.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_visibility.py -v
-# Expected: 6 passed
+# Expected: 6 passed  (actual: 7 passed — extra shared_node_ids test, see 4.1 plan-fix)
 ```
 
-- [ ] **4.5** Commit:
+- [x] **4.5** Commit:
 ```
 feat(visibility): implement visibility.py with Viewer contract and 6 rule tests
 ```
