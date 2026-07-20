@@ -54,5 +54,8 @@ async def delete_edge(
     viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
 ) -> None:
+    # Both endpoints must be visible, symmetric with create_edge — an invisible
+    # target must look nonexistent (404) before any Neo4j call (ADR-004).
     await ns.get_node(db, payload.source_id, viewer)
+    await ns.get_node(db, payload.target_id, viewer)
     await gs.delete_edge(payload.source_id, payload.target_id, payload.label)

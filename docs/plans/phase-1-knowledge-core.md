@@ -1938,6 +1938,12 @@ feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborh
   `mypy app/api app/services app/schemas` must pass — observed
   `Success: no issues found in 20 source files` with no strictness loosened.)
 
+- [x] **9.R2** ([plan-fix]: `delete_edge` only vetted the SOURCE node's visibility; the target
+  went unchecked, so a caller could probe/detach edges into another user's private nodes.
+  DELETE now checks BOTH endpoints via `ns.get_node` before any Neo4j call, symmetric with
+  `create_edge` (invisible == nonexistent → 404, ADR-004). RED→GREEN:
+  `test_delete_edge_invisible_target_looks_not_found` — pure-PG, runs without Neo4j.)
+
 ---
 
 ## Task 10 — Daily logs API

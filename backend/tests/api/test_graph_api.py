@@ -111,6 +111,25 @@ async def test_create_edge_to_invisible_target_looks_not_found(
     assert "edge-secret" not in r.text  # content
 
 
+async def test_delete_edge_invisible_target_looks_not_found(
+    client: AsyncClient, auth_headers, auth_headers_other
+):
+    """DELETE must vet BOTH endpoints exactly like create: a target the caller
+    cannot see must 404 before any Neo4j call (ADR-004) — otherwise a caller
+    could probe (or detach) edges into another user's private nodes."""
+    secret_id = await _create_node(client, auth_headers, "del-secret", visibility="private")
+    mine_id = await _create_node(client, auth_headers_other, "DelMine")
+    r = await client.request(
+        "DELETE",
+        "/api/v1/edges",
+        json={"source_id": mine_id, "target_id": secret_id, "label": "LINKS_TO"},
+        headers=auth_headers_other,
+    )
+    assert r.status_code == 404
+    assert secret_id not in r.text  # existence
+    assert "del-secret" not in r.text  # content
+
+
 async def test_neighborhood_invisible_center_looks_not_found(
     client: AsyncClient, auth_headers, auth_headers_other
 ):
