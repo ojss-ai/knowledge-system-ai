@@ -325,7 +325,7 @@ feat(workers): Celery app setup with task_session context manager
 
 ### Steps
 
-- [ ] **3.1** Write the failing tests:
+- [x] **3.1** Write the failing tests:
 
 ```python
 # backend/tests/services/test_chunking.py
@@ -368,12 +368,14 @@ def test_chunk_overlap():
     assert len(first_words & second_words) > 0
 ```
 
-- [ ] **3.2** Run — expect ImportError:
+- [x] **3.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_chunking.py -x 2>&1 | head -10
 ```
 
-- [ ] **3.3** Implement:
+- [x] **3.3** Implement:
+
+> [plan-fix] The original code block for `_split_by_tokens` infinite-looped when `overlap_tokens > 0`: once `end == len(text)`, `start = end - overlap_chars` stepped back and re-appended the tail chunk forever (pytest OOM-killed, exit 137, on `test_chunk_overlap`). Fixed by breaking out of the loop when `end >= len(text)`; the code block above is updated to match. Also synced a `ruff format` blank line after the module docstring.
 
 ```python
 # backend/app/services/chunking.py
@@ -385,6 +387,7 @@ Strategy:
 2. For sections that exceed max_tokens, further split by sentence boundary
 3. Apply overlap_tokens sliding window between adjacent chunks
 """
+
 from __future__ import annotations
 
 import re
@@ -420,6 +423,8 @@ def _split_by_tokens(text: str, max_tokens: int, overlap_tokens: int) -> list[st
         chunk = text[start:end].strip()
         if chunk:
             chunks.append(chunk)
+        if end >= len(text):
+            break
         start = end - overlap_chars if overlap_tokens > 0 else end
 
     return chunks
@@ -466,13 +471,13 @@ def chunk_markdown(
     return [c for c in chunks if c]
 ```
 
-- [ ] **3.4** Run tests:
+- [x] **3.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_chunking.py -v
 # Expected: 5 passed
 ```
 
-- [ ] **3.5** Commit:
+- [x] **3.5** Commit:
 ```
 feat(chunking): heading-aware Markdown chunker with token overlap
 ```
