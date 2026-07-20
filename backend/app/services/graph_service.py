@@ -112,19 +112,23 @@ async def get_neighborhood(
     hops clamped to _HOP_LIMIT.  Total nodes capped at _NODE_LIMIT.
     Visibility is enforced by re-querying PG (the authoritative source).
     """
-    hops = min(hops, _HOP_LIMIT)
+    hops = max(0, min(hops, _HOP_LIMIT))  # defense-in-depth: interpolated into the pattern
     candidate_ids: set[uuid.UUID] = {center_id}
     raw_edges: list[dict[str, Any]] = []
 
     async with get_driver().session() as session:
+        # LIMIT must bound the per-neighbor rows BEFORE aggregation: after
+        # collect() the match collapses to a single row and LIMIT is a no-op,
+        # letting a hub node pull an unbounded set into Python.
         result = await session.run(
             f"""
             MATCH (center:Node {{node_id: $cid}})-[e*0..{hops}]-(other:Node)
             WHERE other.deleted IS NULL OR other.deleted = false
+            WITH DISTINCT other, e
+            LIMIT $limit
             WITH collect(DISTINCT other) AS nodes,
                  collect(DISTINCT e)    AS edge_lists
             RETURN nodes, edge_lists
-            LIMIT $limit
             """,
             cid=str(center_id),
             limit=_NODE_LIMIT,
