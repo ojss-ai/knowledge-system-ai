@@ -493,12 +493,19 @@ feat(chunking): heading-aware Markdown chunker with token overlap
 
 ### Steps
 
-- [ ] **4.1** Write the failing tests:
+> **[plan-fix] notes (applied during execution):**
+> - Test file: dropped unused `import pytest` (ruff F401), import order normalised.
+> - Service: annotations added for `mypy --strict` (`results`/`vec` locals, `self._model: Any`,
+>   `_load(self) -> Any`); `get_embedder` reads `settings.embedding_backend` /
+>   `settings.embedding_model` directly — the fields exist after 4.3, `getattr` defeats typing.
+> - `pyproject.toml`: mypy override `sentence_transformers.*` → `ignore_missing_imports`
+>   (package is integration-only and not installed; import stays lazy inside `_load`).
+
+- [x] **4.1** Write the failing tests:
 
 ```python
 # backend/tests/services/test_embedding_service.py
-import pytest
-from app.services.embedding_service import FakeEmbedder, Embedder, EmbeddingDimension
+from app.services.embedding_service import Embedder, EmbeddingDimension, FakeEmbedder
 
 
 def test_fake_embedder_is_embedder():
@@ -523,6 +530,7 @@ def test_fake_embedder_deterministic():
 
 def test_embedder_protocol_satisfied():
     """Any class with embed(list[str]) -> list[list[float]] satisfies the protocol."""
+
     class MyEmbedder:
         def embed(self, texts: list[str]) -> list[list[float]]:
             return [[0.0] * 768 for _ in texts]
@@ -530,7 +538,7 @@ def test_embedder_protocol_satisfied():
     assert isinstance(MyEmbedder(), Embedder)
 ```
 
-- [ ] **4.2** Implement:
+- [x] **4.2** Implement:
 
 ```python
 # backend/app/services/embedding_service.py
@@ -538,7 +546,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 EmbeddingDimension = 768
 
@@ -558,10 +566,10 @@ class FakeEmbedder:
     """
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        results = []
+        results: list[list[float]] = []
         for text in texts:
             seed = int(hashlib.sha256(text.encode()).hexdigest(), 16)
-            vec = []
+            vec: list[float] = []
             for i in range(EmbeddingDimension):
                 # Pseudo-random but deterministic value
                 val = math.sin(seed + i * 2654435761)
@@ -581,11 +589,12 @@ class SentenceTransformersEmbedder:
 
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L12-v2") -> None:
         self._model_name = model_name
-        self._model = None  # lazy
+        self._model: Any = None  # lazy
 
-    def _load(self):
+    def _load(self) -> Any:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
+
             self._model = SentenceTransformer(self._model_name)
         return self._model
 
@@ -602,13 +611,13 @@ def get_embedder() -> Embedder:
     or ollama for on-prem LLM (Phase 7).
     """
     from app.core.config import settings
-    backend = getattr(settings, "embedding_backend", "sentence_transformers")
-    if backend == "fake":
+
+    if settings.embedding_backend == "fake":
         return FakeEmbedder()
-    return SentenceTransformersEmbedder(getattr(settings, "embedding_model", "sentence-transformers/all-MiniLM-L12-v2"))
+    return SentenceTransformersEmbedder(settings.embedding_model)
 ```
 
-- [ ] **4.3** Add `embedding_backend` to Settings:
+- [x] **4.3** Add `embedding_backend` to Settings:
 
 ```python
 # backend/app/core/config.py  (add field)
@@ -616,7 +625,7 @@ embedding_backend: str = "sentence_transformers"  # fake | sentence_transformers
 embedding_model: str = "sentence-transformers/all-MiniLM-L12-v2"
 ```
 
-- [ ] **4.4** Add `fake_embedder` to conftest:
+- [x] **4.4** Add `fake_embedder` to conftest:
 
 ```python
 # backend/tests/conftest.py (add)
@@ -627,13 +636,13 @@ def fake_embedder():
     return FakeEmbedder()
 ```
 
-- [ ] **4.5** Run tests:
+- [x] **4.5** Run tests:
 ```bash
 cd backend && pytest tests/services/test_embedding_service.py -v
 # Expected: 4 passed
 ```
 
-- [ ] **4.6** Commit:
+- [x] **4.6** Commit:
 ```
 feat(embedding): Embedder protocol, FakeEmbedder (deterministic), SentenceTransformersEmbedder
 ```
