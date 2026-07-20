@@ -825,6 +825,12 @@ feat(workers): embed_node task — idempotent chunking + vector storage
   `test_system_viewer_sees_private_but_not_deleted` (test_visibility.py, RED via
   ImportError first) and `test_embed_node_skips_soft_deleted` (regression guard).
 
+- [x] **5.R.2 (IMPORTANT)** Re-embedding a node whose body now chunks to nothing
+  left stale chunks behind: the `if not texts: return` early-exit ran BEFORE the
+  delete. The delete now always runs; the early return only skips the insert.
+  Test (RED first): `test_reembed_empty_body_clears_stale_chunks` — embed, set
+  `body=""`, re-embed, assert chunk count 0.
+
 ---
 
 ## Task 6 — autolink_node Celery task

@@ -41,6 +41,28 @@ async def test_embed_node_idempotent(db, make_user, make_node, fake_embedder):
     )
 
 
+async def test_reembed_empty_body_clears_stale_chunks(db, make_user, make_node, fake_embedder):
+    """Editing a body down to nothing must delete the old chunks on re-embed."""
+    owner = await make_user(email="embed5@test.com")
+    node = await make_node(owner, body="# Was here\n\nContent that will be erased.")
+    await db.flush()
+
+    await _embed_node_impl(db, node.id, fake_embedder)
+    count = await db.scalar(
+        select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id)
+    )
+    assert count >= 1
+
+    node.body = ""
+    await db.flush()
+    await _embed_node_impl(db, node.id, fake_embedder)
+
+    count = await db.scalar(
+        select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id)
+    )
+    assert count == 0, "Stale chunks must be deleted when the new chunk list is empty"
+
+
 async def test_embed_node_skips_soft_deleted(db, make_user, make_node, fake_embedder):
     """A soft-deleted node must not be (re)embedded — no chunks written (SYSTEM_VIEWER path)."""
     from datetime import UTC, datetime

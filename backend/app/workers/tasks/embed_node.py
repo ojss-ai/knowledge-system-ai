@@ -34,11 +34,13 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
         return
 
     texts = chunk_markdown(node.body)
+
+    # Idempotent replace: the delete ALWAYS runs, even when the new chunk list
+    # is empty — a body edited down to nothing must clear its stale chunks.
+    await db.execute(delete(NodeChunk).where(NodeChunk.node_id == node_id))
+
     if not texts:
         return
-
-    # Idempotent: replace all chunks
-    await db.execute(delete(NodeChunk).where(NodeChunk.node_id == node_id))
 
     vectors = embedder.embed(texts)
 
