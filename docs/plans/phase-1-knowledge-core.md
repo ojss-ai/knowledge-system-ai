@@ -1407,6 +1407,13 @@ feat(schemas): node schemas (NodeCreate, NodeUpdate, NodeOut, NodeListOut, Graph
 
 ## Task 8 — Nodes API router
 
+> **Review carry-over from Task 4 (IMPORTANT):** the `Viewer(role=admin)` bypass in
+> `visible_nodes_clause` is unconstrained. When building routers, ensure regular
+> (non-admin-console) routes construct the Viewer from the authenticated user's real
+> role but do NOT offer an admin-scoped path outside `/api/v1/admin/*`, and add an
+> audit log entry wherever an admin Viewer is used to read another user's non-public
+> node (ADR-004 / kb-visibility-filter rule 5).
+
 **Files:**
 - Create: `backend/app/api/v1/nodes.py`
 - Modify: `backend/app/main.py`

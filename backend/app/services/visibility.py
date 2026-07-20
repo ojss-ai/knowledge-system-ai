@@ -67,10 +67,23 @@ async def shared_node_ids(viewer: Viewer, db: AsyncSession) -> set[uuid.UUID]:
     Return IDs of all 'shared' nodes visible to viewer.
     Result is used by graph traversal service to filter Neo4j graph endpoints.
     Cache this in Redis (TTL=300s) in production; here we compute directly.
+
+    Re-checks the node's current state: a stale NodeShare row must not leak a
+    node that was downgraded from 'shared' or soft-deleted (ADR-004).
     """
+    from app.models.user import Visibility  # avoid circular at module level
+
     shared_conditions = [NodeShare.user_id == viewer.user_id]
     if viewer.group_ids:
         shared_conditions.append(NodeShare.group_id.in_(viewer.group_ids))
 
-    rows = await db.scalars(select(NodeShare.node_id).where(or_(*shared_conditions)))
+    rows = await db.scalars(
+        select(NodeShare.node_id)
+        .join(KnowledgeNode, KnowledgeNode.id == NodeShare.node_id)
+        .where(
+            or_(*shared_conditions),
+            KnowledgeNode.visibility == Visibility.shared,
+            KnowledgeNode.deleted_at.is_(None),
+        )
+    )
     return set(rows)
