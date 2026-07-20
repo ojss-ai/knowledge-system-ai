@@ -1387,12 +1387,16 @@ feat(node_service): CRUD, revisions, wikilink resolution, soft-delete
 
 ### Steps
 
-- [ ] **7.1** Write the failing test:
+- [x] **7.1** Write the failing test ([plan-fix]: `NodeOut` must not expose `deleted_at` —
+  kb-api-conventions: "Out schemas never expose ... soft-delete fields"; dropped it from the
+  test input dict and asserted its absence in the dump; also added `tests/schemas/__init__.py`
+  to match the existing test-package convention):
 
 ```python
 # backend/tests/schemas/test_node_schemas.py
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
+
 from app.schemas.node import NodeCreate, NodeOut, NodeUpdate
 
 
@@ -1415,12 +1419,12 @@ def test_node_out_no_internal_fields():
         meta={},
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
-        deleted_at=None,
     )
     out = NodeOut(**data)
     dumped = out.model_dump()
     assert "password_hash" not in dumped
     assert "body_tsv" not in dumped
+    assert "deleted_at" not in dumped
 
 
 def test_node_update_partial():
@@ -1429,22 +1433,22 @@ def test_node_update_partial():
     assert u.title == "New"
 ```
 
-- [ ] **7.2** Run — expect ImportError:
+- [x] **7.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/schemas/test_node_schemas.py -x 2>&1 | head -10
 ```
 
-- [ ] **7.3** Create schemas:
+- [x] **7.3** Create schemas ([plan-fix]: use `ConfigDict(from_attributes=True)` and no
+  `from __future__ import annotations`, matching the established style in
+  `app/schemas/user.py` / `group.py`; `deleted_at` removed from `NodeOut` per 7.1 note):
 
 ```python
 # backend/app/schemas/node.py
-from __future__ import annotations
-
 import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.user import Visibility
 
@@ -1467,6 +1471,8 @@ class NodeUpdate(BaseModel):
 
 
 class NodeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     owner_id: uuid.UUID
     title: str
@@ -1478,9 +1484,6 @@ class NodeOut(BaseModel):
     meta: dict[str, Any]
     created_at: datetime
     updated_at: datetime
-    deleted_at: datetime | None
-
-    model_config = {"from_attributes": True}
 
 
 class NodeListOut(BaseModel):
@@ -1501,13 +1504,13 @@ class GraphNeighborhoodOut(BaseModel):
     edges: list[dict[str, Any]]
 ```
 
-- [ ] **7.4** Run tests:
+- [x] **7.4** Run tests:
 ```bash
 cd backend && pytest tests/schemas/test_node_schemas.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **7.5** Commit:
+- [x] **7.5** Commit:
 ```
 feat(schemas): node schemas (NodeCreate, NodeUpdate, NodeOut, NodeListOut, GraphNeighborhoodOut)
 ```
