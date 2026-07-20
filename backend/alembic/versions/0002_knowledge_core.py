@@ -76,7 +76,10 @@ def upgrade() -> None:
         sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
         sa.ForeignKeyConstraint(["owner_id"], ["users.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("source", "source_ref", name="uq_node_source_ref"),
+        # Amended in place (migration unreleased, like the XOR-constraint fix):
+        # uniqueness is per-owner, not global — see Task 10 review fixes.
+        # If the old 0002 was applied: alembic downgrade 275d5f4b90c3 && alembic upgrade head.
+        sa.UniqueConstraint("owner_id", "source", "source_ref", name="uq_node_owner_source_ref"),
     )
     op.create_index(
         "ix_kn_owner_deleted", "knowledge_nodes", ["owner_id", "deleted_at"], unique=False

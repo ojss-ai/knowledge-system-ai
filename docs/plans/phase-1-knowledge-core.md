@@ -2142,6 +2142,36 @@ curl -s -X POST http://localhost:8000/api/v1/daily-logs \
 feat(api): POST/GET /api/v1/daily-logs with upsert-by-date semantics
 ```
 
+### Review fixes (Task 10 `/kb-review`)
+
+- [x] **10.R1** ([plan-fix]: `uq_node_source_ref` was `UNIQUE (source, source_ref)` — GLOBAL
+  across users. User B's first daily-log POST for a date user A had already logged hit an
+  unhandled IntegrityError → 500; a same-user concurrent double-POST (SELECT-then-INSERT
+  TOCTOU) 500'd the same way. Three-part fix:
+
+  1. **Constraint is per-owner**: `UNIQUE (owner_id, source, source_ref)` as
+     `uq_node_owner_source_ref`, in the model and amended IN PLACE in unreleased migration
+     0002 (same approach as the `ck_node_shares_user_xor_group` amendment). Anyone who
+     already applied the old 0002 must run
+     `alembic downgrade 275d5f4b90c3 && alembic upgrade head` — cycle proven green in the
+     sandbox (`38ca9223b637 (head)`; live `\d` shows `UNIQUE (owner_id, source, source_ref)`).
+  2. **Residual race**: `node_service.create_node` maps IntegrityError on the new constraint
+     to `ConflictError` (mirrors the `uq_revision_version` mapping in `update_node`); the
+     daily-log upsert wraps the create in a SAVEPOINT (`db.begin_nested()`) and on
+     `ConflictError` re-fetches via the extracted `_existing_log` probe and updates the row —
+     upsert semantics mean the race loser converges on the existing node, not a 409. No stale
+     graph op: `create_node` queues the Neo4j upsert only after a successful flush.
+  3. **Downstream check**: ingestion idempotency by "(source, source_ref) unique key"
+     (docs/02 §KnowledgeIngestor, phase-4/5/6 plans) still holds per-owner — MD import runs
+     as the uploading user, and Confluence/codebase sync each run as a single service user,
+     so per-owner uniqueness gives the same idempotency guarantee within each connector.
+
+  RED→GREEN: `test_daily_log_same_date_different_users`,
+  `test_daily_log_upsert_recovers_from_insert_race` (probe forced to miss once — deterministic
+  TOCTOU), `test_create_node_duplicate_source_ref_conflict`. All were IntegrityError/500 before;
+  full suite 79 passed, 9 skipped (Neo4j-dependent, sandbox), ruff + `mypy app/api app/services
+  app/schemas` clean.)
+
 ---
 
 ## Phase 1 exit gate

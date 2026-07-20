@@ -107,7 +107,19 @@ async def create_node(
         meta=meta or {},
     )
     db.add(node)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # A row with this (owner_id, source, source_ref) already exists — e.g. a
+        # concurrent double-POST that slipped past a SELECT-then-INSERT probe.
+        # Surface as 409 (mirrors uq_revision_version in update_node); upsert-style
+        # callers catch it, re-fetch, and update the existing row instead.
+        if "uq_node_owner_source_ref" in str(exc.orig):
+            raise ConflictError(
+                f"Node with source={source!r} source_ref={source_ref!r} "
+                "already exists for this owner"
+            ) from exc
+        raise
     # Neo4j vertex upsert runs AFTER db.commit(): queued here, executed by the
     # caller via run_pending_graph_ops(db) (module docstring, kb-neo4j-graph).
     _queue_graph_op(db, partial(gs.upsert_vertex, node))

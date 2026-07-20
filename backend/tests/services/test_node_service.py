@@ -37,6 +37,22 @@ async def test_get_node_invisible_raises_not_found(db, make_user, make_node):
         await ns.get_node(db, node.id, viewer)
 
 
+async def test_create_node_duplicate_source_ref_conflict(db, make_user):
+    """Same (owner_id, source, source_ref) twice → ConflictError (409), never a
+    raw IntegrityError/500 (mirrors the uq_revision_version mapping in update_node)."""
+    from app.core.errors import ConflictError
+
+    owner = await make_user(email="ns_dupref@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await ns.create_node(
+        db, viewer=viewer, title="Log A", source="daily_log", source_ref="2026-07-19"
+    )
+    with pytest.raises(ConflictError):
+        await ns.create_node(
+            db, viewer=viewer, title="Log B", source="daily_log", source_ref="2026-07-19"
+        )
+
+
 async def test_update_node_creates_revision(db, make_user, make_node):
     owner = await make_user(email="ns_upd@test.com")
     node = await make_node(owner, title="Old Title", body="old body")

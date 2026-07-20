@@ -81,7 +81,9 @@ class KnowledgeNode(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("source", "source_ref", name="uq_node_source_ref"),
+        # Per-owner idempotency key: global (source, source_ref) uniqueness made
+        # user B's first daily log for a date user A had logged a 500.
+        UniqueConstraint("owner_id", "source", "source_ref", name="uq_node_owner_source_ref"),
         Index("ix_kn_owner_deleted", "owner_id", "deleted_at"),
         Index("ix_kn_tsv", "body_tsv", postgresql_using="gin"),
     )
