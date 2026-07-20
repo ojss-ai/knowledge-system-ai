@@ -36,17 +36,21 @@ async def test_get_node_own(client: AsyncClient, auth_headers):
     assert r2.json()["id"] == node_id
 
 
-async def test_get_private_node_other_user_forbidden(
+async def test_get_private_node_other_user_looks_not_found(
     client: AsyncClient, auth_headers, auth_headers_other
 ):
+    """Invisible nodes must be indistinguishable from nonexistent ones (ADR-004):
+    404, and neither the id nor the title may appear in the response body."""
     r = await client.post(
         "/api/v1/nodes",
-        json={"title": "Private", "visibility": "private"},
+        json={"title": "PrivateSecretTitle", "visibility": "private"},
         headers=auth_headers,
     )
     node_id = r.json()["id"]
     r2 = await client.get(f"/api/v1/nodes/{node_id}", headers=auth_headers_other)
-    assert r2.status_code == 403
+    assert r2.status_code == 404
+    assert node_id not in r2.text  # existence
+    assert "PrivateSecretTitle" not in r2.text  # content
 
 
 async def test_list_nodes(client: AsyncClient, auth_headers):
@@ -104,7 +108,8 @@ async def test_admin_gets_no_visibility_bypass_outside_admin_routes(
     )
     nid = r.json()["id"]
     r2 = await client.get(f"/api/v1/nodes/{nid}", headers=auth_headers_admin)
-    assert r2.status_code == 403
+    assert r2.status_code == 404  # invisible == nonexistent, even for admin outside /admin
+    assert "owner-only-secret" not in r2.text
     r3 = await client.get("/api/v1/nodes", headers=auth_headers_admin)
     assert "owner-only-secret" not in r3.text
     assert nid not in r3.text
@@ -119,9 +124,10 @@ async def test_share_grants_visibility(client: AsyncClient, auth_headers, auth_h
         headers=auth_headers,
     )
     nid = r.json()["id"]
-    # invisible before the share row exists
+    # invisible before the share row exists — looks nonexistent (ADR-004)
     pre = await client.get(f"/api/v1/nodes/{nid}", headers=auth_headers_other)
-    assert pre.status_code == 403
+    assert pre.status_code == 404
+    assert nid not in pre.text
     rs = await client.post(
         f"/api/v1/nodes/{nid}/shares", json={"user_id": other_id}, headers=auth_headers
     )

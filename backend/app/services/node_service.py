@@ -115,18 +115,16 @@ async def create_node(
 
 
 async def get_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> KnowledgeNode:
+    """Invisible nodes are indistinguishable from nonexistent ones (ADR-004,
+    kb-visibility-filter): both raise NotFoundError. A 403 here would confirm
+    to any authenticated caller that the private node id exists."""
     clause = visible_nodes_clause(viewer)
     row = await db.scalar(select(KnowledgeNode).where(KnowledgeNode.id == node_id).where(clause))
     if row is None:
-        # Distinguish not-found from forbidden
-        exists = await db.scalar(
-            select(KnowledgeNode.id).where(
-                KnowledgeNode.id == node_id, KnowledgeNode.deleted_at.is_(None)
-            )
-        )
-        if exists is None:
-            raise NotFoundError(f"Node {node_id} not found")
-        raise ForbiddenError(f"Node {node_id} not accessible")
+        # Do not echo the id back: the message must not confirm anything
+        # about what exists (the caller already knows what id they asked for,
+        # but keeping the body generic makes existence-leak tests meaningful).
+        raise NotFoundError("Node not found")
     return row
 
 

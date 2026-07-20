@@ -1577,11 +1577,16 @@ async def test_get_node_own(client: AsyncClient, auth_headers):
     assert r2.json()["id"] == node_id
 
 
-async def test_get_private_node_other_user_forbidden(client: AsyncClient, auth_headers, auth_headers_other):
-    r = await client.post("/api/v1/nodes", json={"title": "Private", "visibility": "private"}, headers=auth_headers)
+# [plan-fix] review CRITICAL: plan originally asserted 403 here, but a 403
+# confirms the private node id EXISTS (ADR-004 / kb-visibility-filter forbid
+# existence leaks). Invisible must look nonexistent: 404, generic body.
+async def test_get_private_node_other_user_looks_not_found(client: AsyncClient, auth_headers, auth_headers_other):
+    r = await client.post("/api/v1/nodes", json={"title": "PrivateSecretTitle", "visibility": "private"}, headers=auth_headers)
     node_id = r.json()["id"]
     r2 = await client.get(f"/api/v1/nodes/{node_id}", headers=auth_headers_other)
-    assert r2.status_code == 403
+    assert r2.status_code == 404
+    assert node_id not in r2.text  # existence
+    assert "PrivateSecretTitle" not in r2.text  # content
 
 
 async def test_list_nodes(client: AsyncClient, auth_headers):
@@ -1695,7 +1700,8 @@ cd backend && pytest tests/api/test_nodes_api.py -v
 
 - [x] **8.7** curl evidence ([plan-fix]: login is JSON `{"email","password"}`, not form
   data, and `*.local` addresses are rejected by pydantic EmailStr — evidence user is
-  `admin@example.com`):
+  `admin@example.com`; evidence users/nodes were deleted from the dev DB after the
+  run — `SELECT email FROM users` is empty again, so the suite stays deterministic):
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \

@@ -24,14 +24,16 @@ async def test_get_node_own(db, make_user, make_node):
     assert result.id == node.id
 
 
-async def test_get_node_forbidden(db, make_user, make_node):
-    from app.core.errors import ForbiddenError
+async def test_get_node_invisible_raises_not_found(db, make_user, make_node):
+    """Invisible == nonexistent (ADR-004): NotFoundError, never ForbiddenError,
+    so existence of a private node id is never confirmed."""
+    from app.core.errors import NotFoundError
 
     owner = await make_user(email="ns_fo@test.com")
     other = await make_user(email="ns_fo2@test.com")
     node = await make_node(owner, visibility=Visibility.private)
     viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
-    with pytest.raises(ForbiddenError):
+    with pytest.raises(NotFoundError):
         await ns.get_node(db, node.id, viewer)
 
 
