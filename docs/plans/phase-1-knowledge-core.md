@@ -700,21 +700,25 @@ feat(visibility): implement visibility.py with Viewer contract and 6 rule tests
 ## Task 5 — Neo4j graph service
 
 **Files:**
-- Update: `backend/app/services/graph_service.py` (full implementation — driver setup skeleton was in Task 3)
+- Create: `backend/app/services/graph_service.py`
 - Create: `backend/tests/services/test_graph_service.py`
+
+> [plan-fix] The plan said "Update … driver setup skeleton was in Task 3", but Task 3 put the
+> driver singleton in `app/core/neo4j.py` (no graph_service skeleton exists). This module is
+> created here and imports `get_driver` from `app.core.neo4j` — exactly as the plan code below
+> already does.
 
 ### Steps
 
-- [ ] **5.1** Write the failing tests:
+- [x] **5.1** Write the failing tests:
 
 ```python
 # backend/tests/services/test_graph_service.py
-import uuid
 import pytest
-from app.models.knowledge import KnowledgeNode
-from app.models.user import Visibility, Role
-from app.services.visibility import Viewer
+
+from app.models.user import Role, Visibility
 from app.services import graph_service as gs
+from app.services.visibility import Viewer
 
 pytestmark = pytest.mark.asyncio
 
@@ -753,7 +757,7 @@ async def test_merge_and_delete_edge(db, neo4j_session, make_user, make_node):
     assert str(n2.id) not in [e["target"] for e in hood2["edges"]]
 
 
-async def test_neighborhood_visibility(db, make_user, make_node):
+async def test_neighborhood_visibility(db, neo4j_session, make_user, make_node):
     """Private nodes must not appear in another user's neighborhood traversal."""
     owner = await make_user(email="gs_vis1@test.com")
     other = await make_user(email="gs_vis2@test.com")
@@ -767,15 +771,28 @@ async def test_neighborhood_visibility(db, make_user, make_node):
     viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
     hood = await gs.get_neighborhood(db, public_node.id, viewer, hops=1)
     node_ids = [v["id"] for v in hood["nodes"]]
-    assert str(private_node.id) not in node_ids, "Private node must not leak through graph traversal"
+    assert str(private_node.id) not in node_ids, (
+        "Private node must not leak through graph traversal"
+    )
 ```
 
-- [ ] **5.2** Run — expect ImportError:
+> [plan-fix] As implemented: removed unused imports (`uuid`, `KnowledgeNode`) that fail
+> `ruff check`; isort-ordered the rest; wrapped the >100-char assert. Added `neo4j_session`
+> to `test_neighborhood_visibility` — it drives a live Neo4j via `upsert_vertex`/`merge_edge`,
+> so it must depend on that fixture to SKIP (not error) when Neo4j is down, per the approved
+> sandbox deviation. Test bodies unchanged.
+
+- [x] **5.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_graph_service.py -x 2>&1 | head -20
 ```
 
-- [ ] **5.3** Implement `graph_service.py`:
+- [x] **5.3** Implement `graph_service.py`:
+
+> [plan-fix] As implemented, to pass the gates: bare `dict` generics annotated as
+> `dict[str, Any]` (`mypy --strict` disallow_any_generics — also makes the `Any` import used),
+> `nodes_out`/`raw_edges` explicitly annotated, and >100-char lines wrapped (ruff E501).
+> Cypher, function signatures, and behavior are exactly as planned.
 
 ```python
 # backend/app/services/graph_service.py
@@ -886,7 +903,7 @@ async def get_neighborhood(
     center_id: uuid.UUID,
     viewer: Viewer,
     hops: int = 1,
-) -> dict[str, list[dict]]:
+) -> dict[str, list[dict[str, Any]]]:
     """
     Return nodes and edges within `hops` hops of center_id, visibility-filtered.
     hops clamped to _HOP_LIMIT.  Total nodes capped at _NODE_LIMIT.
@@ -894,7 +911,7 @@ async def get_neighborhood(
     """
     hops = min(hops, _HOP_LIMIT)
     candidate_ids: set[uuid.UUID] = {center_id}
-    raw_edges: list[dict] = []
+    raw_edges: list[dict[str, Any]] = []
 
     async with get_driver().session() as session:
         result = await session.run(
@@ -924,8 +941,8 @@ async def get_neighborhood(
                 for e in path_edges:
                     raw_edges.append({
                         "source": e.start_node["node_id"] if hasattr(e, "start_node") else None,
-                        "target": e.end_node["node_id"]   if hasattr(e, "end_node")   else None,
-                        "label":  e.type                  if hasattr(e, "type")        else "",
+                        "target": e.end_node["node_id"] if hasattr(e, "end_node") else None,
+                        "label": e.type if hasattr(e, "type") else "",
                     })
 
     # Apply visibility filter via Postgres (authoritative)
@@ -941,8 +958,13 @@ async def get_neighborhood(
     visible_nodes = list(visible_rows)
     visible_ids = {str(n.id) for n in visible_nodes}
 
-    nodes_out = [
-        {"id": str(n.id), "title": n.title, "node_type": n.node_type, "visibility": n.visibility.value}
+    nodes_out: list[dict[str, Any]] = [
+        {
+            "id": str(n.id),
+            "title": n.title,
+            "node_type": n.node_type,
+            "visibility": n.visibility.value,
+        }
         for n in visible_nodes
     ]
     edges_out = [
@@ -956,16 +978,21 @@ async def get_overview(
     db: AsyncSession,
     viewer: Viewer,
     limit: int = 100,
-) -> dict[str, list[dict]]:
+) -> dict[str, list[dict[str, Any]]]:
     """Top visible nodes + edges between them for the initial graph viewport."""
     clause = visible_nodes_clause(viewer)
     rows = await db.scalars(
-        select(KnowledgeNode).where(clause).order_by(KnowledgeNode.updated_at.desc()).limit(limit)
+        select(KnowledgeNode)
+        .where(clause)
+        .order_by(KnowledgeNode.updated_at.desc())
+        .limit(limit)
     )
     nodes = list(rows)
     id_set = {str(n.id) for n in nodes}
 
-    nodes_out = [{"id": str(n.id), "title": n.title, "node_type": n.node_type} for n in nodes]
+    nodes_out: list[dict[str, Any]] = [
+        {"id": str(n.id), "title": n.title, "node_type": n.node_type} for n in nodes
+    ]
 
     if not id_set:
         return {"nodes": nodes_out, "edges": []}
@@ -987,13 +1014,15 @@ async def get_overview(
     return {"nodes": nodes_out, "edges": edges_out}
 ```
 
-- [ ] **5.4** Run tests:
+- [x] **5.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_graph_service.py -v
 # Expected: 3 passed
+# (sandbox actual: 3 skipped — "Neo4j unreachable"; approved deviation.
+#  MUST be re-run against the Docker stack and show 3 passed.)
 ```
 
-- [ ] **5.5** Commit:
+- [x] **5.5** Commit:
 ```
 feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edge, neighborhood + visibility gate
 ```
