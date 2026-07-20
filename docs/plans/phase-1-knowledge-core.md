@@ -1971,7 +1971,7 @@ feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborh
 
 ### Steps
 
-- [ ] **10.1** Write failing tests:
+- [x] **10.1** Write failing tests (plan-fix: also added `test_daily_log_unauthenticated_401` and `test_private_daily_log_other_user_looks_not_found` — 401 and visibility tests are mandatory for every new endpoint/read path per kb-api-conventions and kb-visibility-filter):
 
 ```python
 # backend/tests/api/test_daily_logs_api.py
@@ -2012,7 +2012,7 @@ async def test_daily_log_idempotent_create(client: AsyncClient, auth_headers):
     assert r2.json()["body"] == "second"
 ```
 
-- [ ] **10.2** Create the router (daily logs are just KnowledgeNodes with node_type=daily_log):
+- [x] **10.2** Create the router (daily logs are just KnowledgeNodes with node_type=daily_log). Plan-fix — the code below is the original sketch; the committed router differs to match project law (see `backend/app/api/v1/daily_logs.py`): `get_scoped_viewer` instead of `get_current_viewer` (admin visibility bypass only under `/admin/*`); handlers return `NodeOut.model_validate(node)` with `summary`/`operation_id` (kb-api-conventions, mypy); `visible_nodes_clause(viewer)` composed into the upsert existence probe too (rule 1; it subsumes the `deleted_at` filter); `run_pending_graph_ops(db)` after `db.commit()` (ADR-011 handler contract); 404 body is generic `"Daily log not found"` (get_node standard), import at top:
 
 ```python
 # backend/app/api/v1/daily_logs.py
@@ -2110,25 +2110,25 @@ async def list_daily_logs(
     return list(rows)
 ```
 
-- [ ] **10.3** Register in `main.py`:
+- [x] **10.3** Register in `main.py` (plan-fix: import style matches the existing file — `from app.api.v1.daily_logs import router as daily_logs_router`):
 
 ```python
 from app.api.v1 import daily_logs as daily_logs_router
 app.include_router(daily_logs_router.router, prefix="/api/v1")
 ```
 
-- [ ] **10.4** Run all tests:
+- [x] **10.4** Run all tests (76 passed, 9 skipped — Neo4j-dependent tests skip in the sandbox where Neo4j is unreachable; approved, re-verify on a machine with the docker stack):
 ```bash
 cd backend && pytest tests/ -v
 # Expected: all pass, no skips
 ```
 
-- [ ] **10.5** Run full lint + type check:
+- [x] **10.5** Run full lint + type check:
 ```bash
 cd backend && ruff check . && mypy --strict app/services/ app/schemas/
 ```
 
-- [ ] **10.6** curl evidence:
+- [x] **10.6** curl evidence (ran 2026-07-20: POST returned `"daily_log"`; GET by date returned `{"node_type": "daily_log", "source": "daily_log", "source_ref": "2026-07-20"}`; evidence rows deleted afterwards):
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/daily-logs \
   -H "Authorization: Bearer $TOKEN" \
@@ -2137,7 +2137,7 @@ curl -s -X POST http://localhost:8000/api/v1/daily-logs \
 # Expected: "daily_log"
 ```
 
-- [ ] **10.7** Commit:
+- [x] **10.7** Commit:
 ```
 feat(api): POST/GET /api/v1/daily-logs with upsert-by-date semantics
 ```
