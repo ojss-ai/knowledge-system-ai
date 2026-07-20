@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.core.config import settings
 from app.core.db import get_db
 from app.main import create_app
-from app.models.user import Visibility
+from app.models.user import Role, User, Visibility
 
 TEST_DB_URL = settings.database_url  # same dockerized PG; tests roll back
 
@@ -33,6 +33,31 @@ async def client(db):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest_asyncio.fixture
+async def make_user(db):
+    """Factory: create a User in the test DB and return it."""
+
+    async def _factory(
+        *,
+        email: str,
+        display_name: str = "Test User",
+        role: Role = Role.user,
+        password_hash: str = "x",
+    ) -> User:
+        user = User(
+            id=_uuid.uuid4(),
+            email=email,
+            password_hash=password_hash,
+            display_name=display_name,
+            role=role,
+        )
+        db.add(user)
+        await db.flush()
+        return user
+
+    return _factory
 
 
 @pytest_asyncio.fixture

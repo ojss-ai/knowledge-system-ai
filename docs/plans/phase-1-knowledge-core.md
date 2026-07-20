@@ -105,10 +105,11 @@ chore(test): extend conftest with make_node and make_tag fixtures
 - Modify: `backend/app/models/__init__.py`
 - Create: `backend/alembic/versions/0002_knowledge_core.py`
 - Create: `backend/tests/models/test_knowledge_models.py`
+- Modify: `backend/tests/conftest.py` (plan-fix: `make_user` fixture was assumed but never created in Task 1 — added here)
 
 ### Steps
 
-- [ ] **2.1** Write the failing test first:
+- [x] **2.1** Write the failing test first (plan-fix applied to the code below: dropped unused `User`, `Role`, `NodeRevision`, `NodeTag` imports — ruff F401; `pytest.raises(Exception)` → `pytest.raises(IntegrityError)` — ruff B017; the failing flush runs inside `db.begin_nested()` so the outer test transaction stays usable and teardown emits no SAWarning):
 
 ```python
 # backend/tests/models/test_knowledge_models.py
@@ -168,12 +169,12 @@ async def test_tag_slug_unique(db):
         await db.flush()
 ```
 
-- [ ] **2.2** Run — expect ImportError / FAIL:
+- [x] **2.2** Run — expect ImportError / FAIL:
 ```bash
 cd backend && pytest tests/models/test_knowledge_models.py -x 2>&1 | head -30
 ```
 
-- [ ] **2.3** Create the model:
+- [x] **2.3** Create the model (plan-fix applied to the code below: added the `Computed` import per the note; removed unused `text`/`UTC` imports — ruff F401; `class NodeType(str, enum.Enum)` → `class NodeType(enum.StrEnum)` — ruff UP042, matches `Role`/`Visibility` in `user.py`):
 
 ```python
 # backend/app/models/knowledge.py
@@ -299,13 +300,13 @@ class NodeTag(Base):
 
 > **Note:** `Computed` must be imported: `from sqlalchemy import Computed`
 
-- [ ] **2.4** Add to `backend/app/models/__init__.py`:
+- [x] **2.4** Add to `backend/app/models/__init__.py`:
 
 ```python
 from app.models.knowledge import KnowledgeNode, NodeShare, NodeRevision, Tag, NodeTag, NodeType  # noqa: F401
 ```
 
-- [ ] **2.5** Generate Alembic migration:
+- [x] **2.5** Generate Alembic migration (plan-fix: autogenerate DID include the `body_tsv` Computed column; the `visibility` column had to be switched to `postgresql.ENUM(..., name="visibility", create_type=False)` because the enum type already exists from migration 0001 and `sa.Enum` would try to re-create it):
 
 ```bash
 cd backend && alembic revision --autogenerate -m "knowledge_core"
@@ -318,7 +319,7 @@ cd backend && alembic revision --autogenerate -m "knowledge_core"
 #       nullable=True),
 ```
 
-- [ ] **2.6** Apply migration and run tests — expect PASS:
+- [x] **2.6** Apply migration and run tests — expect PASS:
 
 ```bash
 cd backend && alembic upgrade head
@@ -326,7 +327,7 @@ pytest tests/models/test_knowledge_models.py -v
 # Expected: 4 passed
 ```
 
-- [ ] **2.7** Commit:
+- [x] **2.7** Commit:
 ```
 feat(models): knowledge_nodes, node_shares, node_revisions, tags, node_tags + migration 0002
 ```
