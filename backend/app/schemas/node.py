@@ -2,9 +2,10 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.user import Visibility
+from app.services.graph_service import ALLOWED_EDGE_LABELS
 
 
 class NodeCreate(BaseModel):
@@ -56,3 +57,28 @@ class NodeShareCreate(BaseModel):
 class GraphNeighborhoodOut(BaseModel):
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
+
+
+class EdgeCreate(BaseModel):
+    source_id: uuid.UUID
+    target_id: uuid.UUID
+    label: str = "LINKS_TO"
+
+    @field_validator("label")
+    @classmethod
+    def _label_allowed(cls, v: str) -> str:
+        """Reject unknown labels at validation time (422) — the label is
+        interpolated into Cypher, so only the fixed vocabulary may pass."""
+        if v not in ALLOWED_EDGE_LABELS:
+            raise ValueError("unknown edge label")
+        return v
+
+
+class EdgeDelete(EdgeCreate):
+    """Same shape as EdgeCreate: (source_id, target_id, label) identifies an edge."""
+
+
+class EdgeOut(BaseModel):
+    source_id: uuid.UUID
+    target_id: uuid.UUID
+    label: str

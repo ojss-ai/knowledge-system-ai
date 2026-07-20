@@ -1746,32 +1746,32 @@ feat(api): POST/GET/PATCH/DELETE /api/v1/nodes with visibility enforcement
 - Create: `backend/app/api/v1/edges.py`
 - Create: `backend/app/api/v1/graph.py`
 - Modify: `backend/app/main.py`
+- Modify: `backend/app/schemas/node.py` ([plan-fix]: edge schemas live in `app/schemas/`, not inline in the router — kb-api-conventions, and mypy --strict covers `app/schemas`)
+- Modify: `backend/app/core/errors.py` ([plan-fix]: plan did not specify Neo4j-down behavior; graph-sourced endpoints surface `neo4j.exceptions.ServiceUnavailable` as 503 via the central error mapping)
 - Create: `backend/tests/api/test_graph_api.py`
 
 ### Steps
 
-- [ ] **9.1** Write failing tests:
+- [x] **9.1** Write failing tests ([plan-fix]: tests that create or traverse edges need a live Neo4j, so they take the `neo4j_session` fixture and skip when Neo4j is unreachable — same convention as `tests/services/test_graph_service.py`. Added the mandatory kb-api-conventions tests the plan omitted: 401 unauthenticated, 422 unknown label, 422 hops>3, plus the mandatory kb-visibility-filter tests: edge-to-invisible-target → 404 no-leak, neighborhood-of-invisible-center → 404 no-leak, overview hides other users' private nodes. Those visibility tests are pure-PG — the 404 fires before any Neo4j call — so they always run. RED observed: 5 failed (404s: routes not registered), 3 skipped):
 
 ```python
-# backend/tests/api/test_graph_api.py
+# backend/tests/api/test_graph_api.py — full file in repo; the three plan tests as landed:
 import pytest
 from httpx import AsyncClient
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_create_edge(client: AsyncClient, auth_headers):
-    r1 = await client.post("/api/v1/nodes", json={"title": "N1", "visibility": "public"}, headers=auth_headers)
-    r2 = await client.post("/api/v1/nodes", json={"title": "N2", "visibility": "public"}, headers=auth_headers)
-    n1_id, n2_id = r1.json()["id"], r2.json()["id"]
+async def test_create_edge(client: AsyncClient, auth_headers, neo4j_session):
+    n1_id = await _create_node(client, auth_headers, "N1")   # helper posts /api/v1/nodes
+    n2_id = await _create_node(client, auth_headers, "N2")
     r = await client.post("/api/v1/edges", json={"source_id": n1_id, "target_id": n2_id, "label": "LINKS_TO"}, headers=auth_headers)
     assert r.status_code == 201
 
 
-async def test_neighborhood(client: AsyncClient, auth_headers):
-    r1 = await client.post("/api/v1/nodes", json={"title": "Center", "visibility": "public"}, headers=auth_headers)
-    r2 = await client.post("/api/v1/nodes", json={"title": "Neighbour", "visibility": "public"}, headers=auth_headers)
-    n1_id, n2_id = r1.json()["id"], r2.json()["id"]
+async def test_neighborhood(client: AsyncClient, auth_headers, neo4j_session):
+    n1_id = await _create_node(client, auth_headers, "Center")
+    n2_id = await _create_node(client, auth_headers, "Neighbour")
     await client.post("/api/v1/edges", json={"source_id": n1_id, "target_id": n2_id, "label": "LINKS_TO"}, headers=auth_headers)
     r = await client.get(f"/api/v1/graph/neighborhood/{n1_id}?hops=1", headers=auth_headers)
     assert r.status_code == 200
@@ -1784,111 +1784,147 @@ async def test_graph_overview(client: AsyncClient, auth_headers):
     assert r.status_code == 200
     assert "nodes" in r.json()
     assert "edges" in r.json()
+
+# also landed: test_delete_edge (neo4j_session), test_create_edge_unauthenticated_401,
+# test_create_edge_unknown_label_422, test_neighborhood_hops_above_limit_422,
+# test_create_edge_to_invisible_target_looks_not_found,
+# test_neighborhood_invisible_center_looks_not_found, test_overview_hides_other_users_private
 ```
 
-- [ ] **9.2** Create `edges.py`:
+- [x] **9.2** Edge schemas + `edges.py` ([plan-fix]: the plan's `gs.merge_edge(db, ..., props=...)` / `gs.delete_edge(db, ...)` calls don't match the Task 5 signatures — `merge_edge(source_id, target_id, label, created_by, score=None)` and `delete_edge(source_id, target_id, label)` take no `db` and no `props`; `created_by` is the viewer's user id. Dropped `props` (nothing consumes it — YAGNI) and the `db.commit()` calls (edges live only in Neo4j, there is no PG write to commit). `label` is validated against `graph_service.ALLOWED_EDGE_LABELS` in the schema so an unknown label is a 422, not an `assert` 500 — it is interpolated into Cypher. Viewer dep is `get_scoped_viewer` (Task 8 fix: no admin bypass outside `/api/v1/admin/*`); `response_model`/`summary`/`operation_id` set per kb-api-conventions):
 
 ```python
-# backend/app/api/v1/edges.py
-import uuid
-from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.deps import get_current_viewer
-from app.core.db import get_db
-from app.services import graph_service as gs
-from app.services import node_service as ns
-
-router = APIRouter(prefix="/edges", tags=["edges"])
-
-
+# backend/app/schemas/node.py (additions)
 class EdgeCreate(BaseModel):
     source_id: uuid.UUID
     target_id: uuid.UUID
     label: str = "LINKS_TO"
-    props: dict = {}
+
+    @field_validator("label")
+    @classmethod
+    def _label_allowed(cls, v: str) -> str:
+        if v not in ALLOWED_EDGE_LABELS:   # from app.services.graph_service
+            raise ValueError("unknown edge label")
+        return v
 
 
-class EdgeDelete(BaseModel):
+class EdgeDelete(EdgeCreate):
+    """Same shape as EdgeCreate: (source_id, target_id, label) identifies an edge."""
+
+
+class EdgeOut(BaseModel):
     source_id: uuid.UUID
     target_id: uuid.UUID
-    label: str = "LINKS_TO"
-
-
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_edge(
-    payload: EdgeCreate,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    # Verify both nodes are visible to viewer
-    await ns.get_node(db, payload.source_id, viewer)
-    await ns.get_node(db, payload.target_id, viewer)
-    await gs.merge_edge(db, payload.source_id, payload.target_id, payload.label, props=payload.props)
-    await db.commit()
-    return {"source_id": str(payload.source_id), "target_id": str(payload.target_id), "label": payload.label}
-
-
-@router.delete("", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_edge(
-    payload: EdgeDelete,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    await ns.get_node(db, payload.source_id, viewer)
-    await gs.delete_edge(db, payload.source_id, payload.target_id, payload.label)
-    await db.commit()
+    label: str
 ```
 
-- [ ] **9.3** Create `graph.py`:
+```python
+# backend/app/api/v1/edges.py (as landed — see file for module docstring)
+router = APIRouter(prefix="/edges", tags=["edges"])
+
+
+@router.post("", response_model=EdgeOut, status_code=status.HTTP_201_CREATED,
+             summary="Create edge", operation_id="createEdge")
+async def create_edge(
+    payload: EdgeCreate,
+    viewer: Viewer = Depends(get_scoped_viewer),
+    db: AsyncSession = Depends(get_db),
+) -> EdgeOut:
+    # Both endpoints must be visible to the viewer (invisible == nonexistent).
+    await ns.get_node(db, payload.source_id, viewer)
+    await ns.get_node(db, payload.target_id, viewer)
+    await gs.merge_edge(payload.source_id, payload.target_id, payload.label,
+                        created_by=str(viewer.user_id))
+    return EdgeOut(source_id=payload.source_id, target_id=payload.target_id, label=payload.label)
+
+
+@router.delete("", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Delete edge", operation_id="deleteEdge")
+async def delete_edge(
+    payload: EdgeDelete,
+    viewer: Viewer = Depends(get_scoped_viewer),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await ns.get_node(db, payload.source_id, viewer)
+    await gs.delete_edge(payload.source_id, payload.target_id, payload.label)
+```
+
+- [x] **9.3** Create `graph.py` ([plan-fix]: an invisible center must be indistinguishable from a nonexistent one — `ns.get_node(db, node_id, viewer)` runs BEFORE the traversal and raises `NotFoundError` → 404 generic body (ADR-004); the plan's version would have returned a 200 neighborhood around an invisible center. Same `get_scoped_viewer`/`operation_id` fixes as 9.2):
 
 ```python
-# backend/app/api/v1/graph.py
-import uuid
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.deps import get_current_viewer
-from app.core.db import get_db
-from app.schemas.node import GraphNeighborhoodOut
-from app.services import graph_service as gs
-
+# backend/app/api/v1/graph.py (as landed)
 router = APIRouter(prefix="/graph", tags=["graph"])
 
 
-@router.get("/neighborhood/{node_id}", response_model=GraphNeighborhoodOut)
+@router.get("/neighborhood/{node_id}", response_model=GraphNeighborhoodOut,
+            summary="Get node neighborhood", operation_id="getGraphNeighborhood")
 async def get_neighborhood(
     node_id: uuid.UUID,
     hops: int = Query(1, ge=0, le=3),
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    return await gs.get_neighborhood(db, node_id, viewer, hops=hops)
+) -> GraphNeighborhoodOut:
+    await ns.get_node(db, node_id, viewer)  # invisible center == nonexistent (404)
+    data = await gs.get_neighborhood(db, node_id, viewer, hops=hops)
+    return GraphNeighborhoodOut(**data)
 
 
-@router.get("/overview", response_model=GraphNeighborhoodOut)
+@router.get("/overview", response_model=GraphNeighborhoodOut,
+            summary="Get graph overview", operation_id="getGraphOverview")
 async def get_overview(
     limit: int = Query(100, ge=1, le=500),
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    return await gs.get_overview(db, viewer, limit=limit)
+) -> GraphNeighborhoodOut:
+    data = await gs.get_overview(db, viewer, limit=limit)
+    return GraphNeighborhoodOut(**data)
 ```
 
-- [ ] **9.4** Register routers in `main.py`:
+- [x] **9.4** Register routers in `main.py` ([plan-fix]: import style matches the existing `from app.api.v1.X import router as X_router` pattern) and add the Neo4j-down mapping to `core/errors.py`:
 
 ```python
-from app.api.v1 import edges as edges_router, graph as graph_router
-app.include_router(edges_router.router, prefix="/api/v1")
-app.include_router(graph_router.router, prefix="/api/v1")
+# backend/app/main.py
+from app.api.v1.edges import router as edges_router
+from app.api.v1.graph import router as graph_router
+app.include_router(edges_router, prefix="/api/v1")
+app.include_router(graph_router, prefix="/api/v1")
 ```
 
-- [ ] **9.5** Run tests:
+```python
+# backend/app/core/errors.py (addition inside register_error_handlers)
+@app.exception_handler(ServiceUnavailable)          # neo4j.exceptions.ServiceUnavailable
+async def neo4j_unavailable_handler(_: Request, exc: ServiceUnavailable) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": "graph backend unavailable"})
+```
+
+- [x] **9.5** Run tests:
 ```bash
 cd backend && pytest tests/api/test_graph_api.py -v
-# Expected: 3 passed
+# Observed GREEN (sandbox, Neo4j unreachable): 7 passed, 3 skipped (Neo4j skips:
+# test_create_edge, test_delete_edge, test_neighborhood — re-verify on the Docker stack)
+# Full suite: 68 passed, 9 skipped · ruff check clean ·
+# mypy app/services app/schemas: Success: no issues found in 10 source files
 ```
 
-- [ ] **9.6** Commit:
+- [x] **9.6** curl evidence ([plan-fix]: recorded honestly against a live uvicorn with Neo4j
+  DOWN — edge writes and traversals are graph-sourced, so they surface 503
+  `{"detail":"graph backend unavailable"}`; happy-path 201/200 for those endpoints requires
+  the Docker stack and must be re-verified there. Evidence user/nodes deleted afterwards —
+  `users` and `knowledge_nodes` counts are 0 again):
+
+```
+== POST /api/v1/edges (Neo4j down) ==          503  {"detail":"graph backend unavailable"}
+== POST /api/v1/edges bad label ==             422  {"type":"value_error","loc":["body","label"],
+                                                     "msg":"Value error, unknown edge label",...}
+== DELETE /api/v1/edges (Neo4j down) ==        503  {"detail":"graph backend unavailable"}
+== GET /graph/neighborhood/{id} (Neo4j down) = 503  {"detail":"graph backend unavailable"}
+== GET /graph/neighborhood/<random uuid> ==    404  {"detail":"Node not found"}
+== GET /graph/overview (nodes exist→Neo4j) ==  503  {"detail":"graph backend unavailable"}
+# (pytest shows /graph/overview → 200 {"nodes":[],"edges":[]} when the viewer's visible
+#  set is empty — the Neo4j edge lookup is skipped entirely in that case)
+```
+
+- [x] **9.7** Commit:
 ```
 feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborhood, /overview
 ```
