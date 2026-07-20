@@ -92,13 +92,15 @@ cd backend && pytest tests/models/test_chunk_model.py -x 2>&1 | head -20
 # backend/app/models/chunk.py
 from __future__ import annotations
 
+from __future__ import annotations
+
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, Integer, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from pgvector.sqlalchemy import Vector
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
 
@@ -107,22 +109,20 @@ class NodeChunk(Base):
     __tablename__ = "node_chunks"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No single-column index on node_id: uq_chunk_node_idx unique index leads with it.
     node_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=True)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(768), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    __table_args__ = (
-        UniqueConstraint("node_id", "chunk_index", name="uq_chunk_node_idx"),
-    )
+    __table_args__ = (UniqueConstraint("node_id", "chunk_index", name="uq_chunk_node_idx"),)
 ```
 
 - [x] **1.4** Add to `backend/app/models/__init__.py`:
@@ -137,32 +137,47 @@ from app.models.chunk import NodeChunk  # noqa: F401
 """node_chunks with pgvector HNSW index
 
 Revision ID: 0004
-Revises: 0003
-Create Date: 2026-01-01
+Revises: 38ca9223b637
+Create Date: 2026-07-20
 """
-from alembic import op
+
+from collections.abc import Sequence
+
 import sqlalchemy as sa
 from pgvector.sqlalchemy import Vector
+from sqlalchemy.dialects import postgresql
 
-revision = "0004"
-down_revision = "0003"
-branch_labels = None
-depends_on = None
+from alembic import op
+
+revision: str = "0004"
+# [plan-fix] plan said down_revision "0003"; the actual head is 38ca9223b637 (knowledge_core).
+down_revision: str | Sequence[str] | None = "38ca9223b637"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # [plan-fix] fresh databases need the extension before Vector columns / HNSW (ADR-003).
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
     op.create_table(
         "node_chunks",
-        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("node_id", sa.dialects.postgresql.UUID(as_uuid=True),
-                  sa.ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column(
+            "node_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("knowledge_nodes.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("chunk_index", sa.Integer, nullable=False),
         sa.Column("chunk_text", sa.Text, nullable=False),
         sa.Column("embedding", Vector(768), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.UniqueConstraint("node_id", "chunk_index", name="uq_chunk_node_idx"),
     )
-    op.create_index("ix_node_chunks_node_id", "node_chunks", ["node_id"])
+    # [plan-fix] no single-column ix_node_chunks_node_id: uq_chunk_node_idx leads with node_id
+    # (same redundant-index removal applied across phase-1 models).
     # HNSW index for cosine similarity (ADR-003)
     op.execute("""
         CREATE INDEX ix_node_chunks_embedding_hnsw
