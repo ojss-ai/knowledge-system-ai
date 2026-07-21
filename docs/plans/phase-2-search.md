@@ -1801,12 +1801,30 @@ feat(search): hybrid RRF search (FTS + pgvector) with visibility inside each leg
 
 **Files:**
 - Create: `backend/app/api/v1/search.py`
+- Create: `backend/app/schemas/search.py`
 - Modify: `backend/app/main.py`
+- Modify: `backend/tests/conftest.py`
 - Create: `backend/tests/api/test_search_api.py`
 
 ### Steps
 
-- [ ] **8.1** Write failing tests:
+> **[plan-fix] notes (applied during execution):**
+> - Viewer dep is `get_scoped_viewer`, not `get_current_viewer`: the admin
+>   visibility bypass is only reachable under `/api/v1/admin/*`
+>   (kb-visibility-filter rule 5, established in Phase 1 routers).
+> - Response schemas moved from the router into `app/schemas/search.py`
+>   (kb-api-conventions: schemas live in `app/schemas/`; mypy strict gate
+>   covers that package).
+> - Route carries `summary` + `operation_id="searchNodes"` (OpenAPI discipline).
+> - Test infra: autouse fixture in `tests/conftest.py` forces
+>   `settings.embedding_backend = "fake"` — the API path calls `get_embedder()`
+>   at request time and must never lazy-load the real sentence-transformers
+>   model in unit tests (kb-tdd-workflow: real model is integration-only).
+> - `items` are validated explicitly via `SearchResultItem.model_validate(r)`
+>   (mypy strict rejects passing `list[dict]` where `list[SearchResultItem]`
+>   is expected).
+
+- [x] **8.1** Write failing tests:
 
 ```python
 # backend/tests/api/test_search_api.py
@@ -1851,22 +1869,11 @@ async def test_search_requires_auth(client: AsyncClient):
     assert r.status_code == 401
 ```
 
-- [ ] **8.2** Create the router:
+- [x] **8.2** Create the schemas and the router:
 
 ```python
-# backend/app/api/v1/search.py
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends, Query
+# backend/app/schemas/search.py
 from pydantic import BaseModel
-from typing import Any
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.db import get_db
-from app.core.deps import get_current_viewer
-from app.services import search_service as ss
-
-router = APIRouter(prefix="/search", tags=["search"])
 
 
 class SearchResultItem(BaseModel):
@@ -1882,28 +1889,53 @@ class SearchOut(BaseModel):
     items: list[SearchResultItem]
     total: int
     query: str
+```
+
+```python
+# backend/app/api/v1/search.py
+"""Search router — thin translation layer over search_service (ADR-005).
+
+Visibility is enforced inside each search leg by hybrid_search
+(kb-visibility-filter rule 3); the router never touches the tables.
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.db import get_db
+from app.core.deps import Viewer, get_scoped_viewer
+from app.schemas.search import SearchOut, SearchResultItem
+from app.services import search_service as ss
+
+router = APIRouter(prefix="/search", tags=["search"])
 
 
-@router.get("", response_model=SearchOut)
+@router.get("", response_model=SearchOut, summary="Hybrid search", operation_id="searchNodes")
 async def search(
     q: str = Query(..., min_length=1, max_length=500),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
+) -> SearchOut:
     results, total = await ss.hybrid_search(db, q, viewer, limit=limit, offset=offset)
-    return SearchOut(items=results, total=total, query=q)
+    return SearchOut(
+        items=[SearchResultItem.model_validate(r) for r in results],
+        total=total,
+        query=q,
+    )
 ```
 
-- [ ] **8.3** Register in `main.py`:
+- [x] **8.3** Register in `main.py` (existing import style):
 
 ```python
-from app.api.v1 import search as search_router
-app.include_router(search_router.router, prefix="/api/v1")
+from app.api.v1.search import router as search_router
+app.include_router(search_router, prefix="/api/v1")
 ```
 
-- [ ] **8.4** Run all tests + curl evidence:
+- [x] **8.4** Run all tests + curl evidence:
 ```bash
 cd backend && pytest tests/ -v --tb=short
 # Expected: all pass
@@ -1912,14 +1944,43 @@ curl -s "http://localhost:8000/api/v1/search?q=FastAPI" \
   -H "Authorization: Bearer $TOKEN" | jq '{total: .total, first: .items[0].title}'
 ```
 
-- [ ] **8.5** Full gate:
-```bash
-cd backend
-ruff check .
-mypy --strict app/services/ app/schemas/
+Evidence (sandbox: pgserver PG16+pgvector; Neo4j tests auto-skip;
+`EMBEDDING_BACKEND=fake` exported for the live server — real model is
+integration-only; evidence user/node rows deleted afterwards):
+
+```text
+$ pytest tests/ -q --tb=short
+123 passed, 12 skipped in 15.34s
+
+$ curl -s "http://127.0.0.1:8000/api/v1/search?q=FastAPI" -H "Authorization: Bearer $TOKEN"
+{
+    "items": [
+        {
+            "id": "3923338e-9311-4260-8f06-0a5d3db9bdfe",
+            "title": "FastAPI Guide",
+            "node_type": "note",
+            "visibility": "public",
+            "updated_at": "2026-07-21T00:49:50.297882+00:00",
+            "score": 0.01639344262295082
+        }
+    ],
+    "total": 1,
+    "query": "FastAPI"
+}
+
+$ curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8000/api/v1/search?q=FastAPI"
+401
 ```
 
-- [ ] **8.6** Commit:
+- [x] **8.5** Full gate:
+```bash
+cd backend
+ruff check .                              # All checks passed!
+ruff format --check .                     # 85 files already formatted
+mypy app/api app/services app/schemas app/workers   # strict via pyproject; no issues in 31 files
+```
+
+- [x] **8.6** Commit:
 ```
 feat(api): GET /api/v1/search — hybrid RRF search endpoint with visibility enforcement
 ```

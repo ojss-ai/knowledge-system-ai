@@ -28,6 +28,15 @@ def _neo4j_available() -> bool:
         return False
 
 
+@pytest.fixture(autouse=True)
+def _fake_embedding_backend(monkeypatch):
+    """[plan-fix, Task 8.1]: the API search path calls get_embedder(), which reads
+    settings.embedding_backend at call time; the default would lazy-load the real
+    sentence-transformers model inside unit tests (kb-tdd-workflow: real model is
+    integration-only). Force the fake backend for every test."""
+    monkeypatch.setattr(settings, "embedding_backend", "fake")
+
+
 @pytest.fixture
 def fake_embedder():
     return FakeEmbedder()
