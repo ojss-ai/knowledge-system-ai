@@ -872,35 +872,251 @@ feat(workers): embed_node task — idempotent chunking + vector storage
 
 ### Steps
 
-- [ ] **6.1** Write the failing tests:
+> **[plan-fix] notes (applied during execution):**
+> - `graph_service` has no `create_vertex(db, node)` / `merge_edge(db, ..., props=...)`;
+>   the real API (ADR-011) is `upsert_vertex(node)` and
+>   `merge_edge(source_id, target_id, label, created_by, score=None)`. Code below uses it.
+> - One `SIMILAR_TO` edge per pair, lower node id as source (kb-pgvector-search) —
+>   not two directed edges as originally sketched.
+> - The plan's raw `select(KnowledgeNode)` calls lacked `visible_nodes_clause`; every
+>   knowledge_nodes read now carries the owner-viewer clause (kb-visibility-filter rule 1),
+>   and the similarity query applies visibility INSIDE the query, before HAVING/LIMIT.
+> - Task decorator mirrors `embed_node` (kb-celery-jobs): `queue="default"`,
+>   `retry_backoff=True`, `acks_late=True`; wrapper uses `asyncio.run` (not the
+>   deprecated `get_event_loop`).
+> - The original tests verified edges via `gs.get_neighborhood` (needs live Neo4j).
+>   They are kept as skip-when-unreachable tests; the pure-PG logic (similarity query,
+>   threshold, top-K, candidate visibility) is covered with the graph-recorder
+>   monkeypatch pattern from `tests/services/test_node_service.py` plus hand-crafted
+>   chunk vectors (FakeEmbedder is degenerate for *different* texts — see report).
+
+- [x] **6.1** Write the failing tests:
 
 ```python
 # backend/tests/workers/test_autolink_node.py
+import math
 import uuid
+
 import pytest
-from sqlalchemy import select, func
+
 from app.models.chunk import NodeChunk
-from app.services.embedding_service import FakeEmbedder
-from app.workers.tasks.embed_node import _embed_node_impl
-from app.workers.tasks.autolink_node import _autolink_node_impl
-from app.services import graph_service as gs
-from app.services.visibility import Viewer
 from app.models.user import Role, Visibility
+from app.services.visibility import Viewer
+from app.workers.tasks.autolink_node import _autolink_node_impl, autolink_node
+from app.workers.tasks.embed_node import _embed_node_impl
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_autolink_creates_similar_to_edges(db, make_user, make_node, fake_embedder):
-    owner = await make_user(email="al1@test.com")
+# [plan-fix] The plan's two tests verified edges via gs.get_neighborhood, which
+# needs live Neo4j; they are kept below (neo4j-marked). The pure-PG logic
+# (similarity query, threshold, top-K, candidate visibility) is tested here with
+# the graph-recorder pattern from tests/services/test_node_service.py so it runs
+# without Neo4j.
+
+
+def _graph_recorder(monkeypatch):
+    """Patch graph_service functions with recorders; return the call log."""
+    from app.services import graph_service as gs
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_upsert(node):
+        calls.append(("upsert", str(node.id)))
+
+    async def fake_merge(source_id, target_id, label, created_by, score=None):
+        calls.append(("edge", str(source_id), str(target_id), label, created_by))
+
+    monkeypatch.setattr(gs, "upsert_vertex", fake_upsert)
+    monkeypatch.setattr(gs, "merge_edge", fake_merge)
+    return calls
+
+
+def _vec_with_cosine(cos_to_e1: float) -> list[float]:
+    """Unit vector whose cosine to e1 = [1, 0, ...] is exactly cos_to_e1."""
+    v = [0.0] * 768
+    v[0] = cos_to_e1
+    v[1] = math.sqrt(1.0 - cos_to_e1**2)
+    return v
+
+
+async def _add_chunk(db, node, vec: list[float]) -> None:
+    db.add(
+        NodeChunk(id=uuid.uuid4(), node_id=node.id, chunk_index=0, chunk_text="t", embedding=vec)
+    )
+    await db.flush()
+
+
+def _viewer(user) -> Viewer:
+    return Viewer(user_id=user.id, role=Role.user, group_ids=frozenset())
+
+
+async def test_autolink_task_options():
+    """Canonical kb-celery-jobs task shape: default queue, backoff retries, late acks."""
+    assert autolink_node.queue == "default", "autolink is light DB/graph I/O -> default queue"
+    assert autolink_node.retry_backoff is True
+    assert autolink_node.acks_late is True
+    assert autolink_node.max_retries == 3
+
+
+async def test_autolink_creates_similar_to_edge(
+    db, make_user, make_node, fake_embedder, monkeypatch
+):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_rec1@test.com")
     # FakeEmbedder is deterministic — same text = identical vector = cosine 1.0
-    n1 = await make_node(owner, title="Python Tips", body="Python is great for data science.", visibility=Visibility.public)
-    n2 = await make_node(owner, title="Python Guide", body="Python is great for data science.", visibility=Visibility.public)
+    n1 = await make_node(
+        owner,
+        title="Python Tips",
+        body="Python is great for data science.",
+        visibility=Visibility.public,
+    )
+    n2 = await make_node(
+        owner,
+        title="Python Guide",
+        body="Python is great for data science.",
+        visibility=Visibility.public,
+    )
     await db.flush()
 
     await _embed_node_impl(db, n1.id, fake_embedder)
     await _embed_node_impl(db, n2.id, fake_embedder)
 
-    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await _autolink_node_impl(db, n1.id, _viewer(owner))
+
+    # one SIMILAR_TO per pair, lower node id as source (kb-pgvector-search)
+    src, tgt = sorted((n1.id, n2.id))
+    assert ("edge", str(src), str(tgt), "SIMILAR_TO", "system:autolink") in calls
+
+
+async def test_autolink_idempotent(db, make_user, make_node, fake_embedder, monkeypatch):
+    """Re-running autolink issues the exact same MERGE calls — no new/extra edges."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_rec2@test.com")
+    n1 = await make_node(
+        owner, title="Topic A", body="Same content here.", visibility=Visibility.public
+    )
+    n2 = await make_node(
+        owner, title="Topic B", body="Same content here.", visibility=Visibility.public
+    )
+    await db.flush()
+
+    await _embed_node_impl(db, n1.id, fake_embedder)
+    await _embed_node_impl(db, n2.id, fake_embedder)
+
+    viewer = _viewer(owner)
+    await _autolink_node_impl(db, n1.id, viewer)
+    first_run = list(calls)
+    edges = [c for c in first_run if c[0] == "edge"]
+    assert len(edges) == len(set(edges)) == 1, "exactly one MERGE per pair, once"
+
+    calls.clear()
+    await _autolink_node_impl(db, n1.id, viewer)  # second run
+    assert calls == first_run, "second run must repeat identical MERGEs (idempotent)"
+
+
+async def test_autolink_respects_cosine_threshold(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_thr@test.com")
+    src = await make_node(owner, title="Src", visibility=Visibility.public)
+    near = await make_node(owner, title="Near", visibility=Visibility.public)
+    far = await make_node(owner, title="Far", visibility=Visibility.public)
+    await _add_chunk(db, src, _vec_with_cosine(1.0))
+    await _add_chunk(db, near, _vec_with_cosine(0.9))  # >= 0.82 -> linked
+    await _add_chunk(db, far, _vec_with_cosine(0.5))  # < 0.82 -> not linked
+
+    await _autolink_node_impl(db, src.id, _viewer(owner))
+
+    linked = {c[2] for c in calls if c[0] == "edge"} | {c[1] for c in calls if c[0] == "edge"}
+    assert str(near.id) in linked
+    assert str(far.id) not in linked
+
+
+async def test_autolink_caps_at_top_k(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_topk@test.com")
+    src = await make_node(owner, title="Src", visibility=Visibility.public)
+    await _add_chunk(db, src, _vec_with_cosine(1.0))
+
+    cosines = [0.99, 0.97, 0.95, 0.93, 0.91, 0.89, 0.85]  # 7 candidates over threshold
+    nodes = []
+    for i, c in enumerate(cosines):
+        n = await make_node(owner, title=f"Cand {i}", visibility=Visibility.public)
+        await _add_chunk(db, n, _vec_with_cosine(c))
+        nodes.append(n)
+
+    await _autolink_node_impl(db, src.id, _viewer(owner))
+
+    edges = [c for c in calls if c[0] == "edge"]
+    assert len(edges) == 5, "top-K is 5"
+    linked = {e[1] for e in edges} | {e[2] for e in edges}
+    for n in nodes[:5]:
+        assert str(n.id) in linked, "the 5 MOST similar candidates must win"
+    for n in nodes[5:]:
+        assert str(n.id) not in linked
+
+
+async def test_autolink_excludes_other_users_private_nodes(
+    db, make_user, make_node, fake_embedder, monkeypatch
+):
+    """Candidate set uses the OWNER's viewer: another user's private node must
+    never be auto-linked, even at cosine 1.0 (existence must not leak)."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_vis1@test.com")
+    other = await make_user(email="al_vis2@test.com")
+    mine = await make_node(
+        owner, title="Mine", body="identical secret content", visibility=Visibility.public
+    )
+    secret = await make_node(
+        other, title="Secret", body="identical secret content", visibility=Visibility.private
+    )
+    await db.flush()
+
+    await _embed_node_impl(db, mine.id, fake_embedder)
+    await _embed_node_impl(db, secret.id, fake_embedder)
+
+    await _autolink_node_impl(db, mine.id, _viewer(owner))
+
+    assert all(str(secret.id) not in c for c in calls), "private node leaked into autolink"
+
+
+async def test_autolink_without_chunks_is_noop(db, make_user, make_node, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_noop@test.com")
+    node = await make_node(owner, title="Unembedded", visibility=Visibility.public)
+    await db.flush()
+
+    await _autolink_node_impl(db, node.id, _viewer(owner))
+    assert calls == []
+
+
+# --- Plan's original graph-level tests: need live Neo4j (skip when unreachable) ---
+
+
+async def test_autolink_creates_similar_to_edges(
+    db, neo4j_session, make_user, make_node, fake_embedder
+):
+    from app.services import graph_service as gs
+
+    owner = await make_user(email="al1@test.com")
+    n1 = await make_node(
+        owner,
+        title="Python Tips",
+        body="Python is great for data science.",
+        visibility=Visibility.public,
+    )
+    n2 = await make_node(
+        owner,
+        title="Python Guide",
+        body="Python is great for data science.",
+        visibility=Visibility.public,
+    )
+    await db.flush()
+
+    await _embed_node_impl(db, n1.id, fake_embedder)
+    await _embed_node_impl(db, n2.id, fake_embedder)
+
+    viewer = _viewer(owner)
     await _autolink_node_impl(db, n1.id, viewer)
 
     hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
@@ -908,172 +1124,165 @@ async def test_autolink_creates_similar_to_edges(db, make_user, make_node, fake_
     assert "SIMILAR_TO" in edge_labels
 
 
-async def test_autolink_idempotent(db, make_user, make_node, fake_embedder):
+async def test_autolink_idempotent_in_graph(db, neo4j_session, make_user, make_node, fake_embedder):
     """Running autolink twice must not create duplicate SIMILAR_TO edges."""
+    from app.services import graph_service as gs
+
     owner = await make_user(email="al2@test.com")
-    n1 = await make_node(owner, title="Topic A", body="Same content here.", visibility=Visibility.public)
-    n2 = await make_node(owner, title="Topic B", body="Same content here.", visibility=Visibility.public)
+    n1 = await make_node(
+        owner, title="Topic A", body="Same content here.", visibility=Visibility.public
+    )
+    n2 = await make_node(
+        owner, title="Topic B", body="Same content here.", visibility=Visibility.public
+    )
     await db.flush()
 
     await _embed_node_impl(db, n1.id, fake_embedder)
     await _embed_node_impl(db, n2.id, fake_embedder)
 
-    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    viewer = _viewer(owner)
     await _autolink_node_impl(db, n1.id, viewer)
     await _autolink_node_impl(db, n1.id, viewer)  # second run
 
     hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
     similar_edges = [e for e in hood["edges"] if e["label"] == "SIMILAR_TO"]
-    targets = [e["target"] for e in similar_edges]
+    targets = [(e["source"], e["target"]) for e in similar_edges]
     assert len(targets) == len(set(targets)), "Duplicate SIMILAR_TO edges detected"
 ```
 
-- [ ] **6.2** Implement:
+- [x] **6.2** Implement:
 
 ```python
 # backend/app/workers/tasks/autolink_node.py
 from __future__ import annotations
 
+import asyncio
 import uuid
-from typing import TYPE_CHECKING
 
-from celery import shared_task
-from sqlalchemy import select, text
+from celery import Task
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chunk import NodeChunk
 from app.models.knowledge import KnowledgeNode
+from app.models.user import Role
 from app.services import graph_service as gs
 from app.services.visibility import Viewer, visible_nodes_clause
 from app.workers.celery_app import celery_app, task_session
-
-if TYPE_CHECKING:
-    pass
 
 _COSINE_THRESHOLD = 0.82
 _TOP_K = 5
 
 
-async def _autolink_node_impl(
-    db: AsyncSession,
-    node_id: uuid.UUID,
-    viewer: Viewer,
-) -> None:
+async def _autolink_node_impl(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> None:
     """
-    Compute mean-pool vector for node, find top-K similar visible nodes
-    (cosine ≥ threshold), and MERGE SIMILAR_TO edges (idempotent via MERGE).
+    Core logic extracted for unit-testability (no Celery dependency).
+
+    Mean-pool the node's chunk vectors, find the top-K visible nodes whose best
+    chunk has cosine >= threshold, and MERGE one SIMILAR_TO edge per pair with
+    the lower node id as source (kb-pgvector-search). MERGE makes re-runs
+    idempotent; there is no PG-side bookkeeping.
+
+    `viewer` is the node OWNER's identity: a private node may auto-link only to
+    nodes its owner can see (never SYSTEM_VIEWER — results become user-visible
+    edges, so candidate reads must carry the owner's visibility).
     """
-    # Mean-pool: average all chunk embeddings for this node
-    result = await db.execute(
-        text("""
-            SELECT AVG(embedding::float[])::vector AS mean_vec
-            FROM node_chunks
-            WHERE node_id = :node_id
-        """),
-        {"node_id": str(node_id)},
+    source_node = await db.scalar(
+        select(KnowledgeNode).where(KnowledgeNode.id == node_id, visible_nodes_clause(viewer))
     )
-    row = result.fetchone()
-    if row is None or row[0] is None:
+    if source_node is None:  # deleted or no longer visible: tolerate races
         return
 
-    mean_vec = row[0]
-
-    # Visibility-filtered candidate nodes (owner's own nodes as seed, see ADR-004)
-    clause = visible_nodes_clause(viewer)
-    candidate_ids_result = await db.scalars(
-        select(KnowledgeNode.id).where(clause).where(KnowledgeNode.id != node_id)
-    )
-    candidate_ids = list(candidate_ids_result)
-
-    if not candidate_ids:
-        return
-
-    # Vector similarity search against candidates
-    similar_result = await db.execute(
-        text("""
-            SELECT DISTINCT ON (nc.node_id) nc.node_id,
-                   1 - (nc.embedding <=> :query_vec::vector) AS cosine_sim
-            FROM node_chunks nc
-            WHERE nc.node_id = ANY(:candidate_ids)
-              AND nc.embedding IS NOT NULL
-            ORDER BY nc.node_id, nc.embedding <=> :query_vec::vector
-        """),
-        {
-            "query_vec": mean_vec,
-            "candidate_ids": [str(cid) for cid in candidate_ids],
-        },
-    )
-    similar_rows = similar_result.fetchall()
-
-    # Filter by threshold and take top-K
-    similar_rows.sort(key=lambda r: r[1], reverse=True)
-    top_k = [r for r in similar_rows if r[1] >= _COSINE_THRESHOLD][:_TOP_K]
-
-    source_node = await db.scalar(select(KnowledgeNode).where(KnowledgeNode.id == node_id))
-    if source_node is None:
-        return
-    await gs.create_vertex(db, source_node)
-
-    for row in top_k:
-        target_id = uuid.UUID(str(row[0]))
-        target_node = await db.scalar(select(KnowledgeNode).where(KnowledgeNode.id == target_id))
-        if target_node is None:
-            continue
-        await gs.create_vertex(db, target_node)
-        # MERGE is idempotent — calling twice does not create duplicates
-        await gs.merge_edge(
-            db,
-            node_id,
-            target_id,
-            "SIMILAR_TO",
-            props={"created_by": "system:autolink", "cosine": float(row[1])},
+    mean_vec = await db.scalar(
+        select(func.avg(NodeChunk.embedding, type_=Vector(768))).where(
+            NodeChunk.node_id == node_id, NodeChunk.embedding.is_not(None)
         )
+    )
+    if mean_vec is None:  # node has no embedded chunks yet
+        return
+
+    # Best chunk per candidate node: MIN cosine distance == MAX cosine similarity.
+    # Visibility applied INSIDE the query, before HAVING/LIMIT (kb-visibility-filter).
+    distance = NodeChunk.embedding.cosine_distance(mean_vec)
+    best_dist = func.min(distance)
+    rows = (
+        await db.execute(
+            select(NodeChunk.node_id, (1 - best_dist).label("score"))
+            .join(KnowledgeNode, KnowledgeNode.id == NodeChunk.node_id)
+            .where(
+                visible_nodes_clause(viewer),
+                NodeChunk.node_id != node_id,
+                NodeChunk.embedding.is_not(None),
+            )
+            .group_by(NodeChunk.node_id)
+            .having(best_dist <= 1.0 - _COSINE_THRESHOLD)
+            # node_id tiebreak keeps the top-K deterministic across re-runs
+            .order_by(best_dist, NodeChunk.node_id)
+            .limit(_TOP_K)
+        )
+    ).all()
+    if not rows:
+        return
+
+    scores: dict[uuid.UUID, float] = {row.node_id: float(row.score) for row in rows}
+    targets = (
+        await db.scalars(
+            select(KnowledgeNode).where(KnowledgeNode.id.in_(scores), visible_nodes_clause(viewer))
+        )
+    ).all()
+
+    # Vertices must exist before MERGE edge Cypher can MATCH them.
+    await gs.upsert_vertex(source_node)
+    for target in targets:
+        await gs.upsert_vertex(target)
+        src_id, tgt_id = sorted((node_id, target.id))  # one edge per pair, lower id as source
         await gs.merge_edge(
-            db,
-            target_id,
-            node_id,
+            src_id,
+            tgt_id,
             "SIMILAR_TO",
-            props={"created_by": "system:autolink", "cosine": float(row[1])},
+            created_by="system:autolink",
+            score=scores[target.id],
         )
 
-    await db.flush()
 
-
-@celery_app.task(
+@celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
     bind=True,
     name="kb.autolink_node",
+    queue="default",  # light DB/graph I/O, not CPU-bound (kb-celery-jobs rule 6)
     acks_late=True,
     max_retries=3,
-    default_retry_delay=60,
+    retry_backoff=True,
 )
-def autolink_node(self, node_id: str, user_id: str, role: str, group_ids: list[str]) -> None:
-    import asyncio
-    from app.models.user import Role
-    from app.services.visibility import Viewer
-
+def autolink_node(self: Task, node_id: str, user_id: str, role: str, group_ids: list[str]) -> None:
+    """
+    Celery task: create SIMILAR_TO edges for a node after (re)embedding.
+    Args must be primitives; (user_id, role, group_ids) is the node owner's viewer.
+    """
     viewer = Viewer(
         user_id=uuid.UUID(user_id),
         role=Role(role),
         group_ids=frozenset(uuid.UUID(gid) for gid in group_ids),
     )
+    nid = uuid.UUID(node_id)
 
-    async def _run():
+    async def _run() -> None:
         async with task_session() as db:
-            await _autolink_node_impl(db, uuid.UUID(node_id), viewer)
+            await _autolink_node_impl(db, nid, viewer)
 
     try:
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
     except Exception as exc:
-        raise self.retry(exc=exc)
+        raise self.retry(exc=exc) from exc
 ```
 
-- [ ] **6.3** Run tests:
+- [x] **6.3** Run tests:
 ```bash
 cd backend && pytest tests/workers/test_autolink_node.py -v
-# Expected: 2 passed
+# Expected: 7 passed, 2 skipped (the get_neighborhood tests skip when Neo4j is unreachable)
 ```
 
-- [ ] **6.4** Commit:
+- [x] **6.4** Commit:
 ```
 feat(workers): autolink_node task — mean-pool similarity, MERGE SIMILAR_TO edges, idempotent
 ```
