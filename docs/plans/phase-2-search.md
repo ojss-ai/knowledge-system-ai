@@ -13,13 +13,18 @@
 - `kb-api-conventions`
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `pytest -x backend/tests/` green
-- [ ] `ruff check backend/` clean
-- [ ] `mypy --strict backend/app/services/ backend/app/schemas/` clean
-- [ ] `/kb-verify` passes
-- [ ] Idempotency test for `embed_node` passes (run twice → no duplicate chunks)
-- [ ] `curl` evidence for `GET /api/v1/search?q=...`
+- [x] All tasks checked
+- [x] `pytest backend/tests/` green — `123 passed, 12 skipped` (skips = approved
+  Neo4j-unreachable deviation; convert to passes on the Docker stack)
+- [x] `ruff check backend/` + `ruff format --check` clean
+- [x] `mypy --strict` clean across `app/api app/services app/schemas app/workers` (31 files)
+- [x] `/kb-verify` passes — static visibility audit clean (all knowledge_nodes/node_chunks
+  reads compose `visible_nodes_clause` or the documented SYSTEM_VIEWER; raw SQL legs filter
+  inside CTEs pre-LIMIT); dynamic audit 25 passed; fresh-DB `alembic upgrade head` OK incl.
+  HNSW index
+- [x] Idempotency: `pytest -k "idempotent or stale or empty_body"` → 7 passed (embed twice →
+  no dup chunks; empty re-embed clears stale chunks; autolink re-run replaces system edges)
+- [x] `curl` evidence for `GET /api/v1/search?q=...` in §8.4 (200 + 401)
 
 ---
 
