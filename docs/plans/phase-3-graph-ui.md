@@ -78,6 +78,7 @@ describe("scaffold", () => {
   },
   "devDependencies": {
     "typescript": "^5",
+    "@typescript-eslint/eslint-plugin": "^7.2.0",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
@@ -155,10 +156,11 @@ export default config
 module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }
 ```
 
-- [x] **1.7** Create `.eslintrc.json`:
+- [x] **1.7** Create `.eslintrc.json`: <!-- [plan-fix, found in Task 5] eslint-config-next 14 ships only @typescript-eslint/parser, not the plugin — the no-explicit-any rule was unresolvable ("Definition for rule ... was not found") and failed `next build`. Added @typescript-eslint/eslint-plugin@^7.2.0 (matches bundled parser 7.2.0) to devDependencies and declared the plugin. -->
 ```json
 {
   "extends": ["next/core-web-vitals"],
+  "plugins": ["@typescript-eslint"],
   "rules": {
     "no-console": "warn",
     "@typescript-eslint/no-explicit-any": "error"
@@ -805,6 +807,7 @@ feat(frontend): graphStyle, graphStore (Zustand), GraphCanvas with Sigma.js v3 +
 
 **Files:**
 - Create: `frontend/src/app/layout.tsx`
+- Create: `frontend/src/app/globals.css`
 - Create: `frontend/src/app/login/page.tsx`
 - Create: `frontend/src/app/graph/page.tsx`
 - Create: `frontend/src/app/nodes/[id]/page.tsx`
@@ -814,10 +817,12 @@ feat(frontend): graphStyle, graphStore (Zustand), GraphCanvas with Sigma.js v3 +
 - Create: `frontend/src/components/Providers.tsx`
 - Create: `frontend/src/components/Sidebar.tsx`
 - Create: `frontend/tests/unit/pages.test.tsx`
+- Modify: `frontend/vitest.config.ts` <!-- [plan-fix] include pattern was tests/unit/**/*.test.ts — added {ts,tsx} so pages.test.tsx is discovered -->
+- Modify: `frontend/.eslintrc.json`, `frontend/package.json` <!-- [plan-fix] see Task 1 step 1.7 note — @typescript-eslint plugin was missing, surfaced by this task's first `next build` -->
 
 ### Steps
 
-- [ ] **5.1** Write failing test:
+- [x] **5.1** Write failing test:
 
 ```typescript
 // frontend/tests/unit/pages.test.tsx
@@ -833,7 +838,7 @@ describe("page modules", () => {
 })
 ```
 
-- [ ] **5.2** Create root layout:
+- [x] **5.2** Create root layout:
 
 ```typescript
 // frontend/src/app/layout.tsx
@@ -860,7 +865,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 ```
 
-- [ ] **5.3** Create `globals.css`:
+- [x] **5.3** Create `globals.css`:
 ```css
 /* frontend/src/app/globals.css */
 @tailwind base;
@@ -868,7 +873,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 @tailwind utilities;
 ```
 
-- [ ] **5.4** Create Providers (TanStack Query):
+- [x] **5.4** Create Providers (TanStack Query):
 
 ```typescript
 // frontend/src/components/Providers.tsx
@@ -884,7 +889,7 @@ export default function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
-- [ ] **5.5** Create Login page:
+- [x] **5.5** Create Login page:
 
 ```typescript
 // frontend/src/app/login/page.tsx
@@ -937,7 +942,7 @@ export default function LoginPage() {
 }
 ```
 
-- [ ] **5.6** Create Sidebar:
+- [x] **5.6** Create Sidebar:
 
 ```typescript
 // frontend/src/components/Sidebar.tsx
@@ -972,7 +977,7 @@ export default function Sidebar() {
 }
 ```
 
-- [ ] **5.7** Create Graph explorer page:
+- [x] **5.7** Create Graph explorer page:
 
 ```typescript
 // frontend/src/app/graph/page.tsx
@@ -1014,19 +1019,18 @@ export default function GraphPage() {
 }
 ```
 
-- [ ] **5.8** Create Node detail page:
+- [x] **5.8** Create Node detail page:
 
 ```typescript
 // frontend/src/app/nodes/[id]/page.tsx
 "use client"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { useParams, useRouter } from "next/navigation"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Sidebar from "@/components/Sidebar"
 import { fetchNode, updateNode, deleteNode } from "@/lib/api"
-import dynamic from "next/dynamic"
-
-const GraphCanvas = dynamic(() => import("@/components/GraphCanvas"), { ssr: false })
+// [plan-fix] dropped unused dynamic GraphCanvas import — this page renders no
+// mini-graph yet; the unused variable fails lint
 
 export default function NodePage() {
   const { id } = useParams<{ id: string }>()
@@ -1038,8 +1042,12 @@ export default function NodePage() {
   const { data: node, isLoading } = useQuery({
     queryKey: ["node", id],
     queryFn: () => fetchNode(id),
-    onSuccess: (n) => setBody(n.body),
   })
+
+  // [plan-fix] TanStack Query v5 removed useQuery onSuccess — sync via effect
+  useEffect(() => {
+    if (node) setBody(node.body)
+  }, [node])
 
   const update = useMutation({
     mutationFn: () => updateNode(id, { body }),
@@ -1088,7 +1096,7 @@ export default function NodePage() {
 }
 ```
 
-- [ ] **5.9** Create Search page:
+- [x] **5.9** Create Search page:
 
 ```typescript
 // frontend/src/app/search/page.tsx
@@ -1144,12 +1152,12 @@ export default function SearchPage() {
 }
 ```
 
-- [ ] **5.10** Create Daily Log page:
+- [x] **5.10** Create Daily Log page:
 
 ```typescript
 // frontend/src/app/daily/page.tsx
 "use client"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import Sidebar from "@/components/Sidebar"
 import { fetchDailyLog, upsertDailyLog } from "@/lib/api"
@@ -1167,8 +1175,12 @@ export default function DailyPage() {
   const { data: log } = useQuery({
     queryKey: ["daily-log", today],
     queryFn: () => fetchDailyLog(today).catch(() => null),
-    onSuccess: (d) => { if (d) setBody(d.body) },
   })
+
+  // [plan-fix] TanStack Query v5 removed useQuery onSuccess — sync via effect
+  useEffect(() => {
+    if (log) setBody(log.body)
+  }, [log])
 
   const save = useMutation({
     mutationFn: () => upsertDailyLog(today, body),
@@ -1198,7 +1210,7 @@ export default function DailyPage() {
 }
 ```
 
-- [ ] **5.11** Create Upload stub page:
+- [x] **5.11** Create Upload stub page:
 
 ```typescript
 // frontend/src/app/upload/page.tsx
@@ -1218,15 +1230,20 @@ export default function UploadPage() {
 }
 ```
 
-- [ ] **5.12** Run tests:
+- [x] **5.12** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/pages.test.tsx
 # Expected: 1 passed
 npm run build
 # Expected: exit 0
 ```
+<!-- Verification note: in the CI sandbox the proxy returns 403 for
+fonts.googleapis.com, so next/font/google cannot fetch Inter there. Build was
+verified exit 0 (all 11 routes, lint clean) with the font import patched out
+locally in the sandbox working copy only; committed code keeps Inter as
+planned and builds on machines with normal network. -->
 
-- [ ] **5.13** Commit:
+- [x] **5.13** Commit:
 ```
 feat(frontend): layout, login, graph explorer, node detail, search, daily-log, upload stub pages
 ```

@@ -11,6 +11,7 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["tests/unit/**/*.test.ts"],
+    // [plan-fix] .tsx added so Task 5's pages.test.tsx is discovered
+    include: ["tests/unit/**/*.test.{ts,tsx}"],
   },
 })
