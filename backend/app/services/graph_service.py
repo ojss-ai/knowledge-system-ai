@@ -95,6 +95,24 @@ async def merge_edge(
         )
 
 
+async def delete_autolink_edges(node_id: uuid.UUID) -> None:
+    """
+    Delete every system-created SIMILAR_TO edge touching a node, both directions
+    (the pair convention stores the lower node id as source, so the node may sit
+    on either end). The label + created_by filters keep manual SIMILAR_TO edges
+    intact. Re-run of autolink calls this BEFORE merging the new edge set
+    (kb-pgvector-search: "Re-run replaces the node's previous auto edges").
+    """
+    async with get_driver().session() as session:
+        await session.run(
+            """
+            MATCH (n:Node {node_id: $node_id})-[r:SIMILAR_TO {created_by: 'system:autolink'}]-()
+            DELETE r
+            """,
+            node_id=str(node_id),
+        )
+
+
 async def delete_edge(
     source_id: uuid.UUID,
     target_id: uuid.UUID,

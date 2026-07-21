@@ -31,8 +31,12 @@ def _graph_recorder(monkeypatch):
     async def fake_merge(source_id, target_id, label, created_by, score=None):
         calls.append(("edge", str(source_id), str(target_id), label, created_by))
 
+    async def fake_delete_autolink(node_id):
+        calls.append(("delete", str(node_id)))
+
     monkeypatch.setattr(gs, "upsert_vertex", fake_upsert)
     monkeypatch.setattr(gs, "merge_edge", fake_merge)
+    monkeypatch.setattr(gs, "delete_autolink_edges", fake_delete_autolink)
     return calls
 
 
@@ -93,8 +97,76 @@ async def test_autolink_creates_similar_to_edge(
     assert ("edge", str(src), str(tgt), "SIMILAR_TO", "system:autolink") in calls
 
 
+async def test_autolink_deletes_stale_edges_before_merging(
+    db, make_user, make_node, fake_embedder, monkeypatch
+):
+    """Re-run replaces the node's previous auto edges (kb-pgvector-search):
+    delete created_by='system:autolink' edges exactly once, BEFORE any MERGE."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_del@test.com")
+    n1 = await make_node(
+        owner, title="Del A", body="Shared delete-test body.", visibility=Visibility.public
+    )
+    n2 = await make_node(
+        owner, title="Del B", body="Shared delete-test body.", visibility=Visibility.public
+    )
+    await db.flush()
+
+    await _embed_node_impl(db, n1.id, fake_embedder)
+    await _embed_node_impl(db, n2.id, fake_embedder)
+
+    await _autolink_node_impl(db, n1.id, _viewer(owner))
+
+    delete_idxs = [i for i, c in enumerate(calls) if c[0] == "delete"]
+    merge_idxs = [i for i, c in enumerate(calls) if c[0] == "edge"]
+    assert merge_idxs, "sanity: the run must merge a new edge"
+    assert len(delete_idxs) == 1, "stale-edge delete must run exactly once per run"
+    assert calls[delete_idxs[0]] == ("delete", str(n1.id)), "delete targets the re-run node"
+    assert delete_idxs[0] < min(merge_idxs), "delete must run BEFORE any edge MERGE"
+
+
+async def test_autolink_content_change_replaces_stale_edges(db, make_user, make_node, monkeypatch):
+    """Content changed → different top-K set: the re-run deletes the node's old
+    auto edges first, then merges ONLY the new set (old target never re-merged)."""
+    from sqlalchemy import update
+
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="al_chg@test.com")
+    src = await make_node(owner, title="Src", visibility=Visibility.public)
+    old = await make_node(owner, title="Old", visibility=Visibility.public)
+    new = await make_node(owner, title="New", visibility=Visibility.public)
+    await _add_chunk(db, src, _vec_with_cosine(1.0))
+    await _add_chunk(db, old, _vec_with_cosine(0.9))  # similar to ORIGINAL content
+    await _add_chunk(db, new, _vec_with_cosine(-0.2))  # cos(v(-0.2), v(0.9)) ≈ 0.25 < 0.82
+
+    await _autolink_node_impl(db, src.id, _viewer(owner))
+    s, t = sorted((src.id, old.id))
+    assert [c for c in calls if c[0] == "edge"] == [
+        ("edge", str(s), str(t), "SIMILAR_TO", "system:autolink")
+    ], "sanity: first run links src to old"
+
+    # "Content changed": src re-embedded to a vector matching `new`, far from `old`.
+    await db.execute(
+        update(NodeChunk)
+        .where(NodeChunk.node_id == src.id)
+        .values(embedding=_vec_with_cosine(-0.2))
+    )
+    await db.flush()
+
+    calls.clear()
+    await _autolink_node_impl(db, src.id, _viewer(owner))
+
+    assert calls[0] == ("delete", str(src.id)), "re-run must delete stale auto edges first"
+    edges = [c for c in calls if c[0] == "edge"]
+    s, t = sorted((src.id, new.id))
+    assert edges == [("edge", str(s), str(t), "SIMILAR_TO", "system:autolink")], (
+        "only the NEW top-K set is merged; the old target must be gone"
+    )
+
+
 async def test_autolink_idempotent(db, make_user, make_node, fake_embedder, monkeypatch):
-    """Re-running autolink issues the exact same MERGE calls — no new/extra edges."""
+    """Re-running autolink issues the exact same calls (delete + MERGEs) — no
+    new/extra edges."""
     calls = _graph_recorder(monkeypatch)
     owner = await make_user(email="al_rec2@test.com")
     n1 = await make_node(
@@ -252,3 +324,49 @@ async def test_autolink_idempotent_in_graph(db, neo4j_session, make_user, make_n
     similar_edges = [e for e in hood["edges"] if e["label"] == "SIMILAR_TO"]
     targets = [(e["source"], e["target"]) for e in similar_edges]
     assert len(targets) == len(set(targets)), "Duplicate SIMILAR_TO edges detected"
+
+
+async def test_autolink_rerun_removes_stale_edge_in_graph(
+    db, neo4j_session, make_user, make_node, fake_embedder
+):
+    """Content changed → the old system:autolink SIMILAR_TO edge is gone from the
+    graph after a re-run, while a MANUAL SIMILAR_TO edge on the same node survives
+    (the delete filters on created_by='system:autolink')."""
+    from app.services import graph_service as gs
+
+    owner = await make_user(email="al3@test.com")
+    n1 = await make_node(
+        owner, title="Drift", body="Original shared content.", visibility=Visibility.public
+    )
+    n2 = await make_node(
+        owner, title="Anchor", body="Original shared content.", visibility=Visibility.public
+    )
+    manual = await make_node(owner, title="Manual", visibility=Visibility.public)
+    await db.flush()
+
+    await _embed_node_impl(db, n1.id, fake_embedder)
+    await _embed_node_impl(db, n2.id, fake_embedder)
+
+    viewer = _viewer(owner)
+    await _autolink_node_impl(db, n1.id, viewer)
+
+    # A user-created SIMILAR_TO edge on the same node must survive re-runs.
+    await gs.upsert_vertex(manual)
+    await gs.merge_edge(n1.id, manual.id, "SIMILAR_TO", created_by=str(owner.id))
+
+    hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
+    pairs = {(e["source"], e["target"]) for e in hood["edges"] if e["label"] == "SIMILAR_TO"}
+    assert (str(min(n1.id, n2.id)), str(max(n1.id, n2.id))) in pairs, "sanity: auto edge created"
+
+    # Content changed: FakeEmbedder vectors for unrelated texts are ~orthogonal in 768-d.
+    n1.body = "Completely different topic now: gardening, soil, and compost."
+    await db.flush()
+    await _embed_node_impl(db, n1.id, fake_embedder)
+    await _autolink_node_impl(db, n1.id, viewer)
+
+    hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
+    pairs = {(e["source"], e["target"]) for e in hood["edges"] if e["label"] == "SIMILAR_TO"}
+    assert (str(min(n1.id, n2.id)), str(max(n1.id, n2.id))) not in pairs, (
+        "stale system:autolink edge must be deleted on re-run"
+    )
+    assert (str(n1.id), str(manual.id)) in pairs, "manual SIMILAR_TO edge must survive"

@@ -25,8 +25,11 @@ async def _autolink_node_impl(db: AsyncSession, node_id: uuid.UUID, viewer: View
 
     Mean-pool the node's chunk vectors, find the top-K visible nodes whose best
     chunk has cosine >= threshold, and MERGE one SIMILAR_TO edge per pair with
-    the lower node id as source (kb-pgvector-search). MERGE makes re-runs
-    idempotent; there is no PG-side bookkeeping.
+    the lower node id as source (kb-pgvector-search). A re-run REPLACES the
+    node's previous auto edges: stale created_by='system:autolink' edges are
+    deleted before the new set is merged, so content drift never leaves ghost
+    links. MERGE keeps the surviving set duplicate-free; there is no PG-side
+    bookkeeping.
 
     `viewer` is the node OWNER's identity: a private node may auto-link only to
     nodes its owner can see (never SYSTEM_VIEWER — results become user-visible
@@ -45,6 +48,12 @@ async def _autolink_node_impl(db: AsyncSession, node_id: uuid.UUID, viewer: View
     )
     if mean_vec is None:  # node has no embedded chunks yet
         return
+
+    # Re-run replaces the node's previous auto edges (kb-pgvector-search): drop
+    # stale system:autolink edges BEFORE merging, and before the early return
+    # below — content drift may leave an empty candidate set, and the old edges
+    # must still disappear. Manual SIMILAR_TO edges survive (created_by filter).
+    await gs.delete_autolink_edges(node_id)
 
     # Best chunk per candidate node: MIN cosine distance == MAX cosine similarity.
     # Visibility applied INSIDE the query, before HAVING/LIMIT (kb-visibility-filter).
