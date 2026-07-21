@@ -122,7 +122,7 @@ describe("scaffold", () => {
 }
 ```
 
-- [x] **1.4** Create `next.config.mjs` <!-- [plan-fix] see Files note: Next 14 cannot load next.config.ts -->:
+- [x] **1.4** Create `next.config.mjs` <!-- [plan-fix] see Files note: Next 14 cannot load next.config.ts --> <!-- [3.R] rewrites() removed after review: a bare rewrite forwards cookies but FastAPI only accepts Authorization: Bearer (HTTPBearer in deps.py), so every proxied call 401'd. Replaced by the BFF catch-all route handler — see Task 3.R -->:
 
 ```javascript
 // frontend/next.config.mjs
@@ -131,15 +131,6 @@ describe("scaffold", () => {
 const config = {
   reactStrictMode: true,
   experimental: { serverActions: { allowedOrigins: ["localhost:3000"] } },
-  async rewrites() {
-    return [
-      // BFF: proxy /api/v1/* to FastAPI (in dev)
-      {
-        source: "/api/v1/:path*",
-        destination: `${process.env.API_BASE_URL ?? "http://localhost:8000"}/api/v1/:path*`,
-      },
-    ]
-  },
 }
 
 export default config
@@ -385,6 +376,10 @@ feat(frontend): API client layer with typed wrappers for all endpoints
 - Create: `frontend/src/app/api/auth/me/route.ts`
 - Create: `frontend/src/middleware.ts`
 - Create: `frontend/tests/unit/auth.test.ts`
+- Create: `frontend/src/app/api/v1/[...path]/route.ts` <!-- [3.R] BFF proxy, replaces the next.config rewrite -->
+- Create: `frontend/src/lib/routes.ts` <!-- [3.R] pure middleware predicate, unit-testable -->
+- Create: `frontend/tests/unit/proxy.test.ts` <!-- [3.R] -->
+- Create: `frontend/tests/unit/routes.test.ts` <!-- [3.R] -->
 
 ### Steps
 
@@ -470,6 +465,10 @@ export async function POST(req: NextRequest) {
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     maxAge: 604800,
+    // [3.R] NOTE: this cookie path targets /api/auth/refresh, a BFF route that
+    // no task in this phase creates (backend /api/v1/auth/refresh exists since
+    // Phase 0). Harmless until then — the cookie is simply never sent. See
+    // "## Blockers" at the end of this file (Phase 7 hardening).
     path: "/api/auth/refresh",
   })
   return res
@@ -509,17 +508,16 @@ export async function GET(req: NextRequest) {
 }
 ```
 
-- [x] **3.6** Create middleware (protect all non-auth pages):
+- [x] **3.6** Create middleware (protect all non-auth pages) <!-- [3.R] revised after review: /api/ is now fully excluded (matcher + requiresLoginRedirect helper in src/lib/routes.ts) so unauthenticated API calls get a JSON 401, never a 307 HTML redirect -->:
 
 ```typescript
 // frontend/src/middleware.ts
 import { NextRequest, NextResponse } from "next/server"
-
-const PUBLIC_PATHS = ["/login", "/api/auth"]
+import { requiresLoginRedirect } from "@/lib/routes"
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
-  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) return NextResponse.next()
+  if (!requiresLoginRedirect(pathname)) return NextResponse.next()
   const token = req.cookies.get("access_token")?.value
   if (!token) {
     return NextResponse.redirect(new URL("/login", req.url))
@@ -528,7 +526,11 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  // api/ is excluded: unauthenticated API calls must get a JSON 401 from the
+  // BFF proxy / backend, never a 307 HTML redirect to /login. Only page
+  // navigations are guarded here. requiresLoginRedirect() repeats the /api
+  // exclusion defensively (the matcher can't be unit-tested; the helper can).
+  matcher: ["/((?!api/|_next/static|_next/image|favicon.ico).*)"],
 }
 ```
 
@@ -542,6 +544,31 @@ cd frontend && npx vitest run tests/unit/auth.test.ts
 ```
 feat(frontend): BFF auth — login/logout/me routes + middleware cookie guard
 ```
+
+### 3.R — Review fixes (post-/kb-review)
+
+Review found the Task 1 `rewrites()` proxy critically broken: Next rewrites
+forward cookies as-is, but FastAPI's `deps.py` uses `HTTPBearer` and only
+accepts `Authorization: Bearer`, so every browser call to `/api/v1/*` 401'd.
+Fix per the kb-frontend-graph BFF pattern (ADR-008):
+
+- [x] **3.R.1** Failing tests first — `frontend/tests/unit/proxy.test.ts`
+  (Authorization attached from `access_token` cookie, query string preserved,
+  no-cookie forwards without header, 204 passthrough, body/status/JSON
+  passthrough) and `frontend/tests/unit/routes.test.ts`
+  (`requiresLoginRedirect` excludes `/api/*`; middleware never 307s API calls).
+- [x] **3.R.2** Create `frontend/src/app/api/v1/[...path]/route.ts` — catch-all
+  GET/POST/PATCH/DELETE handler: reads the httpOnly `access_token` cookie,
+  forwards to `${API_BASE_URL}/api/v1/<path>?<query>` with
+  `Authorization: Bearer <token>`, passes through body/status/content-type.
+  No cookie → forward without header (backend 401s cleanly, JSON). Tokens
+  never reach client JS.
+- [x] **3.R.3** Remove `rewrites()` from `frontend/next.config.mjs` (Task 1.4
+  block updated in place).
+- [x] **3.R.4** Middleware: extract `requiresLoginRedirect` into
+  `frontend/src/lib/routes.ts`, exclude `api/` in the matcher (see 3.6 block).
+- [x] **3.R.5** Verify: `npx vitest run` (15 passed) and `npx tsc --noEmit`
+  clean. Commits: `fix(frontend): ...` below.
 
 ---
 
@@ -1354,3 +1381,16 @@ npx playwright test     # e2e tests pass
 ```
 
 Update `docs/plans/README.md` — Phase 3 Status → `Done`.
+
+---
+
+## Blockers
+
+- **No `/api/auth/refresh` BFF route in this phase** — Task 3.3 scopes the
+  `refresh_token` cookie to `path: "/api/auth/refresh"`, but no task in
+  Phase 3 (or any later phase plan) creates that Next.js route handler; only
+  the backend `/api/v1/auth/refresh` endpoint exists (Phase 0, exercised again
+  in Phase 7 tests). Consequence: when the 15-min access token expires, the
+  session dies until re-login. Deferred to **Phase 7 hardening**: add the BFF
+  refresh route (read refresh cookie → call backend refresh → rotate both
+  cookies) and have the proxy retry-on-401 or the client redirect on 401.
