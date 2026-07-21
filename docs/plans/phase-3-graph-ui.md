@@ -582,7 +582,7 @@ Fix per the kb-frontend-graph BFF pattern (ADR-008):
 
 ### Steps
 
-- [ ] **4.1** Write the failing test:
+- [x] **4.1** Write the failing test:
 
 ```typescript
 // frontend/tests/unit/graphStyle.test.ts
@@ -605,7 +605,7 @@ describe("graphStyle", () => {
 })
 ```
 
-- [ ] **4.2** Create `graphStyle.ts`:
+- [x] **4.2** Create `graphStyle.ts`:
 
 ```typescript
 // frontend/src/lib/graphStyle.ts
@@ -643,7 +643,7 @@ export function edgeColor(label: string): string {
 }
 ```
 
-- [ ] **4.3** Create `graphStore.ts` (Zustand — graph UI state only):
+- [x] **4.3** Create `graphStore.ts` (Zustand — graph UI state only):
 
 ```typescript
 // frontend/src/lib/graphStore.ts
@@ -669,7 +669,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
 }))
 ```
 
-- [ ] **4.4** Create `GraphCanvas.tsx` (Sigma.js v3 + FA2 web worker):
+- [x] **4.4** Create `GraphCanvas.tsx` (Sigma.js v3 + FA2 web worker):
 
 ```typescript
 // frontend/src/components/GraphCanvas.tsx
@@ -679,6 +679,7 @@ import { useEffect, useRef, useCallback } from "react"
 import Graph from "graphology"
 import { Sigma } from "sigma"
 import forceAtlas2 from "graphology-layout-forceatlas2"
+import FA2LayoutSupervisor from "graphology-layout-forceatlas2/worker"
 import { nodeColor, nodeSize, edgeColor } from "@/lib/graphStyle"
 import { useGraphStore } from "@/lib/graphStore"
 import type { GraphData } from "@/lib/types"
@@ -739,9 +740,17 @@ export default function GraphCanvas({ data, onNodeClick, className }: GraphCanva
     const g = buildGraph(data)
     graphRef.current = g
 
-    // ForceAtlas2 layout (synchronous for small graphs; move to worker for >500 nodes)
+    // [plan-fix] ForceAtlas2 runs in a web worker (kb-frontend-graph rule:
+    // never run layout on the main thread) — plan originally ran it synchronously.
+    // Start on build, stop after a bounded settle window, kill on cleanup.
+    let layout: FA2LayoutSupervisor | null = null
+    let layoutTimer: ReturnType<typeof setTimeout> | null = null
     if (g.order > 0) {
-      forceAtlas2.assign(g, { iterations: 50, settings: { gravity: 1, scalingRatio: 2 } })
+      layout = new FA2LayoutSupervisor(g, {
+        settings: { ...forceAtlas2.inferSettings(g), gravity: 1, scalingRatio: 2 },
+      })
+      layout.start()
+      layoutTimer = setTimeout(() => layout?.stop(), 3000)
     }
 
     // Dispose existing Sigma instance before creating a new one
@@ -762,6 +771,8 @@ export default function GraphCanvas({ data, onNodeClick, className }: GraphCanva
     sigma.on("leaveNode", () => setHoveredNode(null))
 
     return () => {
+      if (layoutTimer) clearTimeout(layoutTimer)
+      layout?.kill()
       sigma.kill()
       sigmaRef.current = null
     }
@@ -777,13 +788,13 @@ export default function GraphCanvas({ data, onNodeClick, className }: GraphCanva
 }
 ```
 
-- [ ] **4.5** Run tests:
+- [x] **4.5** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/graphStyle.test.ts
 # Expected: 4 passed
 ```
 
-- [ ] **4.6** Commit:
+- [x] **4.6** Commit:
 ```
 feat(frontend): graphStyle, graphStore (Zustand), GraphCanvas with Sigma.js v3 + FA2
 ```
