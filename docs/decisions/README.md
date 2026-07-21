@@ -17,3 +17,4 @@ New ADRs via `/kb-new-adr`. Never edit an accepted ADR — supersede it.
 | [010](ADR-010-onprem-llm.md) | On-prem LLM (Ollama) behind feature flag | Accepted |
 | [011](ADR-011-neo4j-graph.md) | Neo4j Community for the knowledge graph | Accepted |
 | [012](ADR-012-nodetype-vocabulary.md) | NodeType vocabulary follows the plans | Accepted |
+| [013](ADR-013-handrolled-api-client.md) | Hand-rolled typed frontend API client (for now) | Accepted |
