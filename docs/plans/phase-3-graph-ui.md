@@ -24,17 +24,21 @@
 **Files:**
 - Create: `frontend/package.json`
 - Create: `frontend/tsconfig.json`
-- Create: `frontend/next.config.ts`
+- Create: `frontend/next.config.mjs` <!-- [plan-fix] was next.config.ts; Next 14.2.3 rejects TS config ("Configuring Next.js via 'next.config.ts' is not supported") — TS config support only landed in Next 15 -->
 - Create: `frontend/.eslintrc.json`
 - Create: `frontend/tailwind.config.ts`
 - Create: `frontend/postcss.config.js`
 
 ### Steps
 
-- [ ] **1.1** Write a smoke test first:
+- [x] **1.1** Write a smoke test first:
 
 ```typescript
 // frontend/tests/unit/smoke.test.ts
+// [plan-fix] added explicit vitest imports — vitest globals are not enabled
+// (no vitest config), and Task 2's test already uses explicit imports
+import { describe, it, expect } from "vitest"
+
 describe("scaffold", () => {
   it("environment is Node", () => {
     expect(typeof process).toBe("object")
@@ -42,7 +46,7 @@ describe("scaffold", () => {
 })
 ```
 
-- [ ] **1.2** Create `package.json`:
+- [x] **1.2** Create `package.json`:
 
 ```json
 {
@@ -92,7 +96,7 @@ describe("scaffold", () => {
 }
 ```
 
-- [ ] **1.3** Create `tsconfig.json`:
+- [x] **1.3** Create `tsconfig.json`:
 
 ```json
 {
@@ -118,13 +122,13 @@ describe("scaffold", () => {
 }
 ```
 
-- [ ] **1.4** Create `next.config.ts`:
+- [x] **1.4** Create `next.config.mjs` <!-- [plan-fix] see Files note: Next 14 cannot load next.config.ts -->:
 
-```typescript
-// frontend/next.config.ts
-import type { NextConfig } from "next"
+```javascript
+// frontend/next.config.mjs
 
-const config: NextConfig = {
+/** @type {import('next').NextConfig} */
+const config = {
   reactStrictMode: true,
   experimental: { serverActions: { allowedOrigins: ["localhost:3000"] } },
   async rewrites() {
@@ -141,7 +145,7 @@ const config: NextConfig = {
 export default config
 ```
 
-- [ ] **1.5** Create `tailwind.config.ts`:
+- [x] **1.5** Create `tailwind.config.ts`:
 
 ```typescript
 import type { Config } from "tailwindcss"
@@ -155,12 +159,12 @@ const config: Config = {
 export default config
 ```
 
-- [ ] **1.6** Create `postcss.config.js`:
+- [x] **1.6** Create `postcss.config.js`:
 ```javascript
 module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }
 ```
 
-- [ ] **1.7** Create `.eslintrc.json`:
+- [x] **1.7** Create `.eslintrc.json`:
 ```json
 {
   "extends": ["next/core-web-vitals"],
@@ -171,14 +175,14 @@ module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }
 }
 ```
 
-- [ ] **1.8** Install and run smoke test:
+- [x] **1.8** Install and run smoke test:
 ```bash
 cd frontend && npm install
 npx vitest run tests/unit/smoke.test.ts
 # Expected: 1 passed
 ```
 
-- [ ] **1.9** Commit:
+- [x] **1.9** Commit:
 ```
 chore(frontend): Next.js 14 scaffold — package.json, tsconfig, next.config, tailwind
 ```
