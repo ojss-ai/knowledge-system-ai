@@ -1536,15 +1536,28 @@ feat(workers): autolink_node task — mean-pool similarity, MERGE SIMILAR_TO edg
 
 ### Steps
 
-- [ ] **7.1** Write the failing tests:
+> **[plan-fix] notes (applied during execution):**
+> - SQLAlchemy `text()` never recognises a bind followed by a `::` cast (its regex has a
+>   `(?!:)` lookahead), so `:visible_ids::uuid[]` / `:query_vec::vector` reached Postgres
+>   verbatim and raised `syntax error at or near ":"`. Rewritten as
+>   `CAST(:param AS type)` in both queries.
+> - Privacy test strengthened per kb-visibility-filter's mandatory shape: a public decoy
+>   node matching the same query ensures the viewer's visible set is non-empty so BOTH
+>   CTE legs actually execute (no empty-set early return), plus an existence AND content
+>   assertion. Original version only checked existence against an empty result.
+> - Dropped the unused `uuid` import and hoisted function-level imports to module top
+>   (ruff); test blocks below reflect ruff-format output.
+
+- [x] **7.1** Write the failing tests:
 
 ```python
 # backend/tests/services/test_search_service.py
 import pytest
-from app.models.user import Visibility, Role
-from app.services.visibility import Viewer
-from app.services.embedding_service import FakeEmbedder
+
+from app.models.user import Role, Visibility
 from app.services import search_service as ss
+from app.services.embedding_service import FakeEmbedder
+from app.services.visibility import Viewer
 from app.workers.tasks.embed_node import _embed_node_impl
 
 pytestmark = pytest.mark.asyncio
@@ -1552,7 +1565,12 @@ pytestmark = pytest.mark.asyncio
 
 async def test_fts_finds_node(db, make_user, make_node):
     owner = await make_user(email="srch_fts@test.com")
-    node = await make_node(owner, title="PostgreSQL Tips", body="Full-text search is powerful.", visibility=Visibility.public)
+    node = await make_node(
+        owner,
+        title="PostgreSQL Tips",
+        body="Full-text search is powerful.",
+        visibility=Visibility.public,
+    )
     await db.flush()
 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
@@ -1563,12 +1581,19 @@ async def test_fts_finds_node(db, make_user, make_node):
 
 async def test_vector_finds_similar(db, make_user, make_node, fake_embedder):
     owner = await make_user(email="srch_vec@test.com")
-    node = await make_node(owner, title="Vector Node", body="embeddings and similarity search", visibility=Visibility.public)
+    node = await make_node(
+        owner,
+        title="Vector Node",
+        body="embeddings and similarity search",
+        visibility=Visibility.public,
+    )
     await db.flush()
     await _embed_node_impl(db, node.id, fake_embedder)
 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
-    results, total = await ss.hybrid_search(db, "embeddings similarity", viewer, fake_embedder=fake_embedder)
+    results, total = await ss.hybrid_search(
+        db, "embeddings similarity", viewer, fake_embedder=fake_embedder
+    )
     ids = [r["id"] for r in results]
     assert str(node.id) in ids
 
@@ -1576,17 +1601,32 @@ async def test_vector_finds_similar(db, make_user, make_node, fake_embedder):
 async def test_private_node_excluded_from_search(db, make_user, make_node, fake_embedder):
     owner = await make_user(email="srch_priv@test.com")
     other = await make_user(email="srch_priv2@test.com")
-    node = await make_node(owner, title="Secret", body="private secret content", visibility=Visibility.private)
+    node = await make_node(
+        owner, title="Secret", body="private secret content", visibility=Visibility.private
+    )
+    # [plan-fix] public decoy matching the same query: guarantees the viewer's
+    # visible set is non-empty so BOTH CTE legs actually execute (no early
+    # return), and serves as a positive control.
+    decoy = await make_node(
+        owner,
+        title="Public Notes",
+        body="public secret private discussion",
+        visibility=Visibility.public,
+    )
     await db.flush()
     await _embed_node_impl(db, node.id, fake_embedder)
+    await _embed_node_impl(db, decoy.id, fake_embedder)
 
     viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
     results, _ = await ss.hybrid_search(db, "secret private", viewer, fake_embedder=fake_embedder)
     ids = [r["id"] for r in results]
+    assert str(decoy.id) in ids, "sanity: both search legs ran for this viewer"
     assert str(node.id) not in ids, "Private node must not appear in another user's search"
+    # kb-visibility-filter mandatory check: existence AND content
+    assert not any("Secret" in r["title"] for r in results)
 ```
 
-- [ ] **7.2** Implement `search_service.py` with exact RRF fusion from kb-pgvector-search skill:
+- [x] **7.2** Implement `search_service.py` with exact RRF fusion from kb-pgvector-search skill:
 
 ```python
 # backend/app/services/search_service.py
@@ -1597,15 +1637,16 @@ CRITICAL invariants (ADR-004 / kb-visibility-filter):
 - Visibility filter applied INSIDE each CTE leg, before LIMIT
 - Never post-filter after merge — that would allow LIMIT to cut visible results
 """
+
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.embedding_service import Embedder
+from app.models.knowledge import KnowledgeNode
+from app.services.embedding_service import Embedder, get_embedder
 from app.services.visibility import Viewer, visible_nodes_clause
 
 _RRF_K = 60
@@ -1628,20 +1669,12 @@ async def hybrid_search(
 
     score = Σ 1 / (k + rank_i)   where k=60
     """
-    from app.services.embedding_service import get_embedder
-
     embedder = fake_embedder or get_embedder()
     query_vec = embedder.embed([query])[0]
 
     # Build visibility predicate as a subquery node_id list
-    # Build visibility predicate as a subquery node_id list
-    from sqlalchemy import select
-    from app.models.knowledge import KnowledgeNode
-
     clause = visible_nodes_clause(viewer)
-    visible_ids_result = await db.scalars(
-        select(KnowledgeNode.id).where(clause)
-    )
+    visible_ids_result = await db.scalars(select(KnowledgeNode.id).where(clause))
     visible_ids = [str(i) for i in visible_ids_result]
 
     if not visible_ids:
@@ -1655,7 +1688,7 @@ async def hybrid_search(
     sql = text("""
         WITH visible AS (
             SELECT id FROM knowledge_nodes
-            WHERE id = ANY(:visible_ids::uuid[])
+            WHERE id = ANY(CAST(:visible_ids AS uuid[]))
         ),
         fts_ranked AS (
             SELECT kn.id,
@@ -1668,11 +1701,11 @@ async def hybrid_search(
         ),
         vec_ranked AS (
             SELECT DISTINCT ON (nc.node_id) nc.node_id AS id,
-                   ROW_NUMBER() OVER (ORDER BY nc.embedding <=> :query_vec::vector) AS rank
+                   ROW_NUMBER() OVER (ORDER BY nc.embedding <=> CAST(:query_vec AS vector)) AS rank
             FROM node_chunks nc
             WHERE nc.node_id IN (SELECT id FROM visible)
               AND nc.embedding IS NOT NULL
-            ORDER BY nc.node_id, nc.embedding <=> :query_vec::vector
+            ORDER BY nc.node_id, nc.embedding <=> CAST(:query_vec AS vector)
             LIMIT 100
         ),
         rrf AS (
@@ -1694,7 +1727,9 @@ async def hybrid_search(
     """)
 
     count_sql = text("""
-        WITH visible AS (SELECT id FROM knowledge_nodes WHERE id = ANY(:visible_ids::uuid[])),
+        WITH visible AS (
+            SELECT id FROM knowledge_nodes WHERE id = ANY(CAST(:visible_ids AS uuid[]))
+        ),
         fts_ids AS (
             SELECT kn.id FROM knowledge_nodes kn, to_tsquery('english', :tsquery) AS q
             WHERE kn.id IN (SELECT id FROM visible) AND kn.body_tsv @@ q
@@ -1736,13 +1771,13 @@ async def hybrid_search(
     return results, int(total)
 ```
 
-- [ ] **7.3** Run tests:
+- [x] **7.3** Run tests:
 ```bash
 cd backend && pytest tests/services/test_search_service.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **7.4** Commit:
+- [x] **7.4** Commit:
 ```
 feat(search): hybrid RRF search (FTS + pgvector) with visibility inside each leg
 ```
