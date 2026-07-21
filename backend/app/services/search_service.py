@@ -62,7 +62,7 @@ async def hybrid_search(
             SELECT kn.id,
                    ROW_NUMBER() OVER (ORDER BY ts_rank_cd(kn.body_tsv, query) DESC) AS rank
             FROM knowledge_nodes kn,
-                 to_tsquery('english', :tsquery) AS query
+                 plainto_tsquery('english', :tsquery) AS query
             WHERE kn.id IN (SELECT id FROM visible)
               AND kn.body_tsv @@ query
             LIMIT 100
@@ -90,7 +90,7 @@ async def hybrid_search(
                rrf.score
         FROM rrf
         JOIN knowledge_nodes kn ON kn.id = rrf.id
-        ORDER BY rrf.score DESC
+        ORDER BY rrf.score DESC, kn.id
         LIMIT :limit OFFSET :offset
     """)
 
@@ -99,7 +99,7 @@ async def hybrid_search(
             SELECT id FROM knowledge_nodes WHERE id = ANY(CAST(:visible_ids AS uuid[]))
         ),
         fts_ids AS (
-            SELECT kn.id FROM knowledge_nodes kn, to_tsquery('english', :tsquery) AS q
+            SELECT kn.id FROM knowledge_nodes kn, plainto_tsquery('english', :tsquery) AS q
             WHERE kn.id IN (SELECT id FROM visible) AND kn.body_tsv @@ q
         ),
         vec_ids AS (
@@ -109,12 +109,12 @@ async def hybrid_search(
         SELECT COUNT(DISTINCT id) FROM (SELECT id FROM fts_ids UNION SELECT id FROM vec_ids) sub
     """)
 
-    # Convert query to tsquery (simple: replace spaces with & for AND logic)
-    tsquery = " & ".join(query.split())
-
+    # plainto_tsquery (kb-pgvector-search): user queries are arbitrary text —
+    # parens/quotes/operators must never raise a tsquery syntax error, so the
+    # raw string is passed through and PG does the safe parsing (implicit AND).
     params = {
         "visible_ids": visible_ids,
-        "tsquery": tsquery,
+        "tsquery": query,
         "query_vec": vec_str,
         "k": _RRF_K,
         "limit": limit,

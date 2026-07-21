@@ -1530,6 +1530,14 @@ feat(workers): autolink_node task — mean-pool similarity, MERGE SIMILAR_TO edg
 
 ## Task 7 — Hybrid search service
 
+> **Review notes (7.R):** (1) plainto_tsquery + kn.id tiebreaker fixes below are
+> review CRITICALs (special-char 500s; nondeterministic OFFSET on ties). (2) Known
+> divergence: the visible-id set is materialized in Python and bound as uuid[]
+> instead of composing visible_nodes_clause inline per CTE — correct (filter still
+> pre-LIMIT in both legs) but a scaling concern for very large visible sets;
+> revisit if admin/org-wide search grows. (3) The FULL OUTER JOIN fusion is
+> mathematically equivalent to the skill's UNION ALL/GROUP BY shape.
+
 **Files:**
 - Create: `backend/app/services/search_service.py`
 - Create: `backend/tests/services/test_search_service.py`
@@ -1694,7 +1702,7 @@ async def hybrid_search(
             SELECT kn.id,
                    ROW_NUMBER() OVER (ORDER BY ts_rank_cd(kn.body_tsv, query) DESC) AS rank
             FROM knowledge_nodes kn,
-                 to_tsquery('english', :tsquery) AS query
+                 plainto_tsquery('english', :tsquery) AS query
             WHERE kn.id IN (SELECT id FROM visible)
               AND kn.body_tsv @@ query
             LIMIT 100
@@ -1722,7 +1730,7 @@ async def hybrid_search(
                rrf.score
         FROM rrf
         JOIN knowledge_nodes kn ON kn.id = rrf.id
-        ORDER BY rrf.score DESC
+        ORDER BY rrf.score DESC, kn.id
         LIMIT :limit OFFSET :offset
     """)
 
@@ -1731,7 +1739,7 @@ async def hybrid_search(
             SELECT id FROM knowledge_nodes WHERE id = ANY(CAST(:visible_ids AS uuid[]))
         ),
         fts_ids AS (
-            SELECT kn.id FROM knowledge_nodes kn, to_tsquery('english', :tsquery) AS q
+            SELECT kn.id FROM knowledge_nodes kn, plainto_tsquery('english', :tsquery) AS q
             WHERE kn.id IN (SELECT id FROM visible) AND kn.body_tsv @@ q
         ),
         vec_ids AS (
@@ -1742,7 +1750,12 @@ async def hybrid_search(
     """)
 
     # Convert query to tsquery (simple: replace spaces with & for AND logic)
-    tsquery = " & ".join(query.split())
+    # [plan-fix] review CRITICAL: hand-built to_tsquery strings crash on
+    # parens/quotes ("issue(#123)" -> tsquery syntax error -> 500). The raw
+    # query is passed to plainto_tsquery (implicit AND, safe parsing), per
+    # kb-pgvector-search. Also: ", kn.id" tiebreaker on the final ORDER BY
+    # keeps OFFSET pagination deterministic when RRF scores tie.
+    tsquery = query
 
     params = {
         "visible_ids": visible_ids,
