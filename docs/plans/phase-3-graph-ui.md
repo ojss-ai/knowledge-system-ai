@@ -195,10 +195,11 @@ chore(frontend): Next.js 14 scaffold — package.json, tsconfig, next.config, ta
 - Create: `frontend/src/lib/api.ts`
 - Create: `frontend/src/lib/types.ts`
 - Create: `frontend/tests/unit/api.test.ts`
+- Create: `frontend/vitest.config.ts` <!-- [plan-fix] added: test imports "@/lib/api" but vitest does not read tsconfig paths; config maps "@" → ./src -->
 
 ### Steps
 
-- [ ] **2.1** Write the failing test:
+- [x] **2.1** Write the failing test:
 
 ```typescript
 // frontend/tests/unit/api.test.ts
@@ -241,13 +242,15 @@ describe("searchNodes", () => {
 })
 ```
 
-- [ ] **2.2** Create `types.ts`:
+- [x] **2.2** Create `types.ts`:
 
 ```typescript
 // frontend/src/lib/types.ts
 export type Visibility = "private" | "public" | "shared"
 export type NodeType = "note" | "daily_log" | "file" | "code_file" | "code_symbol" | "confluence_page"
 
+// [plan-fix] dropped deleted_at — backend NodeOut (backend/app/schemas/node.py)
+// does not expose it; soft-deleted nodes are never returned.
 export interface KBNode {
   id: string
   owner_id: string
@@ -260,7 +263,6 @@ export interface KBNode {
   meta: Record<string, unknown>
   created_at: string
   updated_at: string
-  deleted_at: string | null
 }
 
 export interface NodeListOut {
@@ -286,12 +288,14 @@ export interface SearchOut {
 }
 
 export interface GraphData {
-  nodes: { id: string; title: string; node_type: string; visibility: string }[]
+  // [plan-fix] visibility optional — GET /graph/overview omits it
+  // (graph_service.get_overview returns only id/title/node_type)
+  nodes: { id: string; title: string; node_type: string; visibility?: string }[]
   edges: { source: string; target: string; label: string }[]
 }
 ```
 
-- [ ] **2.3** Create `api.ts`:
+- [x] **2.3** Create `api.ts`:
 
 ```typescript
 // frontend/src/lib/api.ts
@@ -308,6 +312,11 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`API ${res.status}: ${text}`)
+  }
+  // [plan-fix] DELETE /nodes/{id} returns 204 No Content — res.json() would
+  // throw on the empty body.
+  if (res.status === 204) {
+    return undefined as T
   }
   return res.json() as Promise<T>
 }
@@ -354,13 +363,13 @@ export async function fetchDailyLog(date: string): Promise<KBNode> {
 }
 ```
 
-- [ ] **2.4** Run tests:
+- [x] **2.4** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/api.test.ts
 # Expected: 2 passed
 ```
 
-- [ ] **2.5** Commit:
+- [x] **2.5** Commit:
 ```
 feat(frontend): API client layer with typed wrappers for all endpoints
 ```
