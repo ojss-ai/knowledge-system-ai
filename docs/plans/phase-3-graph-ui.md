@@ -379,6 +379,7 @@ feat(frontend): API client layer with typed wrappers for all endpoints
 ## Task 3 — BFF auth route handlers + middleware
 
 **Files:**
+- Create: `frontend/src/lib/auth.ts` <!-- [plan-fix] was missing from Files list; step 3.2 creates it -->
 - Create: `frontend/src/app/api/auth/login/route.ts`
 - Create: `frontend/src/app/api/auth/logout/route.ts`
 - Create: `frontend/src/app/api/auth/me/route.ts`
@@ -387,7 +388,7 @@ feat(frontend): API client layer with typed wrappers for all endpoints
 
 ### Steps
 
-- [ ] **3.1** Write failing tests:
+- [x] **3.1** Write failing tests:
 
 ```typescript
 // frontend/tests/unit/auth.test.ts
@@ -405,7 +406,7 @@ describe("parseAccessToken", () => {
 })
 ```
 
-- [ ] **3.2** Create `frontend/src/lib/auth.ts`:
+- [x] **3.2** Create `frontend/src/lib/auth.ts`:
 
 ```typescript
 // frontend/src/lib/auth.ts
@@ -433,7 +434,7 @@ export function isTokenExpired(claims: TokenClaims): boolean {
 }
 ```
 
-- [ ] **3.3** Create BFF login route:
+- [x] **3.3** Create BFF login route:
 
 ```typescript
 // frontend/src/app/api/auth/login/route.ts
@@ -441,12 +442,14 @@ import { NextRequest, NextResponse } from "next/server"
 
 export async function POST(req: NextRequest) {
   const { email, password } = await req.json()
+  // [plan-fix] backend login is JSON {email, password} (LoginIn schema in
+  // backend/app/schemas/auth.py), not OAuth2 form-urlencoded {username, password}
   const apiRes = await fetch(
     `${process.env.API_BASE_URL ?? "http://localhost:8000"}/api/v1/auth/login`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ username: email, password }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
     }
   )
   if (!apiRes.ok) {
@@ -473,7 +476,7 @@ export async function POST(req: NextRequest) {
 }
 ```
 
-- [ ] **3.4** Create BFF logout route:
+- [x] **3.4** Create BFF logout route:
 
 ```typescript
 // frontend/src/app/api/auth/logout/route.ts
@@ -487,7 +490,7 @@ export async function POST() {
 }
 ```
 
-- [ ] **3.5** Create BFF me route (proxies to FastAPI with access_token from cookie):
+- [x] **3.5** Create BFF me route (proxies to FastAPI with access_token from cookie):
 
 ```typescript
 // frontend/src/app/api/auth/me/route.ts
@@ -506,7 +509,7 @@ export async function GET(req: NextRequest) {
 }
 ```
 
-- [ ] **3.6** Create middleware (protect all non-auth pages):
+- [x] **3.6** Create middleware (protect all non-auth pages):
 
 ```typescript
 // frontend/src/middleware.ts
@@ -529,13 +532,13 @@ export const config = {
 }
 ```
 
-- [ ] **3.7** Run tests:
+- [x] **3.7** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/auth.test.ts
 # Expected: 2 passed
 ```
 
-- [ ] **3.8** Commit:
+- [x] **3.8** Commit:
 ```
 feat(frontend): BFF auth — login/logout/me routes + middleware cookie guard
 ```
