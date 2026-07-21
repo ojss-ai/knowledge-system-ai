@@ -739,17 +739,26 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.chunk import NodeChunk
+from app.models.group import GroupMember
 from app.models.knowledge import KnowledgeNode
+from app.models.user import User
 from app.services.chunking import chunk_markdown
 from app.services.embedding_service import Embedder, get_embedder
 from app.services.visibility import SYSTEM_VIEWER, visible_nodes_clause
 from app.workers.celery_app import celery_app, task_session
+from app.workers.tasks.autolink_node import autolink_node
+
+# Primitive args for chaining autolink_node.delay: (node_id, user_id, role, group_ids)
+AutolinkArgs = tuple[str, str, str, list[str]]
 
 
-async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embedder) -> None:
+async def _embed_node_impl(
+    db: AsyncSession, node_id: uuid.UUID, embedder: Embedder
+) -> KnowledgeNode | None:
     """
     Core logic extracted for unit-testability (no Celery dependency).
     Idempotent: deletes existing chunks for the node before reinserting.
+    Returns the embedded node, or None when it is gone/soft-deleted.
     """
     # SYSTEM_VIEWER justification (kb-visibility-filter rule 1): embedding is a
     # system job that must (re)index any LIVE node regardless of owner. Going
@@ -762,7 +771,7 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
         )
     )
     if node is None:
-        return
+        return None
 
     texts = chunk_markdown(node.body)
 
@@ -771,7 +780,7 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
     await db.execute(delete(NodeChunk).where(NodeChunk.node_id == node_id))
 
     if not texts:
-        return
+        return node
 
     vectors = embedder.embed(texts)
 
@@ -785,6 +794,48 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
         db.add(chunk)
 
     await db.flush()
+    return node
+
+
+async def _embed_and_prepare_autolink(
+    db: AsyncSession, node_id: uuid.UUID, embedder: Embedder
+) -> AutolinkArgs | None:
+    """
+    Embed the node, then build the primitive args for chaining autolink_node
+    (plan Goal: auto-linking runs as a post-embed task). Runs INSIDE the task
+    session; the actual .delay happens post-commit via _after_embed.
+
+    The args are the node OWNER's viewer (user id, role, group ids): autolink's
+    candidate reads must carry the owner's visibility, never SYSTEM_VIEWER.
+    Returns None (no chaining) when the node or its owner is gone.
+    """
+    node = await _embed_node_impl(db, node_id, embedder)
+    if node is None:
+        return None
+
+    owner_role = await db.scalar(select(User.role).where(User.id == node.owner_id))
+    if owner_role is None:  # owner row gone (FK race): nothing to link on behalf of
+        return None
+    group_ids = await db.scalars(
+        select(GroupMember.group_id).where(GroupMember.user_id == node.owner_id)
+    )
+    return (
+        str(node.id),
+        str(node.owner_id),
+        owner_role.value,
+        sorted(str(gid) for gid in group_ids),
+    )
+
+
+def _after_embed(autolink_args: AutolinkArgs | None) -> None:
+    """
+    Post-commit hook: chain autolink via the queue, never inline
+    (kb-celery-jobs rule 7). Must be called AFTER task_session commits so the
+    autolink worker sees the freshly written chunks.
+    """
+    if autolink_args is None:
+        return
+    autolink_node.delay(*autolink_args)
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
@@ -797,20 +848,26 @@ async def _embed_node_impl(db: AsyncSession, node_id: uuid.UUID, embedder: Embed
 )
 def embed_node(self: Task, node_id: str) -> None:
     """
-    Celery task: chunk and embed a knowledge node.
-    Args must be primitives (str, not UUID).
+    Celery task: chunk and embed a knowledge node, then chain autolink_node
+    (post-embed task, kb-celery-jobs rule 7). Args must be primitives (str,
+    not UUID).
     """
     nid = uuid.UUID(node_id)
     embedder = get_embedder()
 
-    async def _run() -> None:
+    async def _run() -> AutolinkArgs | None:
         async with task_session() as db:
-            await _embed_node_impl(db, nid, embedder)
+            return await _embed_and_prepare_autolink(db, nid, embedder)
 
     try:
-        asyncio.run(_run())
+        autolink_args = asyncio.run(_run())
     except Exception as exc:
         raise self.retry(exc=exc) from exc
+
+    # Chain AFTER the session above committed: the autolink worker must see the
+    # new chunks. Enqueue failures propagate and fail the task; embed_node is
+    # idempotent, so a re-run (manual or requeued) is always safe.
+    _after_embed(autolink_args)
 ```
 
 - [x] **5.3** Run tests:
@@ -1447,6 +1504,27 @@ feat(workers): autolink_node task — mean-pool similarity, MERGE SIMILAR_TO edg
   stale auto edge gone after content change; a manual `SIMILAR_TO` edge on the
   same node survives). The no-chunks noop path intentionally stays a noop
   (returns before the delete), preserving `test_autolink_without_chunks_is_noop`.
+
+- [x] **6.R.2 (IMPORTANT)** Autolink was never invoked: the plan Goal says
+  auto-linking "runs as a post-embed task", but nothing enqueued `kb.autolink_node`.
+  Neither Task 5 nor Task 6 prescribed the chaining mechanism, so the
+  kb-celery-jobs canonical shape is used ([plan-fix]): the `embed_node` wrapper
+  chains `autolink_node.delay(...)` AFTER `task_session` commits (rule 7: chain
+  via the queue, never inline; post-commit so the autolink worker sees the new
+  chunks). The chain is split into two broker-free testable pieces in
+  `embed_node.py`: `_embed_and_prepare_autolink` (in-session; embeds, then builds
+  the primitive args `(node_id, user_id, role, group_ids)` from the node OWNER's
+  role + group memberships — autolink must use the owner's viewer, never
+  SYSTEM_VIEWER) and `_after_embed` (post-commit hook calling `.delay`; None =
+  embed skipped, no enqueue). `_embed_node_impl` now returns the node (or None).
+  Tests (RED first via ImportError):
+  `test_embed_prepare_chain_returns_owner_viewer_args` (owner in a group; exact
+  arg tuple), `test_embed_prepare_chain_skips_missing_node`,
+  `test_after_embed_enqueues_autolink` (monkeypatched `autolink_node.delay`
+  recorder), `test_after_embed_noop_when_embed_skipped`. The 5.2 code block is
+  kept in sync. **Docker-stack note:** end-to-end chaining (embed worker →
+  broker → autolink on `default` queue) needs the real stack; verify with
+  workers consuming both `-Q embed` and `-Q default`.
 
 ---
 

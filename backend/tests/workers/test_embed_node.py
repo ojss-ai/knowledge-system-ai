@@ -115,3 +115,69 @@ async def test_embed_failure_propagates_for_retry(db, make_user, make_node):
 
     with pytest.raises(RuntimeError, match="transient embedding backend failure"):
         await _embed_node_impl(db, node.id, BoomEmbedder())
+
+
+# --- 6.R.2: autolink runs as a post-embed task (plan Goal; kb-celery-jobs rule 7) ---
+# The Celery wrapper chains autolink_node.delay(...) AFTER task_session commits.
+# The chain is split into two broker-free testable pieces: the in-session arg
+# builder (_embed_and_prepare_autolink) and the post-commit hook (_after_embed).
+
+
+async def test_embed_prepare_chain_returns_owner_viewer_args(
+    db, make_user, make_node, fake_embedder
+):
+    """Chain args carry the node OWNER's viewer (id, role, group ids) as primitives —
+    autolink candidate reads must use the owner's visibility, never SYSTEM_VIEWER."""
+    from app.models.group import Group, GroupMember
+    from app.workers.tasks.embed_node import _embed_and_prepare_autolink
+
+    owner = await make_user(email="chain1@test.com")
+    group = Group(name="chain-group", created_by=owner.id)
+    db.add(group)
+    await db.flush()
+    db.add(GroupMember(group_id=group.id, user_id=owner.id))
+    node = await make_node(owner, body="Some content to embed.")
+    await db.flush()
+
+    args = await _embed_and_prepare_autolink(db, node.id, fake_embedder)
+
+    assert args == (str(node.id), str(owner.id), "user", [str(group.id)])
+    count = await db.scalar(
+        select(func.count()).select_from(NodeChunk).where(NodeChunk.node_id == node.id)
+    )
+    assert count >= 1, "the embed itself must have run"
+
+
+async def test_embed_prepare_chain_skips_missing_node(db, fake_embedder):
+    """No node (deleted/gone) -> no chain args -> autolink is never enqueued."""
+    import uuid
+
+    from app.workers.tasks.embed_node import _embed_and_prepare_autolink
+
+    args = await _embed_and_prepare_autolink(db, uuid.uuid4(), fake_embedder)
+    assert args is None
+
+
+async def test_after_embed_enqueues_autolink(monkeypatch):
+    """The post-commit hook chains via autolink_node.delay (queue, not inline) —
+    monkeypatched recorder, no broker (kb-celery-jobs testing rules)."""
+    from app.workers.tasks.autolink_node import autolink_node
+    from app.workers.tasks.embed_node import _after_embed
+
+    delayed: list[tuple] = []
+    monkeypatch.setattr(autolink_node, "delay", lambda *a: delayed.append(a))
+
+    args = ("nid", "uid", "user", ["gid"])
+    _after_embed(args)
+    assert delayed == [args], "autolink must be enqueued exactly once with the chain args"
+
+
+async def test_after_embed_noop_when_embed_skipped(monkeypatch):
+    from app.workers.tasks.autolink_node import autolink_node
+    from app.workers.tasks.embed_node import _after_embed
+
+    delayed: list[tuple] = []
+    monkeypatch.setattr(autolink_node, "delay", lambda *a: delayed.append(a))
+
+    _after_embed(None)
+    assert delayed == [], "skipped embed (node gone) must not enqueue autolink"
