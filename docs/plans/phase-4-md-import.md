@@ -348,17 +348,28 @@ feat(models): ingestion_runs, api_tokens + migration 0005; MinIO storage client
 **Files:**
 - Create: `backend/app/services/ingest/__init__.py`
 - Create: `backend/app/services/ingest/base.py`
+- Create: `backend/tests/services/ingest/__init__.py` ([plan-fix] test dirs are packages in this repo)
 - Create: `backend/tests/services/ingest/test_ingest_base.py`
+- Modify: `backend/app/services/node_service.py` ([plan-fix] `_queue_graph_op` promoted to public
+  `queue_graph_op` — the ingestor queues its graph MERGEs through the same session mechanism)
 
 ### Steps
 
-- [ ] **2.1** Write the failing test:
+- [x] **2.1** Write the failing test ([plan-fix] `test_two_pass_edge_resolution` verifies edges
+  via live Neo4j, so it gets the `neo4j_session` skip fixture and runs
+  `ns.run_pending_graph_ops(db)` — the ingestor QUEUES graph ops (PG-first, ADR-011), it never
+  awaits Neo4j in-transaction. Recorder-based tests added (pattern from
+  `tests/services/test_node_service.py`) so two-pass ordering and dangling-ref handling stay
+  verified without a live Neo4j — kb-ingestion-connectors lists dangling-link handling as a
+  mandatory test):
 
 ```python
 # backend/tests/services/ingest/test_ingest_base.py
 import pytest
-from app.services.ingest.base import IngestItem, KnowledgeIngestor, EdgeSpec
+
 from app.models.user import Role
+from app.services import node_service as ns
+from app.services.ingest.base import EdgeSpec, IngestItem, KnowledgeIngestor
 from app.services.visibility import Viewer
 
 pytestmark = pytest.mark.asyncio
@@ -389,54 +400,138 @@ async def test_upsert_idempotent(db, make_user):
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     ingestor = KnowledgeIngestor(db, viewer)
 
-    item = IngestItem(source="md_upload", source_ref="idem/test.md", title="Idempotent", body="body")
+    item = IngestItem(
+        source="md_upload", source_ref="idem/test.md", title="Idempotent", body="body"
+    )
     n1 = await ingestor.upsert(item)
     n2 = await ingestor.upsert(item)
     assert n1.id == n2.id
 
 
-async def test_two_pass_edge_resolution(db, make_user):
+async def test_two_pass_edge_resolution(db, neo4j_session, make_user):
     """Edges with forward references are resolved after all nodes are ingested."""
     owner = await make_user(email="ing_edge@test.com")
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     ingestor = KnowledgeIngestor(db, viewer)
 
-    n1 = await ingestor.upsert(IngestItem(source="md", source_ref="a.md", title="A", body="see [[B]]"))
-    n2 = await ingestor.upsert(IngestItem(source="md", source_ref="b.md", title="B", body="content"))
+    n1 = await ingestor.upsert(
+        IngestItem(source="md", source_ref="a.md", title="A", body="see [[B]]")
+    )
+    n2 = await ingestor.upsert(
+        IngestItem(source="md", source_ref="b.md", title="B", body="content")
+    )
 
     ingestor.add_edge_spec(EdgeSpec(source_ref="a.md", target_ref="b.md", label="LINKS_TO"))
     await ingestor.resolve_edges()
+    # The ingestor only QUEUES graph ops (PG-first, ADR-011); run them as the
+    # post-commit caller would.
+    await ns.run_pending_graph_ops(db)
 
     from app.services import graph_service as gs
+
     hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
     targets = [e["target"] for e in hood["edges"]]
     assert str(n2.id) in targets
+
+
+# --- PG-first invariant + dangling refs, verified via recorder (no live Neo4j) ---
+
+
+def _graph_recorder(monkeypatch):
+    """Patch graph_service functions with recorders; return the call log."""
+    from app.services import graph_service as gs
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_upsert(node):
+        calls.append(("upsert", str(node.id)))
+
+    async def fake_merge(source_id, target_id, label, created_by, score=None):
+        calls.append(("edge", str(source_id), str(target_id), label, created_by))
+
+    monkeypatch.setattr(gs, "upsert_vertex", fake_upsert)
+    monkeypatch.setattr(gs, "merge_edge", fake_merge)
+    return calls
+
+
+async def test_resolve_edges_defers_graph_sync(db, make_user, monkeypatch):
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_defer@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    ingestor = KnowledgeIngestor(db, viewer)
+
+    n1 = await ingestor.upsert(IngestItem(source="md", source_ref="x.md", title="X", body="x"))
+    n2 = await ingestor.upsert(IngestItem(source="md", source_ref="y.md", title="Y", body="y"))
+    ingestor.add_edge_spec(EdgeSpec(source_ref="x.md", target_ref="y.md", label="LINKS_TO"))
+    await ingestor.resolve_edges()
+
+    assert calls == []  # nothing hit Neo4j inside the transaction
+    await ns.run_pending_graph_ops(db)
+    assert ("edge", str(n1.id), str(n2.id), "LINKS_TO", "ingest") in calls
+
+
+async def test_resolve_edges_skips_dangling_refs(db, make_user, monkeypatch):
+    """Unresolvable refs are skipped silently, never raised (kb-ingestion-connectors)."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_dangle@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    ingestor = KnowledgeIngestor(db, viewer)
+
+    await ingestor.upsert(IngestItem(source="md", source_ref="only.md", title="Only", body="o"))
+    ingestor.add_edge_spec(
+        EdgeSpec(source_ref="only.md", target_ref="missing.md", label="LINKS_TO")
+    )
+    await ingestor.resolve_edges()
+    await ns.run_pending_graph_ops(db)
+
+    assert all(c[0] != "edge" for c in calls)
 ```
 
-- [ ] **2.2** Create `base.py`:
+- [x] **2.2** Create `base.py` ([plan-fix] plan block drifted from the codebase:
+  `gs.create_vertex` does not exist → `gs.upsert_vertex(node)` (no db arg);
+  `gs.merge_edge(source_id, target_id, label, created_by, score)` takes no db arg and no
+  `props=` kwarg → `created_by`/`score` are pulled from `EdgeSpec.props`; `resolve_edges`
+  awaited Neo4j inside the transaction → it now QUEUES ops via `ns.queue_graph_op`
+  (PG-first, ADR-011), caller runs `run_pending_graph_ops(db)` post-commit; the
+  existing-node probe selected `knowledge_nodes` without `visible_nodes_clause`
+  (kb-visibility-filter rule 1) and without owner scoping — the idempotency key is
+  per-owner (`uq_node_owner_source_ref`), so the probe pins `owner_id == viewer.user_id`;
+  `import uuid` hoisted to module level; mypy --strict scope annotations):
 
 ```python
 # backend/app/services/ingest/base.py
+"""KnowledgeIngestor — the single convergence point for all ingestion paths
+(kb-ingestion-connectors): connectors fetch + convert into IngestItems; this
+module owns persistence. Never write connector-specific node persistence.
+
+PG first, Neo4j second (ADR-011): upsert() persists rows via node_service
+(which queues the vertex sync); resolve_edges() only QUEUES edge MERGEs on the
+session via node_service.queue_graph_op. The caller commits, then runs
+node_service.run_pending_graph_ops(db).
+"""
+
 from __future__ import annotations
 
 import hashlib
+import uuid
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.knowledge import KnowledgeNode, NodeType, Tag, NodeTag
+from app.models.knowledge import KnowledgeNode, NodeTag, NodeType, Tag
 from app.models.user import Visibility
 from app.services import graph_service as gs
 from app.services import node_service as ns
-from app.services.visibility import Viewer
+from app.services.visibility import Viewer, visible_nodes_clause
 
 
 @dataclass
 class IngestItem:
-    source: str                          # "md_upload" | "confluence" | "codebase"
-    source_ref: str                      # unique external key (path, page_id, symbol_fqn)
+    source: str  # "md_upload" | "confluence" | "codebase"
+    source_ref: str  # unique external key (path, page_id, symbol_fqn)
     title: str
     body: str
     node_type: str = NodeType.note.value
@@ -451,8 +546,8 @@ class IngestItem:
 
 @dataclass
 class EdgeSpec:
-    source_ref: str          # source_ref of the source node
-    target_ref: str          # source_ref of the target node
+    source_ref: str  # source_ref of the source node
+    target_ref: str  # source_ref of the target node
     label: str = "LINKS_TO"
     props: dict[str, Any] = field(default_factory=dict)
 
@@ -460,19 +555,20 @@ class EdgeSpec:
 class KnowledgeIngestor:
     """
     Single convergence point for all ingestion paths.
-    
+
     Usage:
         ingestor = KnowledgeIngestor(db, viewer)
         for item in items:
             await ingestor.upsert(item)
             ingestor.add_edge_spec(EdgeSpec(...))  # collect during pass 1
-        await ingestor.resolve_edges()             # resolve in pass 2
+        await ingestor.resolve_edges()             # queue edges in pass 2
+        # caller: await db.commit(); await node_service.run_pending_graph_ops(db)
     """
 
     def __init__(self, db: AsyncSession, viewer: Viewer) -> None:
         self._db = db
         self._viewer = viewer
-        self._ref_to_id: dict[str, KnowledgeNode] = {}
+        self._ref_to_node: dict[str, KnowledgeNode] = {}
         self._edge_specs: list[EdgeSpec] = []
 
     async def upsert(self, item: IngestItem) -> KnowledgeNode:
@@ -481,22 +577,31 @@ class KnowledgeIngestor:
         Idempotent: same (source, source_ref) → same node ID.
         Content-hash short-circuit: unchanged content → skip body update.
         """
+        # visible_nodes_clause is mandatory on every knowledge_nodes read
+        # (kb-visibility-filter rule 1). The extra owner_id predicate pins the
+        # probe to the idempotency key (owner_id, source, source_ref) — the
+        # clause alone would also match ANOTHER owner's public node with the
+        # same source_ref, and updating that must never happen here.
         existing = await self._db.scalar(
             select(KnowledgeNode).where(
+                visible_nodes_clause(self._viewer),
+                KnowledgeNode.owner_id == self._viewer.user_id,
                 KnowledgeNode.source == item.source,
                 KnowledgeNode.source_ref == item.source_ref,
-                KnowledgeNode.deleted_at.is_(None),
             )
         )
 
-        if existing:
+        if existing is not None:
             existing_hash = hashlib.sha256((existing.title + existing.body).encode()).hexdigest()
             if existing_hash != item.content_hash:
                 # Content changed — update
                 existing = await ns.update_node(
-                    self._db, existing.id, self._viewer,
-                    title=item.title, body=item.body,
-                    meta={**existing.meta, **item.meta, "_content_hash": item.content_hash},
+                    self._db,
+                    existing.id,
+                    self._viewer,
+                    title=item.title,
+                    body=item.body,
+                    meta={**item.meta, "_content_hash": item.content_hash},
                 )
             node = existing
         else:
@@ -517,7 +622,6 @@ class KnowledgeIngestor:
             slug = tag_name.lower().replace(" ", "-")
             tag = await self._db.scalar(select(Tag).where(Tag.slug == slug))
             if tag is None:
-                import uuid
                 tag = Tag(id=uuid.uuid4(), name=tag_name, slug=slug)
                 self._db.add(tag)
                 await self._db.flush()
@@ -529,7 +633,7 @@ class KnowledgeIngestor:
                 self._db.add(NodeTag(node_id=node.id, tag_id=tag.id))
                 await self._db.flush()
 
-        self._ref_to_id[item.source_ref] = node
+        self._ref_to_node[item.source_ref] = node
         return node
 
     def add_edge_spec(self, spec: EdgeSpec) -> None:
@@ -538,28 +642,42 @@ class KnowledgeIngestor:
 
     async def resolve_edges(self) -> None:
         """
-        Pass 2: resolve all queued EdgeSpecs to actual node IDs and create edges.
-        Unresolvable refs are silently skipped.
+        Pass 2: resolve queued EdgeSpecs to node IDs and QUEUE the graph MERGEs
+        for post-commit run_pending_graph_ops() — never awaited in-transaction
+        (ADR-011). Unresolvable refs are silently skipped (dangling links are
+        expected in batch imports, not errors).
         """
         for spec in self._edge_specs:
-            src_node = self._ref_to_id.get(spec.source_ref)
-            tgt_node = self._ref_to_id.get(spec.target_ref)
+            src_node = self._ref_to_node.get(spec.source_ref)
+            tgt_node = self._ref_to_node.get(spec.target_ref)
             if src_node is None or tgt_node is None:
                 continue
-            await gs.create_vertex(self._db, src_node)
-            await gs.create_vertex(self._db, tgt_node)
-            await gs.merge_edge(self._db, src_node.id, tgt_node.id, spec.label, props=spec.props)
+            score = spec.props.get("score")
+            ns.queue_graph_op(self._db, partial(gs.upsert_vertex, src_node))
+            ns.queue_graph_op(self._db, partial(gs.upsert_vertex, tgt_node))
+            ns.queue_graph_op(
+                self._db,
+                partial(
+                    gs.merge_edge,
+                    src_node.id,
+                    tgt_node.id,
+                    spec.label,
+                    created_by=str(spec.props.get("created_by", "ingest")),
+                    score=float(score) if score is not None else None,
+                ),
+            )
 
         self._edge_specs.clear()
 ```
 
-- [ ] **2.3** Run tests:
+- [x] **2.3** Run tests:
 ```bash
 cd backend && pytest tests/services/ingest/test_ingest_base.py -v
-# Expected: 3 passed
+# Expected: 5 passed with Neo4j up; 4 passed + 1 skipped when Neo4j is unreachable
+# ([plan-fix] count was 3; two recorder-based tests added, live-graph test skips without Neo4j)
 ```
 
-- [ ] **2.4** Commit:
+- [x] **2.4** Commit:
 ```
 feat(ingest): KnowledgeIngestor with IngestItem contract and two-pass edge resolution
 ```
