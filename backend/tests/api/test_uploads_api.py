@@ -132,6 +132,42 @@ async def test_upload_rejects_zip_bomb(
     assert recorded_delay == []
 
 
+async def test_upload_enqueue_failure_marks_run_failed_and_503(
+    client: AsyncClient, auth_headers, db, monkeypatch
+):
+    """[review-fix 5.R.4] broker down between commit and enqueue: the durable
+    run row must not sit pending forever (no worker is coming) — mark it
+    failed with the reason in a fresh commit and answer 503."""
+    from app.workers.tasks.ingest_md import ingest_md
+
+    def broken_delay(*args, **kwargs):
+        raise RuntimeError("redis connection refused")
+
+    monkeypatch.setattr(ingest_md, "delay", broken_delay)
+
+    zip_bytes = make_zip_bytes({"a.md": "# A\n\nBody."})
+    r = await client.post(
+        "/api/v1/uploads/markdown",
+        files={"file": ("notes.zip", io.BytesIO(zip_bytes), "application/zip")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 503
+
+    from sqlalchemy import select
+
+    owner = await db.scalar(select(User).where(User.email == "owner@test.com"))
+    run = await db.scalar(
+        select(IngestionRun).where(
+            IngestionRun.owner_id == owner.id, IngestionRun.source == "md_upload"
+        )
+    )
+    assert run is not None, "the run row must survive (it committed before the enqueue)"
+    assert run.status == RunStatus.failed
+    assert run.error_log.startswith("enqueue failed:")
+    assert "redis connection refused" in run.error_log
+    assert run.finished_at is not None
+
+
 async def test_upload_unauthenticated_is_401(client: AsyncClient):
     zip_bytes = make_zip_bytes({"a.md": "# A"})
     r = await client.post(

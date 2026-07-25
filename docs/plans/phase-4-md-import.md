@@ -1803,7 +1803,7 @@ import base64
 import io
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import (
     APIRouter,
@@ -1891,13 +1891,25 @@ async def upload_markdown(
     await db.commit()  # the worker reads this row — it must be durable before enqueue
 
     # Primitive args only (kb-celery-jobs rule 2); the zip travels base64.
-    ingest_md.delay(
-        str(run.id),
-        base64.b64encode(content).decode(),
-        str(viewer.user_id),
-        viewer.role.value,
-        [str(g) for g in viewer.group_ids],
-    )
+    try:
+        ingest_md.delay(
+            str(run.id),
+            base64.b64encode(content).decode(),
+            str(viewer.user_id),
+            viewer.role.value,
+            [str(g) for g in viewer.group_ids],
+        )
+    except Exception as exc:
+        # [review-fix 5.R.4] enqueue-then-crash: the run row is already durable
+        # but no worker will ever pick it up — a permanent "pending" lie. Mark
+        # it failed in a fresh commit and tell the client to retry.
+        run.status = RunStatus.failed
+        run.error_log = f"enqueue failed: {exc}"
+        run.finished_at = datetime.now(UTC)
+        await db.commit()
+        raise HTTPException(
+            status_code=503, detail="ingestion queue unavailable, try again later"
+        ) from exc
 
     return UploadStarted(run_id=run.id, status=RunStatus.pending)
 
@@ -1989,7 +2001,8 @@ app.include_router(uploads_router, prefix="/api/v1")
 - [x] **5.4** Run tests:
 ```bash
 cd backend && pytest tests/api/test_uploads_api.py -v
-# Expected: 8 passed  ([plan-fix] was "3 passed"; see 5.1 for the added tests)
+# Expected: 11 passed  ([plan-fix] was "3 passed"; see 5.1 for the added tests,
+# then 5.R: +1 WS auth/ownership, +1 zip-bomb 422, +1 enqueue-failure 503)
 ```
 
 Evidence (sandbox, 2026-07-24 — RED first: all failed 404/WebSocketDisconnect
@@ -2088,7 +2101,16 @@ feat(api): POST /api/v1/uploads/markdown (202 + Celery), GET /runs/:id, WS progr
   (importer) and `test_upload_rejects_zip_bomb` (endpoint 422, nothing
   enqueued) all failed with AttributeError before the constants/guard existed.
 
-- [ ] **5.R.4 IMPORTANT — enqueue-then-crash leaves the run pending forever.**
+- [x] **5.R.4 IMPORTANT — enqueue-then-crash leaves the run pending forever.**
+  The run row commits durably BEFORE `ingest_md.delay`; if the broker publish
+  then raises (Redis down), the client got a 500 and the row lied "pending"
+  eternally — no worker was ever going to pick it up. Fixed: the enqueue is
+  wrapped in try/except; on failure the run is marked
+  `status=failed, error_log="enqueue failed: ...", finished_at=now` in a fresh
+  commit and the endpoint answers 503 ("ingestion queue unavailable, try again
+  later"). RED first: `test_upload_enqueue_failure_marks_run_failed_and_503`
+  (monkeypatched `delay` raising) failed with the raw RuntimeError → 500
+  before the guard existed.
 
 ---
 

@@ -32,7 +32,7 @@ import base64
 import io
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import (
     APIRouter,
@@ -120,13 +120,25 @@ async def upload_markdown(
     await db.commit()  # the worker reads this row — it must be durable before enqueue
 
     # Primitive args only (kb-celery-jobs rule 2); the zip travels base64.
-    ingest_md.delay(
-        str(run.id),
-        base64.b64encode(content).decode(),
-        str(viewer.user_id),
-        viewer.role.value,
-        [str(g) for g in viewer.group_ids],
-    )
+    try:
+        ingest_md.delay(
+            str(run.id),
+            base64.b64encode(content).decode(),
+            str(viewer.user_id),
+            viewer.role.value,
+            [str(g) for g in viewer.group_ids],
+        )
+    except Exception as exc:
+        # [review-fix 5.R.4] enqueue-then-crash: the run row is already durable
+        # but no worker will ever pick it up — a permanent "pending" lie. Mark
+        # it failed in a fresh commit and tell the client to retry.
+        run.status = RunStatus.failed
+        run.error_log = f"enqueue failed: {exc}"
+        run.finished_at = datetime.now(UTC)
+        await db.commit()
+        raise HTTPException(
+            status_code=503, detail="ingestion queue unavailable, try again later"
+        ) from exc
 
     return UploadStarted(run_id=run.id, status=RunStatus.pending)
 
