@@ -781,14 +781,20 @@ feat(tools): SyncEngine with incremental sync, version cache, dry-run mode
 
 ### Steps
 
-- [ ] **4.1** Write failing test:
+- [x] **4.1** Write failing test:
+
+> [plan-fix] vs the original block: dropped `pytestmark = pytest.mark.asyncio`
+> (asyncio_mode="auto", test_tokens_api precedent); added the kb-api-conventions
+> checklist tests (401 unauthenticated, 422 missing title) and a tags-persistence
+> test — the sync engine (Task 3) sends Confluence labels as `tags`, which the
+> original 4.2 block dropped silently (labels → tags, kb-ingestion-connectors).
 
 ```python
 # backend/tests/api/test_ingest_item_api.py
-import pytest
-from httpx import AsyncClient
+import uuid
 
-pytestmark = pytest.mark.asyncio
+from httpx import AsyncClient
+from sqlalchemy import select
 
 
 async def test_ingest_item_creates_node(client: AsyncClient, auth_headers):
@@ -822,25 +828,82 @@ async def test_ingest_item_idempotent(client: AsyncClient, auth_headers):
     r1 = await client.post("/api/v1/uploads/ingest-item", json=payload, headers=auth_headers)
     r2 = await client.post("/api/v1/uploads/ingest-item", json=payload, headers=auth_headers)
     assert r1.json()["id"] == r2.json()["id"], "Same source_ref must return same node ID"
+
+
+async def test_ingest_item_persists_tags(client: AsyncClient, auth_headers, db):
+    """Confluence labels arrive as `tags` and must land in tags/node_tags."""
+    from app.models.knowledge import NodeTag, Tag
+
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json={
+            "title": "Tagged Page",
+            "body": "body",
+            "source": "confluence",
+            "source_ref": "confluence:TS:tagged1",
+            "tags": ["confluence", "docs"],
+        },
+        headers=auth_headers,
+    )
+    node_id = uuid.UUID(r.json()["id"])
+    slugs = await db.scalars(
+        select(Tag.slug).join(NodeTag, NodeTag.tag_id == Tag.id).where(NodeTag.node_id == node_id)
+    )
+    assert set(slugs) == {"confluence", "docs"}
+
+
+async def test_ingest_item_unauthenticated_is_401(client: AsyncClient):
+    r = await client.post("/api/v1/uploads/ingest-item", json={"title": "t", "body": "b"})
+    assert r.status_code == 401
+
+
+async def test_ingest_item_missing_title_is_422(client: AsyncClient, auth_headers):
+    r = await client.post(
+        "/api/v1/uploads/ingest-item", json={"body": "no title"}, headers=auth_headers
+    )
+    assert r.status_code == 422
 ```
 
-- [ ] **4.2** Add `POST /api/v1/uploads/ingest-item` to `uploads.py`:
+- [x] **4.2** Add `POST /api/v1/uploads/ingest-item` to `uploads.py`:
+
+> [plan-fix] vs the original block:
+> - `get_scoped_viewer`, not `get_current_viewer` — the admin visibility bypass
+>   is only reachable under /api/v1/admin/* (Phase 1 standard, kb-visibility rule 5).
+> - `run_pending_graph_ops(db)` after the commit — create/update queue the Neo4j
+>   vertex sync on the session; the original block never drained it (ADR-011,
+>   nodes.py standard).
+> - `IngestItemIn(NodeCreate)` adds the `tags` field and passes it to IngestItem —
+>   NodeCreate has no tags field, so Confluence labels sent by the sync engine
+>   would have been dropped silently.
+> - Typed return + `NodeOut.model_validate(node)` (never return ORM objects) and
+>   summary/operation_id, per kb-api-conventions.
 
 ```python
 # backend/app/api/v1/uploads.py  (add after existing routes)
 from app.schemas.node import NodeCreate, NodeOut
+from app.services import node_service as ns
 from app.services.ingest.base import IngestItem, KnowledgeIngestor
 
 
-@router.post("/ingest-item", response_model=NodeOut)
+class IngestItemIn(NodeCreate):
+    """NodeCreate + `tags` — Confluence labels arrive as tags [plan-fix]."""
+
+    tags: list[str] = Field(default_factory=list)
+
+
+@router.post(
+    "/ingest-item",
+    response_model=NodeOut,
+    summary="Upsert a single knowledge node from an external source",
+    operation_id="ingestSingleItem",
+)
 async def ingest_single_item(
-    payload: NodeCreate,
-    viewer: Viewer = Depends(get_current_viewer),
+    payload: IngestItemIn,
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    """
-    Upsert a single knowledge node from an external source (Confluence CLI, codebase scanner).
-    Idempotent: same source+source_ref → same node.
+) -> NodeOut:
+    """Upsert a single knowledge node from an external source (Confluence CLI,
+    codebase scanner). Idempotent: same source+source_ref → same node.
     """
     item = IngestItem(
         source=payload.source or "api",
@@ -849,21 +912,28 @@ async def ingest_single_item(
         body=payload.body,
         node_type=payload.node_type,
         visibility=payload.visibility,
+        tags=payload.tags,
         meta=payload.meta,
     )
     ingestor = KnowledgeIngestor(db, viewer)
     node = await ingestor.upsert(item)
     await db.commit()
-    return node
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
+    return NodeOut.model_validate(node)
 ```
 
-- [ ] **4.3** Run tests:
+> Note (not fixed here): the Task 3 sync engine counts `created` only on a 201,
+> but this endpoint returns 200 for create and update alike (the ingestor does
+> not report which branch it took) — first syncs will log created=0/updated=N.
+> Cosmetic only; revisit if SyncResult accuracy ever matters.
+
+- [x] **4.3** Run tests:
 ```bash
 cd backend && pytest tests/api/test_ingest_item_api.py -v
-# Expected: 2 passed
+# Expected: 5 passed  [plan-fix: was 2 — 401/422/tags tests added in 4.1]
 ```
 
-- [ ] **4.4** Commit:
+- [x] **4.4** Commit:
 ```
 feat(api): POST /api/v1/uploads/ingest-item — single-item upsert for CLI tools
 ```
