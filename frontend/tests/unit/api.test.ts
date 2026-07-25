@@ -1,6 +1,6 @@
 // frontend/tests/unit/api.test.ts
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { fetchNodes, fetchNode, searchNodes } from "@/lib/api"
+import { fetchNodes, fetchNode, searchNodes, fetchAdminStats } from "@/lib/api"
 
 // Mock fetch globally
 const mockFetch = vi.fn()
@@ -20,6 +20,36 @@ describe("fetchNodes", () => {
       expect.objectContaining({ credentials: "include" })
     )
     expect(result.total).toBe(0)
+  })
+})
+
+describe("fetchAdminStats", () => {
+  it("calls /api/v1/admin/stats with credentials and returns stats", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        total_users: 3,
+        active_users: 2,
+        total_nodes: 10,
+        total_chunks: 42,
+        total_audit_events: 7,
+      }),
+    })
+    const stats = await fetchAdminStats()
+    expect(mockFetch).toHaveBeenCalledWith(
+      "/api/v1/admin/stats",
+      expect.objectContaining({ credentials: "include" })
+    )
+    expect(stats.total_nodes).toBe(10)
+  })
+
+  it("throws on 403 (non-admin)", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 403,
+      text: async () => "admin required",
+    })
+    await expect(fetchAdminStats()).rejects.toThrow("API 403")
   })
 })
 

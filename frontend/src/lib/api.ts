@@ -1,5 +1,5 @@
 // frontend/src/lib/api.ts
-import type { KBNode, NodeListOut, SearchOut, GraphData } from "./types"
+import type { KBNode, NodeListOut, SearchOut, GraphData, AdminStats } from "./types"
 
 const BASE = "/api/v1"
 
@@ -52,6 +52,10 @@ export async function fetchGraphOverview(limit = 100): Promise<GraphData> {
 
 export async function fetchNeighborhood(nodeId: string, hops = 1): Promise<GraphData> {
   return apiFetch(`/graph/neighborhood/${nodeId}?hops=${hops}`)
+}
+
+export async function fetchAdminStats(): Promise<AdminStats> {
+  return apiFetch("/admin/stats")
 }
 
 export async function upsertDailyLog(date: string, body: string): Promise<KBNode> {

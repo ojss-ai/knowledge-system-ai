@@ -8,4 +8,9 @@ describe("page modules", () => {
     const mod = await import("@/app/login/page")
     expect(typeof mod.default).toBe("function")
   })
+
+  it("admin page exists as a module", async () => {
+    const mod = await import("@/app/admin/page")
+    expect(typeof mod.default).toBe("function")
+  })
 })

@@ -1393,22 +1393,20 @@ async def list_audit_logs(
 
 - [x] **6.4** ~~Register in `main.py`~~ *([plan-fix]: the admin package router is already registered in `create_app()` since phase-1 — the new modules are included via `admin/__init__.py` instead)*
 
-- [ ] **6.5** Create admin frontend page:
+- [x] **6.5** Create admin frontend page: *([plan-fix]: plan's raw `fetch()` violates kb-conventions/ADR-013 — added `AdminStats` to `lib/types.ts` and `fetchAdminStats()` to the typed client `lib/api.ts`, with vitest coverage (api client + page module))*
 
 ```typescript
 // frontend/src/app/admin/page.tsx
 "use client"
 import { useQuery } from "@tanstack/react-query"
 import Sidebar from "@/components/Sidebar"
-
-async function fetchStats() {
-  const r = await fetch("/api/v1/admin/stats", { credentials: "include" })
-  if (!r.ok) throw new Error("Not authorized")
-  return r.json()
-}
+import { fetchAdminStats } from "@/lib/api"
 
 export default function AdminPage() {
-  const { data, isLoading, error } = useQuery({ queryKey: ["admin-stats"], queryFn: fetchStats })
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["admin-stats"],
+    queryFn: fetchAdminStats,
+  })
 
   return (
     <div className="flex h-screen">
@@ -1439,15 +1437,19 @@ export default function AdminPage() {
 }
 ```
 
-- [ ] **6.6** Run tests:
+- [x] **6.6** Run tests:
 ```bash
 cd backend && pytest tests/api/test_admin_api.py -v
-# Expected: 3 passed
+# Actual: 9 passed ([plan-fix]: 3 planned + 401, soft-delete count, filter/
+# pagination, requires-admin on audit-logs, and 2 carry-over audit tests)
+cd frontend && npx vitest run && npx tsc --noEmit
+# Actual: 23 passed (7 files), tsc clean
 ```
 
-- [ ] **6.7** Commit:
+- [x] **6.7** Commit:
 ```
-feat(admin): GET /api/v1/admin/stats, /audit-logs, /users + admin dashboard page
+feat(admin): GET /api/v1/admin/stats + /audit-logs with audited admin reads   (8003477)
+feat(admin): dashboard page + typed fetchAdminStats client
 ```
 
 ---
