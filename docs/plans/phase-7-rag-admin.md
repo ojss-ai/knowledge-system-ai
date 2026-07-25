@@ -732,6 +732,7 @@ class AuditLog(Base):
 # backend/app/services/audit_service.py
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -739,6 +740,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AuditLog
 from app.services.visibility import Viewer
+
+_META_MAX_BYTES = 4096  # [3.R.1] cap serialized meta; audit rows must stay small
+
+
+def _cap_meta(meta: dict[str, Any] | None) -> dict[str, Any]:
+    """Bound `meta` to ~4KB serialized [3.R.1]. Oversized payloads → marker dict
+    with a UTF-8-safe preview (audit trail, not a payload store)."""
+    if not meta:
+        return {}
+    serialized = json.dumps(meta, default=str)
+    if len(serialized.encode("utf-8")) <= _META_MAX_BYTES:
+        return meta
+    preview = serialized.encode("utf-8")[: _META_MAX_BYTES - 64].decode("utf-8", errors="ignore")
+    return {"truncated": True, "preview": preview}
 
 
 async def log(
@@ -752,6 +767,12 @@ async def log(
     user_agent: str | None = None,
     meta: dict[str, Any] | None = None,
 ) -> None:
+    """Append an audit entry (committed with the caller's transaction).
+
+    [3.R.1] `meta` is stored verbatim in JSONB and surfaced on admin dashboards:
+    do NOT put secrets or PII in it — Task 6 admin reads pass cross-user data
+    through here, so keep meta to ids/titles/counts. >~4KB → truncation marker.
+    """
     entry = AuditLog(
         id=uuid.uuid4(),
         actor_id=viewer.user_id if viewer else None,
@@ -760,7 +781,7 @@ async def log(
         resource_id=resource_id,
         ip_address=ip_address,
         user_agent=user_agent,
-        meta=meta or {},
+        meta=_cap_meta(meta),
     )
     db.add(entry)
     # Non-blocking: do not flush here — caller's transaction commits it
@@ -832,6 +853,14 @@ pytest tests/services/test_audit_service.py -v
 ```
 feat(audit): AuditLog model + migration 0006 + audit_service.log()
 ```
+
+### 3.R Review fixes (post-commit 6d91af5)
+
+- [x] **3.R.1** (NIT) `audit_service.log()` now caps `meta`: JSON-serialized payloads over
+  4KB are replaced with `{"truncated": True, "preview": <first ~4KB>}` (`_cap_meta`), and
+  the docstring warns against putting secrets/PII in `meta` — Task 6 admin reads will pass
+  cross-user data through this path. Tested: oversized meta gets the marker + stays ≤ ~4KB;
+  small meta is stored verbatim.
 
 > **Carry-over from phase-1 Task 8 (now actionable):** the audit mechanism exists as of
 > this task, but nothing calls it yet. Task 6 (admin API) MUST call
