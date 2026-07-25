@@ -2116,6 +2116,17 @@ feat(api): POST /api/v1/uploads/markdown (202 + Celery), GET /runs/:id, WS progr
 
 ## Task 6 — Service token API
 
+> [plan-fix] vs the original blocks:
+> - `get_scoped_viewer`, not `get_current_viewer` — the admin visibility bypass is
+>   only reachable under `/api/v1/admin/*` (Phase 1 standard, Task 5 precedent).
+> - Revoking another user's token answers a generic **404** (invisible ==
+>   nonexistent, get_run standard), not the plan's 403 — a 403 confirms the token
+>   id exists. `ForbiddenError` dropped.
+> - `ApiToken.revoked == False` → `.is_(False)` (ruff E712).
+> - Typed `viewer: Viewer`, return annotations, `summary`/`operation_id` per
+>   kb-api-conventions; checklist tests (401, cross-user 404, 422) and
+>   hashed-at-rest assertions added; `pytestmark` dropped (asyncio_mode="auto").
+
 **Files:**
 - Create: `backend/app/api/v1/tokens.py`
 - Modify: `backend/app/main.py`
@@ -2123,14 +2134,17 @@ feat(api): POST /api/v1/uploads/markdown (202 + Celery), GET /runs/:id, WS progr
 
 ### Steps
 
-- [ ] **6.1** Write failing tests:
+- [x] **6.1** Write failing tests:
 
 ```python
 # backend/tests/api/test_tokens_api.py
-import pytest
-from httpx import AsyncClient
+import uuid
 
-pytestmark = pytest.mark.asyncio
+from argon2 import PasswordHasher
+from httpx import AsyncClient
+from sqlalchemy import select
+
+from app.models.ingest import ApiToken
 
 
 async def test_create_token(client: AsyncClient, auth_headers):
@@ -2145,21 +2159,41 @@ async def test_create_token(client: AsyncClient, auth_headers):
     assert "id" in data
 
 
+async def test_create_token_stores_hash_not_plaintext(client: AsyncClient, auth_headers, db):
+    r = await client.post(
+        "/api/v1/tokens", json={"name": "hashed", "scopes": ["read"]}, headers=auth_headers
+    )
+    raw = r.json()["token"]
+    row = await db.scalar(select(ApiToken).where(ApiToken.id == uuid.UUID(r.json()["id"])))
+    assert row.token_hash != raw
+    PasswordHasher().verify(row.token_hash, raw)  # raises on mismatch
+
+
 async def test_list_tokens(client: AsyncClient, auth_headers):
-    await client.post("/api/v1/tokens", json={"name": "t1", "scopes": ["read"]}, headers=auth_headers)
+    await client.post(
+        "/api/v1/tokens", json={"name": "t1", "scopes": ["read"]}, headers=auth_headers
+    )
     r = await client.get("/api/v1/tokens", headers=auth_headers)
     assert r.status_code == 200
     assert len(r.json()) >= 1
+    # plus: no "token"/"token_hash" keys in list items (see the test file)
 
 
 async def test_revoke_token(client: AsyncClient, auth_headers):
-    r = await client.post("/api/v1/tokens", json={"name": "t2", "scopes": ["read"]}, headers=auth_headers)
+    r = await client.post(
+        "/api/v1/tokens", json={"name": "t2", "scopes": ["read"]}, headers=auth_headers
+    )
     tid = r.json()["id"]
     r2 = await client.delete(f"/api/v1/tokens/{tid}", headers=auth_headers)
     assert r2.status_code == 204
+
+
+# plus checklist tests (see backend/tests/api/test_tokens_api.py):
+# 401 unauthenticated on all three endpoints; 422 missing name;
+# cross-user list isolation; cross-user/missing revoke → generic 404.
 ```
 
-- [ ] **6.2** Create `tokens.py`:
+- [x] **6.2** Create `tokens.py`:
 
 ```python
 # backend/app/api/v1/tokens.py
@@ -2176,8 +2210,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import get_current_viewer
-from app.core.errors import ForbiddenError, NotFoundError
+from app.core.deps import Viewer, get_scoped_viewer
+from app.core.errors import NotFoundError
 from app.models.ingest import ApiToken
 
 router = APIRouter(prefix="/tokens", tags=["tokens"])
@@ -2206,12 +2240,18 @@ class TokenOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-@router.post("", response_model=TokenCreated, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=TokenCreated,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a service token (raw token shown once)",
+    operation_id="createToken",
+)
 async def create_token(
     payload: TokenCreate,
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
+) -> TokenCreated:
     raw = secrets.token_urlsafe(32)
     token = ApiToken(
         id=uuid.uuid4(),
@@ -2225,46 +2265,56 @@ async def create_token(
     return TokenCreated(id=token.id, name=token.name, scopes=token.scopes, token=raw)
 
 
-@router.get("", response_model=list[TokenOut])
+@router.get(
+    "",
+    response_model=list[TokenOut],
+    summary="List my active service tokens",
+    operation_id="listTokens",
+)
 async def list_tokens(
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
+) -> list[TokenOut]:
     rows = await db.scalars(
-        select(ApiToken).where(ApiToken.owner_id == viewer.user_id, ApiToken.revoked == False)
+        select(ApiToken).where(ApiToken.owner_id == viewer.user_id, ApiToken.revoked.is_(False))
     )
-    return list(rows)
+    return [TokenOut.model_validate(row) for row in rows]
 
 
-@router.delete("/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{token_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a service token",
+    operation_id="revokeToken",
+)
 async def revoke_token(
     token_id: uuid.UUID,
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
+) -> None:
     token = await db.scalar(select(ApiToken).where(ApiToken.id == token_id))
-    if token is None:
+    if token is None or token.owner_id != viewer.user_id:
+        # Generic body: invisible == nonexistent, nothing confirmed either way.
         raise NotFoundError("Token not found")
-    if token.owner_id != viewer.user_id:
-        raise ForbiddenError("Not your token")
     token.revoked = True
     await db.commit()
 ```
 
-- [ ] **6.3** Register in `main.py`:
+- [x] **6.3** Register in `main.py` ([plan-fix] `from … import router as …` — the
+  file's established import style):
 ```python
-from app.api.v1 import tokens as tokens_router
-app.include_router(tokens_router.router, prefix="/api/v1")
+from app.api.v1.tokens import router as tokens_router
+app.include_router(tokens_router, prefix="/api/v1")
 ```
 
-- [ ] **6.4** Run all tests + full gate:
+- [x] **6.4** Run all tests + full gate:
 ```bash
 cd backend && pytest tests/ -v --tb=short
 ruff check .
 mypy --strict app/services/ app/schemas/
 ```
 
-- [ ] **6.5** Commit:
+- [x] **6.5** Commit:
 ```
 feat(api): POST/GET/DELETE /api/v1/tokens — service token management
 ```
