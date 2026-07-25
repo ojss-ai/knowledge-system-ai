@@ -10,12 +10,16 @@
 - `kb-frontend-graph` — BFF pattern, one graphology instance, FA2 in web worker, progressive loading
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `npm run build` in `frontend/` exits 0
-- [ ] `npx vitest run` green
-- [ ] `npx playwright test` green (3 e2e tests)
-- [ ] `npm run lint` (ESLint + tsc --noEmit) clean
-- [ ] Graph canvas renders in browser without console errors
+- [x] All tasks checked
+- [x] `npm run build` exits 0 (sandbox: with a local Inter stub because
+  fonts.googleapis.com is blocked there; committed code keeps `next/font/google` —
+  re-run `npm run build` once on a normal network to confirm)
+- [x] `npx vitest run` green — 7 files / 20 tests
+- [x] `npx playwright test` — 6 passed, 1 skipped in sandbox (canvas test needs
+  Neo4j; expect 7 passed on the Docker stack, no E2E_SKIP_NEO4J)
+- [x] `npm run lint` (ESLint + tsc --noEmit) clean
+- [ ] Graph canvas renders in browser without console errors — **requires Neo4j;
+  verify on the Docker stack** (`make up api` + `npm run dev`, open /graph)
 
 ---
 
