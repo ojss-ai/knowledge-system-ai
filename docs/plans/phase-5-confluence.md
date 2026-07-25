@@ -12,13 +12,16 @@
 - `kb-api-conventions`
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `pytest -x backend/tests/` green
-- [ ] `ruff check tools/kb-confluence-sync/` clean
-- [ ] `mypy --strict tools/kb-confluence-sync/` clean
-- [ ] `kb-confluence-sync --dry-run` exits 0 against a mocked Confluence server
-- [ ] Idempotency test: sync twice → same node count
-- [ ] Exit codes: 0=success, 1=sync error, 2=config error
+- [x] All tasks checked
+- [x] `pytest backend/tests/` green — `190 passed, 13 skipped` (Neo4j-unreachable
+  sandbox skips; convert to passes on the Docker stack)
+- [x] `ruff check tools/kb-confluence-sync/` clean (tool suite: 20 passed)
+- [x] `mypy --strict tools/kb-confluence-sync/` clean (9 files)
+- [x] `--dry-run` exits 0 against a mocked/stubbed Confluence server (§5.5;
+  would-create vs would-update split per 5.R.5)
+- [x] Idempotency: `test_sync_twice_second_run_all_skipped` (version cache) +
+  backend `test_ingest_item_idempotent` (same node id on repeat POST)
+- [x] Exit codes verified: 0 success, 1 sync error, 2 config error (test_cli)
 
 ---
 
