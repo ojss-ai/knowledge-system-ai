@@ -45,6 +45,7 @@ import io
 import uuid
 import zipfile
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -270,7 +271,7 @@ async def ingest_batch(
             )
         )
     for e in payload.edges:
-        props: dict = {"score": e.confidence} if e.confidence is not None else {}
+        props: dict[str, Any] = {"score": e.confidence} if e.confidence is not None else {}
         ingestor.add_edge_spec(
             EdgeSpec(source_ref=e.source_ref, target_ref=e.target_ref, label=e.label, props=props)
         )
