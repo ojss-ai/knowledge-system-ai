@@ -610,6 +610,10 @@ def test_sync_twice_second_run_all_skipped(tmp_path: Path) -> None:
 > (mypy strict forbids returning `Any`); `sync_all` annotates `results`; dropped the dead
 > `r = self._kb_session.get(/api/v1/nodes...)` existence check (F841 — its response was never
 > read; the ingest-item endpoint owns upsert semantics per Task 4).
+>
+> **[review-fix 5.R.4/5.R.5]** block updated in place: `_load_cache` self-heals on a
+> corrupt/unreadable cache file (warn + empty cache), and the dry-run branch splits
+> would-create vs would-update using the local version cache.
 
 ```python
 # tools/kb-confluence-sync/sync_engine.py
@@ -679,6 +683,15 @@ class SyncEngine:
                 cache: dict[str, int] = json.load(f)
                 return cache
         except FileNotFoundError:
+            return {}  # first run — silent
+        except (json.JSONDecodeError, OSError) as exc:
+            # [review-fix 5.R.4] self-healing: a truncated/garbage/unreadable
+            # cache must not brick the tool. Worst case every page re-syncs —
+            # the ingest-item endpoint is an idempotent upsert by source_ref.
+            logger.warning(
+                f"Version cache {self._config.version_cache_file!r} unreadable "
+                f"({exc}); starting with an empty cache — all pages will re-sync"
+            )
             return {}
 
     def _save_cache(self) -> None:
@@ -701,8 +714,15 @@ class SyncEngine:
                 continue
 
             if self._config.dry_run:
-                logger.info(f"[DRY RUN] Would sync: {page.title} (v{page.version})")
-                result.created += 1
+                # [review-fix 5.R.5] a cached page (older version) is a
+                # would-update; an uncached one a would-create. Best-effort from
+                # local knowledge only — dry run never asks the KB API.
+                if cache_key in self._version_cache:
+                    logger.info(f"[DRY RUN] Would update: {page.title} (v{page.version})")
+                    result.updated += 1
+                else:
+                    logger.info(f"[DRY RUN] Would create: {page.title} (v{page.version})")
+                    result.created += 1
                 continue
 
             try:
@@ -877,6 +897,10 @@ async def test_ingest_item_missing_title_is_422(client: AsyncClient, auth_header
 >   would have been dropped silently.
 > - Typed return + `NodeOut.model_validate(node)` (never return ORM objects) and
 >   summary/operation_id, per kb-api-conventions.
+> - **[review-fix 5.R.1]** `viewer` now comes from `Depends(_require_ingest_scope)`
+>   (module-level singleton of `deps.require_scope("ingest")` — ruff B008 forbids
+>   the factory call inline): service tokens must hold the `"ingest"` scope; JWT
+>   users carry `scopes=None` and pass implicitly. Block updated in place.
 
 ```python
 # backend/app/api/v1/uploads.py  (add after existing routes)
@@ -899,7 +923,9 @@ class IngestItemIn(NodeCreate):
 )
 async def ingest_single_item(
     payload: IngestItemIn,
-    viewer: Viewer = Depends(get_scoped_viewer),
+    # [review-fix 5.R.1] service tokens must hold the "ingest" scope; JWT users
+    # (scopes=None) pass implicitly. ApiToken.scopes was stored but never read.
+    viewer: Viewer = Depends(_require_ingest_scope),
     db: AsyncSession = Depends(get_db),
 ) -> NodeOut:
     """Upsert a single knowledge node from an external source (Confluence CLI,
@@ -1213,6 +1239,54 @@ mypy --strict *.py   # [plan-fix: covers cli.py and __main__.py too]
 ```
 feat(tools): kb-confluence-sync CLI — sync, dry-run, --json output, exit codes 0/1/2
 ```
+
+---
+
+### 5.R Review fixes (on commit eae45b1)
+
+- [x] **5.R.1 CRITICAL — ApiToken.scopes never enforced.** Tokens stored a
+  `scopes` list but no read path ever checked it: a `scopes=["read"]` token
+  could ingest. Smallest coherent design (approved): `Viewer` grows
+  `scopes: frozenset[str] | None = None` — `None` means "full-access
+  principal" (JWT users, SYSTEM_VIEWER, workers), a set means "service token
+  limited to exactly these". `_viewer_from_service_token` sets
+  `frozenset(row.scopes or ())` (empty list stays an empty set — no
+  capabilities, never all); the admin-downscope constructions in
+  `get_scoped_viewer`/`get_ws_viewer` propagate scopes. New
+  `deps.require_scope(scope)` dependency factory returns 403 on a missing
+  scope; `POST /api/v1/uploads/ingest-item` requires `"ingest"` via a
+  module-level `_require_ingest_scope` singleton (ruff B008). Tests:
+  `scopes=["read"]` → 403, `scopes=["ingest"]` → 200, JWT user unaffected
+  (test_service_token_auth.py). **Documented default:** `TokenCreate.scopes`
+  defaults to `["read"]` (tokens.py) — kept deliberately, least privilege: a
+  token created without explicit scopes CANNOT ingest; the CLI setup docs and
+  tests request `["ingest"]` explicitly.
+- [x] **5.R.2 IMPORTANT — timing side-channel on token lookup.** The
+  not-found/revoked/expired branches returned before any argon2 work, so a 401
+  in microseconds (vs ~50 ms for a live id) was an oracle for enumerating
+  token ids. Fix: module-level `_DUMMY_HASH`; those branches verify the
+  presented token against it and discard the (expected) mismatch, equalizing
+  cost. Test pins that the not-found branch calls `verify` exactly once.
+- [x] **5.R.3 IMPORTANT — corrupt stored hash was a 500.** argon2 raises
+  `InvalidHashError` (NOT a `VerificationError` subclass) when `token_hash` is
+  malformed; it escaped as a server error. Both verify sites now catch
+  `(VerificationError, InvalidHashError)` → 401 (`VerifyMismatchError` is a
+  `VerificationError` subclass, already covered). Test corrupts the row
+  in-place and asserts 401.
+- [x] **5.R.4 IMPORTANT — corrupt version cache crashed the tool.**
+  `sync_engine._load_cache` only caught `FileNotFoundError`; a truncated or
+  unreadable `.confluence_versions.json` raised at construction. Now catches
+  `(json.JSONDecodeError, OSError)` → warn + start empty (self-healing: worst
+  case a full re-sync, and ingest-item is an idempotent upsert). Tests: garbage
+  JSON and cache-path-is-a-directory both start empty with a warning.
+- [x] **5.R.5 NIT — dry run splits would-create vs would-update.** Dry run
+  counted every unskipped page as `created`; it now reports `updated` for
+  pages present in the local version cache at a different version (best-effort
+  from local knowledge — dry run still makes zero KB API calls). The Task 4.2
+  note about 200-vs-201 in REAL syncs stands unchanged.
+
+New test counts: `test_sync_engine.py` 4 → 7, `test_service_token_auth.py`
+5 → 10 (tool suite 20, backend suite 190 passed / 13 skipped).
 
 ---
 
