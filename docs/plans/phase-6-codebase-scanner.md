@@ -11,13 +11,14 @@
 - `kb-celery-jobs` (for the background dispatch path)
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `python -m pytest tools/kb-codebase-scan/tests/` green
-- [ ] `ruff check tools/kb-codebase-scan/` clean
-- [ ] `mypy --strict tools/kb-codebase-scan/` clean
-- [ ] `kb-codebase-scan --dry-run` exits 0 on the backend/ directory itself
-- [ ] Incremental scan: run twice on same repo → second run shows 0 new nodes
-- [ ] Exit codes: 0=success, 1=scan error, 2=config error
+- [x] All tasks checked (Task 4 re-planned as 4a/4b, human-approved 2026-07-25)
+- [x] `python -m pytest tools/kb-codebase-scan/tests/` green — 26 passed
+- [x] `ruff check tools/kb-codebase-scan/` clean
+- [x] `mypy --strict tools/kb-codebase-scan/` clean (7 modules)
+- [x] `--dry-run` exits 0 on backend/ (§5.4: 558 items, exit 0)
+- [x] Incremental: second run → 0 new (§5.4)
+- [x] Exit codes verified 0/1/2 (test_cli)
+- Backend suite after 4a: 205 passed, 13 skipped (Neo4j sandbox skips)
 
 ---
 
