@@ -52,3 +52,34 @@ def test_non_md_files_skipped():
     items, _ = parse_zip(zip_bytes, source="md_upload")
     assert len(items) == 1
     assert items[0].title == "Doc"
+
+
+def _zip_of(files: dict[str, str]) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, body in files.items():
+            zf.writestr(name, body)
+    return buf.getvalue()
+
+
+def test_empty_h1_falls_back_to_filename():
+    """An H1 of pure whitespace must not produce an empty title."""
+    items, _ = parse_zip(_zip_of({"meeting-notes.md": "#   \n\nbody text"}))
+    assert items[0].title == "Meeting Notes"
+
+
+def test_duplicate_titles_resolve_first_wins_deterministically():
+    """Two files with the same H1: wikilinks resolve to the FIRST (zip order),
+    deterministically — never silently to whichever was processed last."""
+    files = {
+        "a-first.md": "# Meeting Notes\n\nfirst",
+        "b-second.md": "# Meeting Notes\n\nsecond",
+        "linker.md": "# Linker\n\nsee [[Meeting Notes]]",
+    }
+    items, edges = parse_zip(_zip_of(files))
+    links = [e for e in edges if e.source_ref == "linker.md"]
+    assert len(links) == 1
+    assert links[0].target_ref == "a-first.md"

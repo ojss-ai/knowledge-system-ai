@@ -11,10 +11,16 @@ import re
 import zipfile
 from pathlib import Path
 
+import structlog
+
 from app.services.ingest.base import EdgeSpec, IngestItem
 
+logger = structlog.get_logger(__name__)
+
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
-_HEADING_RE = re.compile(r"^#\s+(.+)", re.MULTILINE)
+# [ \t] not \s: \s matches newlines, so "#   \n\nbody" would swallow the blank
+# line and title itself "body" (review CRITICAL — empty-H1 fallback broken).
+_HEADING_RE = re.compile(r"^#[ \t]+(.+)", re.MULTILINE)
 
 
 def extract_wikilinks(body: str) -> list[str]:
@@ -22,9 +28,13 @@ def extract_wikilinks(body: str) -> list[str]:
 
 
 def _title_from_body_or_filename(body: str, filename: str) -> str:
-    """Extract first H1 heading as title, fall back to filename stem."""
+    """Extract first H1 heading as title, fall back to filename stem.
+
+    A whitespace-only H1 ("#   ") must fall through to the filename —
+    nodes must never be created with an empty title (review CRITICAL).
+    """
     m = _HEADING_RE.search(body)
-    if m:
+    if m and m.group(1).strip():
         return m.group(1).strip()
     return Path(filename).stem.replace("-", " ").replace("_", " ").title()
 
@@ -49,7 +59,9 @@ def parse_zip(
         for name in md_files:
             try:
                 body = zf.read(name).decode("utf-8", errors="replace")
-            except Exception:
+            except Exception as exc:
+                # Skip unreadable members, but never silently (review IMPORTANT)
+                logger.warning("md_import_unreadable_member", member=name, error=str(exc))
                 continue
 
             title = _title_from_body_or_filename(body, name)
@@ -60,7 +72,18 @@ def parse_zip(
                 body=body,
             )
             items.append(item)
-            title_to_ref[title] = name
+            # First-wins on duplicate titles: deterministic wikilink resolution
+            # (review CRITICAL — last-wins silently rebound links to whichever
+            # file happened to be processed last).
+            if title in title_to_ref:
+                logger.warning(
+                    "md_import_duplicate_title",
+                    title=title,
+                    kept=title_to_ref[title],
+                    ignored=name,
+                )
+            else:
+                title_to_ref[title] = name
 
     # Second pass: resolve wikilinks to source_refs
     for item in items:

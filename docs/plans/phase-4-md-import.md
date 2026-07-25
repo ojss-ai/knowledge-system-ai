@@ -777,7 +777,8 @@ from pathlib import Path
 from app.services.ingest.base import EdgeSpec, IngestItem
 
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
-_HEADING_RE = re.compile(r"^#\s+(.+)", re.MULTILINE)
+# [ \t] not \s: \s matches newlines ("#   \n\nbody" would title itself "body")
+_HEADING_RE = re.compile(r"^#[ \t]+(.+)", re.MULTILINE)
 
 
 def extract_wikilinks(body: str) -> list[str]:
@@ -787,7 +788,7 @@ def extract_wikilinks(body: str) -> list[str]:
 def _title_from_body_or_filename(body: str, filename: str) -> str:
     """Extract first H1 heading as title, fall back to filename stem."""
     m = _HEADING_RE.search(body)
-    if m:
+    if m and m.group(1).strip():  # whitespace-only H1 falls back to filename
         return m.group(1).strip()
     return Path(filename).stem.replace("-", " ").replace("_", " ").title()
 
@@ -823,7 +824,10 @@ def parse_zip(
                 body=body,
             )
             items.append(item)
-            title_to_ref[title] = name
+            # First-wins on duplicate titles (deterministic wikilink resolution);
+            # duplicates and unreadable members are logged, never silent.
+            if title not in title_to_ref:
+                title_to_ref[title] = name
 
     # Second pass: resolve wikilinks to source_refs
     for item in items:
