@@ -1583,99 +1583,141 @@ feat(tools): CodebaseScanner — ingest-batch upserts, DEFINES file→symbol, CA
 ## Task 5 — CLI entrypoint
 
 **Files:**
+- Create: `tools/kb-codebase-scan/cli.py` ([plan-fix] implementation; `__main__.py` is a shim, mirroring `tools/kb-confluence-sync`)
 - Create: `tools/kb-codebase-scan/__main__.py`
 - Create: `tools/kb-codebase-scan/pyproject.toml`
 - Create: `tools/kb-codebase-scan/tests/test_cli.py`
 
+> **[plan-fix] block sync (Task 5):** blocks below updated to match the committed code, mirroring the
+> Phase 5 kb-confluence-sync [plan-fix]es: flat-module layout → no `kb_codebase_scan` package to
+> `python -m` (CLI runs as `python __main__.py`, the exit-gate invocation); implementation lives in
+> `cli.py` because a console script cannot target a module named `__main__`; test paths resolved from
+> `__file__` (the 5.1 block's `cwd`/`--repo` were relative to the repo root, but pytest runs from the
+> tool dir); env scrubbed of `KB_*` for deterministic exit-code tests; dry-run runs WITHOUT a token
+> (the 5.1 block exported a fake token it never needed); `test_dry_run_on_self` scans a tmp copy of
+> the tool's own sources so the hash cache never lands in the working tree. `.codebase_scan_cache.json`
+> added to the root `.gitignore` (scanning a repo inside this repo writes the cache next to it).
+
 ### Steps
 
-- [ ] **5.1** Write failing tests:
+- [x] **5.1** Write failing tests:
 
 ```python
 # tools/kb-codebase-scan/tests/test_cli.py
-import subprocess, sys
+"""CLI entrypoint tests (Task 5). [plan-fix] — see block-sync note above."""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TOOL_DIR = Path(__file__).resolve().parents[1]
+# `python` from PATH first: sys.executable may be a loader-wrapped binary that
+# cannot be exec'd directly (sandbox py312); PATH carries the working wrapper.
+PYTHON = shutil.which("python") or sys.executable
 
 
-def run_cli(*args):
+def run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    base_env = {k: v for k, v in os.environ.items() if not k.startswith("KB_")}
+    if env:
+        base_env.update(env)
     return subprocess.run(
-        [sys.executable, "-m", "__main__", *args],
-        capture_output=True, text=True,
-        cwd="tools/kb-codebase-scan",
+        [PYTHON, "__main__.py", *args],
+        capture_output=True,
+        text=True,
+        cwd=TOOL_DIR,
+        env=base_env,
     )
 
 
-def test_help():
+def copy_own_sources(tmp_path: Path) -> Path:
+    """The scanner's own directory, minus caches — dry-run on real code."""
+    repo = tmp_path / "self"
+    repo.mkdir()
+    for src in TOOL_DIR.glob("*.py"):
+        shutil.copy(src, repo / src.name)
+    return repo
+
+
+def test_help_exits_0() -> None:
     r = run_cli("--help")
     assert r.returncode == 0
+    assert "usage" in r.stdout.lower()
 
 
-def test_missing_repo_exits_2():
+def test_missing_repo_exits_2() -> None:
     r = run_cli("scan", "--repo", "/nonexistent/path/xyz")
     assert r.returncode == 2
+    assert "does not exist" in r.stderr
 
 
-def test_dry_run_on_self(tmp_path):
-    """Scan the scanner's own directory in dry-run mode."""
-    import os
-    r = subprocess.run(
-        [sys.executable, "-m", "__main__", "scan",
-         "--repo", "tools/kb-codebase-scan",
-         "--dry-run", "--language", "python"],
-        capture_output=True, text=True,
-        env={**os.environ, "KB_API_TOKEN": "fake"},
-    )
-    assert r.returncode == 0
+def test_missing_token_without_dry_run_exits_2(tmp_path: Path) -> None:
+    r = run_cli("scan", "--repo", str(tmp_path))
+    assert r.returncode == 2
+    assert "KB_API_TOKEN" in r.stderr
+
+
+def test_dry_run_on_self(tmp_path: Path) -> None:
+    """Scan the scanner's own sources in dry-run mode — no token required."""
+    repo = copy_own_sources(tmp_path)
+    r = run_cli("scan", "--repo", str(repo), "--dry-run", "--language", "python")
+    assert r.returncode == 0, r.stderr
+    assert "Scan complete:" in r.stdout
+
+
+def test_dry_run_json_output(tmp_path: Path) -> None:
+    repo = copy_own_sources(tmp_path)
+    r = run_cli("scan", "--repo", str(repo), "--dry-run", "--language", "python", "--json")
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert data["total"] > 0
+    assert set(data) == {"total", "new", "updated", "failed"}
 ```
 
-- [ ] **5.2** Create `__main__.py`:
+- [x] **5.2** Create `cli.py` (+ `__main__.py` shim `from cli import main`):
 
 ```python
-# tools/kb-codebase-scan/__main__.py
-"""
-kb-codebase-scan — Codebase knowledge graph generator.
+# tools/kb-codebase-scan/cli.py
+"""kb-codebase-scan — Codebase knowledge graph generator.
 
 Usage:
-    python -m kb_codebase_scan scan --repo /path/to/repo [--dry-run]
+    python __main__.py scan --repo /path/to/repo [--dry-run]
+    kb-codebase-scan scan --repo /path/to/repo [--dry-run]   (pip-installed)
 
-Environment variables:
+Environment variables (or .env file):
     KB_API_URL      http://localhost:8000
-    KB_API_TOKEN    Service token
+    KB_API_TOKEN    Service token from /api/v1/tokens
     SCAN_LANGUAGES  python,typescript  (default)
 
-Exit codes: 0=success, 1=scan error, 2=config error
+Exit codes:
+    0  Success
+    1  Scan error (failed batches or crash)
+    2  Configuration error
 """
+
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 from pathlib import Path
 
+from repo_walker import ScanConfig
+from scanner import CodebaseScanner
 
-def main() -> None:
-    parser = argparse.ArgumentParser(prog="kb-codebase-scan")
-    sub = parser.add_subparsers(dest="command")
+try:
+    from dotenv import load_dotenv
+except ImportError:  # python-dotenv is optional — env vars still work
+    pass
+else:
+    load_dotenv()
 
-    scan = sub.add_parser("scan", help="Scan a repository")
-    scan.add_argument("--repo", required=True, help="Path to repository root")
-    scan.add_argument("--dry-run", action="store_true")
-    scan.add_argument("--language", dest="languages", action="append",
-                      help="Languages to scan (python, typescript). Repeatable.")
-    scan.add_argument("--visibility", default="private")
-    scan.add_argument("--json", action="store_true")
-    scan.add_argument("--verbose", "-v", action="store_true")
 
-    args = parser.parse_args()
-    if args.command is None:
-        parser.print_help()
-        sys.exit(0)
-
-    if args.verbose:
-        logging.basicConfig(level=logging.DEBUG)
-    else:
-        logging.basicConfig(level=logging.INFO)
-
+def build_config(args: argparse.Namespace) -> ScanConfig:
     repo_path = Path(args.repo).resolve()
     if not repo_path.exists():
         print(f"ERROR: Repo path does not exist: {repo_path}", file=sys.stderr)
@@ -1683,17 +1725,15 @@ def main() -> None:
 
     kb_token = os.environ.get("KB_API_TOKEN", "")
     kb_url = os.environ.get("KB_API_URL", "http://localhost:8000")
-
     if not args.dry_run and not kb_token:
         print("ERROR: KB_API_TOKEN is required (or use --dry-run)", file=sys.stderr)
         sys.exit(2)
 
-    languages = args.languages or os.environ.get("SCAN_LANGUAGES", "python,typescript").split(",")
+    languages: list[str] = args.languages or [
+        s.strip() for s in os.environ.get("SCAN_LANGUAGES", "python,typescript").split(",")
+    ]
 
-    from repo_walker import ScanConfig
-    from scanner import CodebaseScanner
-
-    config = ScanConfig(
+    return ScanConfig(
         repo_path=str(repo_path),
         languages=languages,
         dry_run=args.dry_run,
@@ -1702,21 +1742,60 @@ def main() -> None:
         visibility=args.visibility,
     )
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="kb-codebase-scan",
+        description="Scan a code repository into the Knowledge Base",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    scan = sub.add_parser("scan", help="Scan a repository")
+    scan.add_argument("--repo", required=True, help="Path to repository root")
+    scan.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    scan.add_argument(
+        "--language",
+        dest="languages",
+        action="append",
+        help="Languages to scan (python, typescript). Repeatable.",
+    )
+    scan.add_argument("--visibility", default="private")
+    scan.add_argument("--json", action="store_true", help="Output results as JSON")
+    scan.add_argument("--verbose", "-v", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    config = build_config(args)
     scanner = CodebaseScanner(config)
+
     try:
         result = scanner.run()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: Scan failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if args.json:
-        import json
-        print(json.dumps({
-            "total": result.total, "new": result.new_items,
-            "updated": result.updated_items, "failed": result.failed_files,
-        }))
+        print(
+            json.dumps(
+                {
+                    "total": result.total,
+                    "new": result.new_items,
+                    "updated": result.updated_items,
+                    "failed": result.failed_files,
+                }
+            )
+        )
     else:
-        print(f"Scan complete: {result.new_items} new, {result.updated_items} updated, {result.failed_files} failed")
+        print(
+            f"Scan complete: {result.new_items} new, {result.updated_items} updated, "
+            f"{result.failed_files} failed"
+        )
 
     sys.exit(1 if result.failed_files > 0 else 0)
 
@@ -1725,12 +1804,15 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **5.3** Create `pyproject.toml`:
+- [x] **5.3** Create `pyproject.toml`:
 
 ```toml
+# [plan-fix] vs the original 5.3 block (mirrors tools/kb-confluence-sync/pyproject.toml):
+# - build-backend "setuptools.backends.legacy:build" does not exist → setuptools.build_meta.
+# - Flat-module layout: modules via py-modules; console script targets cli:main.
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "kb-codebase-scan"
@@ -1746,22 +1828,50 @@ dependencies = [
 ]
 
 [project.scripts]
-kb-codebase-scan = "kb_codebase_scan.__main__:main"
+kb-codebase-scan = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "cli",
+    "language_parser",
+    "python_parser",
+    "typescript_parser",
+    "repo_walker",
+    "scanner",
+]
 ```
 
-- [ ] **5.4** Run tests and full gate:
+- [x] **5.4** Run tests and full gate:
 ```bash
 cd tools/kb-codebase-scan
 python -m pytest tests/ -v
 ruff check .
-mypy --strict language_parser.py python_parser.py typescript_parser.py repo_walker.py scanner.py
+mypy --strict cli.py __main__.py language_parser.py python_parser.py typescript_parser.py repo_walker.py scanner.py
 
 # Dry-run on backend/ itself:
 KB_API_TOKEN=fake python __main__.py scan --repo ../../backend --dry-run --language python
 # Expected: exit 0, prints "Scan complete: N new, ..."
 ```
 
-- [ ] **5.5** Commit:
+**Evidence (2026-07-25, sandbox py312):** `pytest tests/ -v` → 26 passed; `ruff check .` → All checks
+passed; `mypy --strict` (all 7 modules) → no issues found in 7 source files. Dry-run on backend/:
+
+```
+$ KB_API_TOKEN=fake python __main__.py scan --repo ../../backend --dry-run --language python --json
+INFO:kb-codebase-scan:[DRY RUN] Would upsert 558 items, 686 edges
+{"total": 558, "new": 558, "updated": 0, "failed": 0}
+exit: 0
+$ KB_API_TOKEN=fake python __main__.py scan --repo ../../backend --dry-run --language python   # incremental 2nd run
+INFO:kb-codebase-scan:[DRY RUN] Would upsert 0 items, 0 edges
+Scan complete: 0 new, 0 updated, 0 failed
+exit: 0
+$ python __main__.py scan --repo /nonexistent
+ERROR: Repo path does not exist: /nonexistent
+exit: 2
+```
+(backend/.codebase_scan_cache.json removed after the evidence run; pattern gitignored.)
+
+- [x] **5.5** Commit:
 ```
 feat(tools): kb-codebase-scan CLI — scan, dry-run, --json output, exit codes 0/1/2
 ```
