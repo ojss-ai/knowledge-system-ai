@@ -1075,7 +1075,7 @@ feat(api): POST /uploads/ingest-batch — ref-addressed edges with DB-fallback r
 
 ### Steps
 
-- [ ] **4b.1** RED — append to `tools/kb-codebase-scan/tests/test_repo_walker.py` (the cwd-relative default cache breaks test isolation and cross-repo scans):
+- [x] **4b.1** RED — append to `tools/kb-codebase-scan/tests/test_repo_walker.py` (the cwd-relative default cache breaks test isolation and cross-repo scans):
 
 ```python
 def test_cache_file_lives_in_scanned_repo() -> None:
@@ -1087,7 +1087,7 @@ def test_cache_file_lives_in_scanned_repo() -> None:
     assert (Path(repo_dir) / ".codebase_scan_cache.json").exists()
 ```
 
-- [ ] **4b.2** GREEN — in `repo_walker.py` add a `_cache_path` helper and use it in `_load_cache`/`save_cache` (relative `hash_cache_file` resolves under the repo root; absolute paths still honored). `_load_cache` also self-heals on garbage, mirroring sync_engine 5.R.4:
+- [x] **4b.2** GREEN — in `repo_walker.py` add a `_cache_path` helper and use it in `_load_cache`/`save_cache` (relative `hash_cache_file` resolves under the repo root; absolute paths still honored). `_load_cache` also self-heals on garbage, mirroring sync_engine 5.R.4:
 
 ```python
     def _cache_path(self) -> Path:
@@ -1112,7 +1112,7 @@ def test_cache_file_lives_in_scanned_repo() -> None:
 cd tools/kb-codebase-scan && python -m pytest tests/test_repo_walker.py -v   # 4 passed
 ```
 
-- [ ] **4b.3** RED — create `tools/kb-codebase-scan/tests/test_scanner.py`:
+- [x] **4b.3** RED — create `tools/kb-codebase-scan/tests/test_scanner.py`:
 
 ```python
 import tempfile
@@ -1231,7 +1231,7 @@ def test_changed_caller_still_links_to_unchanged_callee() -> None:
 cd tools/kb-codebase-scan && python -m pytest tests/test_scanner.py -v   # RED: ImportError
 ```
 
-- [ ] **4b.4** GREEN — create `tools/kb-codebase-scan/scanner.py`:
+- [x] **4b.4** GREEN — create `tools/kb-codebase-scan/scanner.py`:
 
 ```python
 # tools/kb-codebase-scan/scanner.py
@@ -1418,10 +1418,12 @@ class CodebaseScanner:
         result.api_calls += 1
         r.raise_for_status()
         data = r.json()
-        result.new_items += int(data["created"])
-        result.updated_items += int(data["updated"])
-        result.edges_sent += int(data["edges_queued"])
-        result.edges_dangling += int(data["edges_dangling"])
+        if items:  # item counters only from item batches (edge batches create nothing)
+            result.new_items += int(data["created"])
+            result.updated_items += int(data["updated"])
+        if edges:
+            result.edges_sent += int(data["edges_queued"])
+            result.edges_dangling += int(data["edges_dangling"])
 
     def run(self) -> ScanResult:
         result = ScanResult()
@@ -1459,15 +1461,17 @@ class CodebaseScanner:
         return result
 ```
 
-- [ ] **4b.5** Append `types-requests>=2.31` to `tools/kb-codebase-scan/requirements.txt`, then the full gate:
+> **[plan-fix]** `_post_batch` originally accumulated all four counters unconditionally; since `run()` posts item-only then edge-only batches, that double-counted `created` against the test's single mock response (and is wrong-shaped for real responses too). Counters are now guarded by batch kind. Also: the scanner test file defines 7 tests, not 8 as the gate comment said.
+
+- [x] **4b.5** Append `types-requests>=2.31` to `tools/kb-codebase-scan/requirements.txt`, then the full gate:
 ```bash
 cd tools/kb-codebase-scan
-python -m pytest tests/ -v          # all green (parser 9, walker 4, scanner 8)
+python -m pytest tests/ -v          # all green (parser 9, walker 4, scanner 7)
 ruff check .                        # clean
 mypy --strict language_parser.py python_parser.py typescript_parser.py repo_walker.py scanner.py
 ```
 
-- [ ] **4b.6** Commit:
+- [x] **4b.6** Commit:
 ```
 feat(tools): CodebaseScanner — ingest-batch upserts, DEFINES file→symbol, CALLS confidence=0.7
 ```

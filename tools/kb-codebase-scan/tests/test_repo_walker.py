@@ -60,3 +60,12 @@ def test_incremental_skips_unchanged() -> None:
 
     files = [str(f) for f in walker.iter_changed_files()]
     assert not any("mod.py" in f for f in files)
+
+
+def test_cache_file_lives_in_scanned_repo() -> None:
+    repo_dir = make_temp_repo({"m.py": "def f(): pass"})
+    walker = RepoWalker(ScanConfig(repo_path=repo_dir, languages=["python"]))
+    for f in walker.iter_changed_files():
+        walker.mark_scanned(f)
+    walker.save_cache()
+    assert (Path(repo_dir) / ".codebase_scan_cache.json").exists()

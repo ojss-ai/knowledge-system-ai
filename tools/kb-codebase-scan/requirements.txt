@@ -4,3 +4,4 @@ tree-sitter-python>=0.21
 tree-sitter-typescript>=0.21
 python-dotenv>=1.0
 gitpython>=3.1
+types-requests>=2.31

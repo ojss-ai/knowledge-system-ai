@@ -42,16 +42,22 @@ class RepoWalker:
             self._extensions.update(_LANGUAGE_EXTENSIONS.get(lang, []))
         self._hash_cache: dict[str, str] = self._load_cache()
 
+    def _cache_path(self) -> Path:
+        p = Path(self._config.hash_cache_file)
+        return p if p.is_absolute() else self._root / p
+
     def _load_cache(self) -> dict[str, str]:
         try:
-            with open(self._config.hash_cache_file) as f:
+            with open(self._cache_path()) as f:
                 cache: dict[str, str] = json.load(f)
                 return cache
         except FileNotFoundError:
             return {}
+        except (json.JSONDecodeError, OSError):
+            return {}  # unreadable cache → full re-scan; upserts are idempotent
 
     def save_cache(self) -> None:
-        with open(self._config.hash_cache_file, "w") as f:
+        with open(self._cache_path(), "w") as f:
             json.dump(self._hash_cache, f)
 
     def _file_hash(self, path: Path) -> str:
