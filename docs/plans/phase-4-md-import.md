@@ -692,17 +692,23 @@ feat(ingest): KnowledgeIngestor with IngestItem contract and two-pass edge resol
 
 ### Steps
 
-- [ ] **3.1** Write failing tests:
+- [x] **3.1** Write failing tests:
+
+> [plan-fix] Plan block set `pytestmark = pytest.mark.asyncio` on an all-sync
+> module (pure parsing, no DB) — pytest-asyncio emits PytestWarnings for that,
+> violating "output pristine". Mark dropped. The plan also imported IngestItem
+> without using it (ruff F401); it is now exercised via an isinstance assertion.
 
 ```python
 # backend/tests/services/ingest/test_md_importer.py
 import io
 import zipfile
-import pytest
-from app.services.ingest.md_importer import parse_zip, extract_wikilinks
-from app.services.ingest.base import IngestItem
 
-pytestmark = pytest.mark.asyncio
+from app.services.ingest.base import IngestItem
+from app.services.ingest.md_importer import extract_wikilinks, parse_zip
+
+# [plan-fix] plan set `pytestmark = pytest.mark.asyncio`, but every test here is
+# synchronous (pure parsing, no DB) — the mark only produced PytestWarnings.
 
 
 def make_zip(files: dict[str, str]) -> bytes:
@@ -714,22 +720,27 @@ def make_zip(files: dict[str, str]) -> bytes:
 
 
 def test_parse_zip_returns_ingest_items():
-    zip_bytes = make_zip({
-        "notes/hello.md": "# Hello World\n\nThis is a note.",
-        "notes/bye.md": "# Goodbye\n\nSee [[Hello World]] for details.",
-    })
+    zip_bytes = make_zip(
+        {
+            "notes/hello.md": "# Hello World\n\nThis is a note.",
+            "notes/bye.md": "# Goodbye\n\nSee [[Hello World]] for details.",
+        }
+    )
     items, edge_specs = parse_zip(zip_bytes, source="md_upload")
     assert len(items) == 2
+    assert all(isinstance(i, IngestItem) for i in items)
     titles = [i.title for i in items]
     assert "Hello World" in titles
     assert "Goodbye" in titles
 
 
 def test_parse_zip_extracts_wikilink_edge_specs():
-    zip_bytes = make_zip({
-        "a.md": "# A\n\nLinks to [[B]].",
-        "b.md": "# B\n\nContent.",
-    })
+    zip_bytes = make_zip(
+        {
+            "a.md": "# A\n\nLinks to [[B]].",
+            "b.md": "# B\n\nContent.",
+        }
+    )
     items, edge_specs = parse_zip(zip_bytes, source="md_upload")
     assert any(e.source_ref.endswith("a.md") and e.target_ref.endswith("b.md") for e in edge_specs)
 
@@ -746,10 +757,16 @@ def test_non_md_files_skipped():
     assert items[0].title == "Doc"
 ```
 
-- [ ] **3.2** Implement:
+- [x] **3.2** Implement:
 
 ```python
 # backend/app/services/ingest/md_importer.py
+"""Markdown zip importer (kb-ingestion-connectors, md_importer section).
+
+Connector layer only: parses a zip of ``.md`` files into IngestItems and
+wikilink EdgeSpecs. Persistence is owned by KnowledgeIngestor — never here.
+"""
+
 from __future__ import annotations
 
 import io
@@ -788,7 +805,9 @@ def parse_zip(
     title_to_ref: dict[str, str] = {}  # title → source_ref (for wikilink resolution)
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        md_files = [n for n in zf.namelist() if n.lower().endswith(".md") and not n.startswith("__MACOSX")]
+        md_files = [
+            n for n in zf.namelist() if n.lower().endswith(".md") and not n.startswith("__MACOSX")
+        ]
 
         for name in md_files:
             try:
@@ -823,13 +842,13 @@ def parse_zip(
     return items, edge_specs
 ```
 
-- [ ] **3.3** Run tests:
+- [x] **3.3** Run tests:
 ```bash
 cd backend && pytest tests/services/ingest/test_md_importer.py -v
 # Expected: 4 passed
 ```
 
-- [ ] **3.4** Commit:
+- [x] **3.4** Commit:
 ```
 feat(ingest): Markdown zip parser with wikilink edge extraction
 ```
