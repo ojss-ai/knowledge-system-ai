@@ -30,16 +30,23 @@
 
 ### Steps
 
-- [ ] **1.1** Write the failing tests:
+- [x] **1.1** Write the failing tests:
+
+> [plan-fix] Test code adjusted for `ruff` (I001/F401/F841) and `mypy --strict`: imports sorted,
+> unused `pytest`/`ConfluencePage` imports dropped, functions annotated, and the auth test now
+> asserts the exact `Basic <b64>` header (uses `expected` instead of leaving it dead).
+> Also added `tools/kb-confluence-sync/ruff.toml` (mirrors backend select: E,F,I,UP,B,ASYNC) so the
+> exit criterion `ruff check tools/kb-confluence-sync/` is deterministic outside backend's config.
 
 ```python
 # tools/kb-confluence-sync/tests/test_confluence_client.py
-from unittest.mock import patch, MagicMock
-import pytest
-from confluence_client import ConfluenceClient, ConfluencePage
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+from confluence_client import ConfluenceClient
 
 
-def mock_session_get(url, **kwargs):
+def mock_session_get(url: str, **kwargs: Any) -> MagicMock:
     """Return canned responses based on URL fragment."""
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
@@ -64,7 +71,7 @@ def mock_session_get(url, **kwargs):
     return resp
 
 
-def test_list_pages():
+def test_list_pages() -> None:
     client = ConfluenceClient(base_url="https://example.atlassian.net/wiki", token="tok")
     with patch.object(client._session, "get", side_effect=mock_session_get):
         pages = client.list_pages("TS")
@@ -74,7 +81,7 @@ def test_list_pages():
         assert pages[0].version == 3
 
 
-def test_get_page_content():
+def test_get_page_content() -> None:
     client = ConfluenceClient(base_url="https://example.atlassian.net/wiki", token="tok")
     with patch.object(client._session, "get", side_effect=mock_session_get):
         page = client.get_page("123")
@@ -82,15 +89,21 @@ def test_get_page_content():
         assert "<p>" in page.body_storage
 
 
-def test_client_uses_token_auth():
-    client = ConfluenceClient(base_url="https://example.atlassian.net/wiki", token="mytoken", email="user@test.com")
+def test_client_uses_token_auth() -> None:
+    client = ConfluenceClient(
+        base_url="https://example.atlassian.net/wiki", token="mytoken", email="user@test.com"
+    )
     # Authorization header must be set
     import base64
+
     expected = base64.b64encode(b"user@test.com:mytoken").decode()
-    assert client._session.auth is not None or "Authorization" in client._session.headers
+    assert client._session.headers["Authorization"] == f"Basic {expected}"
 ```
 
-- [ ] **1.2** Create the client:
+- [x] **1.2** Create the client:
+
+> [plan-fix] Dropped unused `from typing import Generator` (ruff F401); `list_pages` builds its
+> query dict as `params: dict[str, str | int]` so `mypy --strict` accepts `Session.get(params=...)`.
 
 ```python
 # tools/kb-confluence-sync/confluence_client.py
@@ -98,7 +111,6 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from typing import Generator
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -156,16 +168,14 @@ class ConfluenceClient:
         start = 0
 
         while True:
-            r = self._session.get(
-                f"{self._base}/rest/api/content",
-                params={
-                    "spaceKey": space_key,
-                    "type": "page",
-                    "limit": limit,
-                    "start": start,
-                    "expand": "version,ancestors",
-                },
-            )
+            params: dict[str, str | int] = {
+                "spaceKey": space_key,
+                "type": "page",
+                "limit": limit,
+                "start": start,
+                "expand": "version,ancestors",
+            }
+            r = self._session.get(f"{self._base}/rest/api/content", params=params)
             r.raise_for_status()
             data = r.json()
 
@@ -219,13 +229,13 @@ class ConfluenceClient:
         )
 ```
 
-- [ ] **1.3** Run tests:
+- [x] **1.3** Run tests:
 ```bash
 cd tools/kb-confluence-sync && python -m pytest tests/test_confluence_client.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **1.4** Commit:
+- [x] **1.4** Commit:
 ```
 feat(tools): ConfluenceClient — list_pages, get_page, Basic/Bearer auth, pagination
 ```
