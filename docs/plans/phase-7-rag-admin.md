@@ -850,23 +850,19 @@ feat(audit): AuditLog model + migration 0006 + audit_service.log()
 
 ### Steps
 
-- [ ] **4.1** Write failing test:
+- [x] **4.1** Write failing test: *([plan-fix]: no `/auth/register` endpoint and login is JSON, not form-data (same as conftest [plan-fix, Task 8.5]) — register via `auth_service`; `pytestmark` dropped, asyncio_mode is auto)*
 
 ```python
 # backend/tests/api/test_token_revocation.py
-import pytest
-from httpx import AsyncClient
-
-pytestmark = pytest.mark.asyncio
+from app.services import auth_service
 
 
-async def test_refresh_token_used_twice_rejected(client: AsyncClient):
+async def test_refresh_token_used_twice_rejected(db, client) -> None:
     """Using a refresh token a second time must return 401 (rotation + revocation)."""
-    await client.post("/api/v1/auth/register", json={
-        "email": "revoke@test.com", "password": "pass1234", "display_name": "R"
-    })
-    r = await client.post("/api/v1/auth/login",
-        data={"username": "revoke@test.com", "password": "pass1234"})
+    await auth_service.register(db, email="revoke@test.com", password="pass1234", display_name="R")
+    r = await client.post(
+        "/api/v1/auth/login", json={"email": "revoke@test.com", "password": "pass1234"}
+    )
     refresh_token = r.json()["refresh_token"]
 
     # First refresh — should succeed
@@ -878,80 +874,85 @@ async def test_refresh_token_used_twice_rejected(client: AsyncClient):
     assert r2.status_code == 401
 ```
 
-- [ ] **4.2** Implement revocation list in Redis:
+- [x] **4.2** Implement revocation list in Redis: *([plan-fix]: client memoized per running event loop — a forever-cached global client is bound to the loop it was created on and raises "Event loop is closed" after any loop change (one loop per test); `setex` is deprecated → `set(ex=)`)*
 
 ```python
 # backend/app/core/security.py  (add to existing file)
+import asyncio
 import redis.asyncio as aioredis
 from app.core.config import settings
 
 _redis: aioredis.Redis | None = None
+_redis_loop: asyncio.AbstractEventLoop | None = None
+
 
 async def _get_redis() -> aioredis.Redis:
-    global _redis
-    if _redis is None:
+    global _redis, _redis_loop
+    loop = asyncio.get_running_loop()
+    if _redis is None or _redis_loop is not loop:
         _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        _redis_loop = loop
     return _redis
 
 
 async def revoke_jti(jti: str, ttl_seconds: int) -> None:
-    """Add a JTI to the revocation set in Redis."""
+    """Add a JTI to the revocation set in Redis (ADR-008)."""
     r = await _get_redis()
-    await r.setex(f"revoked_jti:{jti}", ttl_seconds, "1")
+    await r.set(f"revoked_jti:{jti}", "1", ex=ttl_seconds)
 
 
 async def is_jti_revoked(jti: str) -> bool:
     r = await _get_redis()
-    return await r.exists(f"revoked_jti:{jti}") == 1
+    return bool(await r.exists(f"revoked_jti:{jti}") == 1)
 ```
 
-- [ ] **4.3** Update refresh endpoint in `auth.py` to revoke old JTI on use:
+- [x] **4.3** Update refresh endpoint in `auth.py` to revoke old JTI on use: *([plan-fix]: canonical names — existing endpoint is `refresh` with `RefreshIn` / `make_access_token(user_id, role)` / `make_refresh_token`, not `RefreshRequest`/`create_*`; raw `db.scalar(select(User)...)` in the router violates kb-api-conventions "no DB queries in routers" → moved to new `auth_service.get_active_user(db, user_id)`; catch `pyjwt.PyJWTError`, not bare `Exception`)*
 
 ```python
-# backend/app/api/v1/auth.py — refresh endpoint addition
-# In the refresh route, after decoding the old refresh token:
-#   1. Check if jti is revoked → 401 if so
-#   2. Revoke old jti (with remaining TTL)
-#   3. Issue new access + refresh tokens
-
-@router.post("/refresh", response_model=TokensOut)
-async def refresh_tokens(payload: RefreshRequest, db: AsyncSession = Depends(get_db)):
-    from app.core.security import decode_token, revoke_jti, is_jti_revoked, create_access_token, create_refresh_token
+# backend/app/api/v1/auth.py — refresh endpoint (imports at module top, not inline)
+@router.post(
+    "/refresh", response_model=TokensOut, summary="Rotate tokens", operation_id="refreshTokens"
+)
+async def refresh(payload: RefreshIn, db: AsyncSession = Depends(get_db)) -> TokensOut:
     try:
-        claims = decode_token(payload.refresh_token, expected_kind="refresh")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
+        claims = decode_token(payload.refresh_token, "refresh")
+    except pyjwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="invalid refresh token") from exc
 
+    # ADR-008: rotation + revocation — a refresh token is single-use.
     jti = claims.get("jti")
     if jti and await is_jti_revoked(jti):
-        raise HTTPException(status_code=401, detail="Refresh token already used")
-
+        raise HTTPException(status_code=401, detail="refresh token already used")
     if jti:
-        import time
         remaining = int(claims["exp"] - time.time())
         if remaining > 0:
             await revoke_jti(jti, remaining)
 
-    user = await db.scalar(select(User).where(User.id == uuid.UUID(claims["sub"])))
-    if user is None or not user.is_active:
-        raise HTTPException(status_code=401, detail="User not found")
+    user = await auth_service.get_active_user(db, uuid.UUID(claims["sub"]))
+    if user is None:
+        raise HTTPException(status_code=401, detail="user not found")  # auth boundary
 
     return TokensOut(
-        access_token=create_access_token(user),
-        refresh_token=create_refresh_token(user),
+        access_token=make_access_token(user.id, user.role.value),
+        refresh_token=make_refresh_token(user.id, user.role.value),
     )
 ```
 
-- [ ] **4.4** Run tests:
+- [x] **4.4** Run tests:
 ```bash
 cd backend && pytest tests/api/test_token_revocation.py -v
-# Expected: 1 passed
+# Expected: 1 passed  → actual: 1 passed; full tests/api/: 92 passed, 3 skipped
 ```
 
-- [ ] **4.5** Commit:
+- [x] **4.5** Commit:
 ```
 feat(auth): JWT refresh token revocation via Redis JTI blocklist
 ```
+
+> **Known gap (carried from phase-3 `## Blockers`):** the frontend BFF still has no
+> `/api/auth/refresh` route handler, so the browser never exercises this endpoint —
+> backend rotation + revocation is live for direct API/CLI clients only. BFF wiring
+> is out of scope for this task and remains open.
 
 ---
 

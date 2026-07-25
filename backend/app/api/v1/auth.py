@@ -1,3 +1,4 @@
+import time
 import uuid
 
 import jwt as pyjwt
@@ -5,7 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.security import decode_token, make_access_token, make_refresh_token
+from app.core.security import (
+    decode_token,
+    is_jti_revoked,
+    make_access_token,
+    make_refresh_token,
+    revoke_jti,
+)
 from app.schemas.auth import LoginIn, RefreshIn, TokensOut
 from app.services import auth_service
 
@@ -28,12 +35,26 @@ async def login(payload: LoginIn, db: AsyncSession = Depends(get_db)) -> TokensO
 @router.post(
     "/refresh", response_model=TokensOut, summary="Rotate tokens", operation_id="refreshTokens"
 )
-async def refresh(payload: RefreshIn) -> TokensOut:
+async def refresh(payload: RefreshIn, db: AsyncSession = Depends(get_db)) -> TokensOut:
     try:
         claims = decode_token(payload.refresh_token, "refresh")
     except pyjwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="invalid refresh token") from exc
-    uid, role = uuid.UUID(claims["sub"]), claims["role"]
+
+    # ADR-008: rotation + revocation — a refresh token is single-use.
+    jti = claims.get("jti")
+    if jti and await is_jti_revoked(jti):
+        raise HTTPException(status_code=401, detail="refresh token already used")
+    if jti:
+        remaining = int(claims["exp"] - time.time())
+        if remaining > 0:
+            await revoke_jti(jti, remaining)
+
+    user = await auth_service.get_active_user(db, uuid.UUID(claims["sub"]))
+    if user is None:
+        raise HTTPException(status_code=401, detail="user not found")  # auth boundary
+
     return TokensOut(
-        access_token=make_access_token(uid, role), refresh_token=make_refresh_token(uid, role)
+        access_token=make_access_token(user.id, user.role.value),
+        refresh_token=make_refresh_token(user.id, user.role.value),
     )
