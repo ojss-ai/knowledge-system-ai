@@ -30,12 +30,11 @@
 
 ### Steps
 
-- [ ] **1.1** Write the failing tests:
+- [x] **1.1** Write the failing tests: *([plan-fix]: dropped unused `import pytest` — ruff F401)*
 
 ```python
 # backend/tests/services/test_llm_service.py
-import pytest
-from app.services.llm_service import LLMAdapter, FakeLLM, get_llm
+from app.services.llm_service import FakeLLM, LLMAdapter, get_llm
 
 
 def test_fake_llm_returns_string():
@@ -63,7 +62,7 @@ def test_llm_complete_accepts_system_prompt():
     assert isinstance(result, str)
 ```
 
-- [ ] **1.2** Implement:
+- [x] **1.2** Implement: *([plan-fix]: `requests` is not a backend dependency — OllamaLLM uses `httpx` (moved to runtime deps); OpenAIAdapter fully typed and `openai.*` mypy override added so `mypy --strict app/services/` passes)*
 
 ```python
 # backend/app/services/llm_service.py
@@ -72,7 +71,7 @@ LLM service adapter — on-prem first (ADR-010).
 
 Feature flag:
   LLM_ALLOW_EXTERNAL=false (default) → only local backends (Ollama, fake)
-  LLM_ALLOW_EXTERNAL=true            → external APIs allowed (OpenAI, Anthropic)
+  LLM_ALLOW_EXTERNAL=true            → external APIs allowed (OpenAI)
 
 Backends:
   LLM_BACKEND=fake            → FakeLLM (tests + graceful degradation)
@@ -82,7 +81,7 @@ Backends:
 from __future__ import annotations
 
 import os
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -104,8 +103,8 @@ class FakeLLM:
 
 class OllamaLLM:
     """
-    Adapter for a local Ollama server.
-    Requires: pip install ollama
+    Adapter for a local Ollama server (HTTP API via httpx).
+    On any failure the adapter degrades gracefully to a stub response.
     """
 
     def __init__(
@@ -118,7 +117,8 @@ class OllamaLLM:
 
     def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
         try:
-            import requests
+            import httpx
+
             payload = {
                 "model": self._model,
                 "prompt": prompt,
@@ -126,9 +126,10 @@ class OllamaLLM:
                 "stream": False,
                 "options": {"num_predict": max_tokens},
             }
-            r = requests.post(f"{self._base_url}/api/generate", json=payload, timeout=60)
+            r = httpx.post(f"{self._base_url}/api/generate", json=payload, timeout=60)
             r.raise_for_status()
-            return r.json().get("response", "")
+            response = r.json().get("response", "")
+            return response if isinstance(response, str) else ""
         except Exception as exc:
             # Graceful degradation: fall back to stub
             return f"[LLM unavailable: {exc}]"
@@ -157,17 +158,23 @@ def get_llm() -> LLMAdapter:
         # openai backend (optional dep)
         try:
             from openai import OpenAI
+
             class OpenAIAdapter:
-                def __init__(self):
+                def __init__(self) -> None:
                     self._client = OpenAI()
                     self._model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-                def complete(self, prompt, *, system="", max_tokens=512):
-                    msgs = []
+
+                def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+                    msgs: list[dict[str, str]] = []
                     if system:
                         msgs.append({"role": "system", "content": system})
                     msgs.append({"role": "user", "content": prompt})
-                    r = self._client.chat.completions.create(model=self._model, messages=msgs, max_tokens=max_tokens)
-                    return r.choices[0].message.content or ""
+                    r: Any = self._client.chat.completions.create(
+                        model=self._model, messages=msgs, max_tokens=max_tokens
+                    )
+                    content = r.choices[0].message.content
+                    return content if isinstance(content, str) else ""
+
             return OpenAIAdapter()
         except ImportError:
             return FakeLLM()
@@ -175,21 +182,21 @@ def get_llm() -> LLMAdapter:
     return FakeLLM()
 ```
 
-- [ ] **1.3** Add to `config.py`:
+- [x] **1.3** Add to `config.py` (also in pyproject: `httpx>=0.27` moved dev → runtime deps; `[[tool.mypy.overrides]] module = "openai.*"` added):
 ```python
-llm_backend: str = "ollama"          # fake | ollama | openai
+llm_backend: str = "ollama"  # fake | ollama | openai
 llm_allow_external: bool = False
 ollama_model: str = "llama3"
 ollama_base_url: str = "http://localhost:11434"
 ```
 
-- [ ] **1.4** Run tests:
+- [x] **1.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_llm_service.py -v
 # Expected: 4 passed
 ```
 
-- [ ] **1.5** Commit:
+- [x] **1.5** Commit:
 ```
 feat(llm): LLMAdapter protocol, FakeLLM, OllamaLLM, get_llm() with LLM_ALLOW_EXTERNAL gate
 ```
