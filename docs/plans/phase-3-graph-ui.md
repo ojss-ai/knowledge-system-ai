@@ -1260,7 +1260,7 @@ feat(frontend): layout, login, graph explorer, node detail, search, daily-log, u
 
 ### Steps
 
-- [ ] **6.1** Create Playwright config:
+- [x] **6.1** Create Playwright config:
 
 ```typescript
 // frontend/playwright.config.ts
@@ -1286,7 +1286,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **6.2** Auth e2e test:
+- [x] **6.2** Auth e2e test:
 
 ```typescript
 // frontend/tests/e2e/auth.spec.ts
@@ -1298,9 +1298,13 @@ test("unauthenticated user is redirected to /login", async ({ page }) => {
 })
 
 test("login with valid credentials navigates to graph", async ({ page }) => {
-  // Assumes seed admin exists (from Phase 0, Task 10)
+  // Assumes seed admin exists (from Phase 0, Task 10):
+  //   python -m app.scripts.seed_admin admin@example.com admin1234
+  // [plan-fix] plan used admin@kb.local, but the backend's EmailStr
+  // (email-validator >= 2) rejects .local as a special-use reserved
+  // domain — login would 422 before ever checking the password.
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "admin1234")
   await page.click('button[type="submit"]')
   await expect(page).toHaveURL(/\/graph/, { timeout: 10_000 })
@@ -1308,29 +1312,34 @@ test("login with valid credentials navigates to graph", async ({ page }) => {
 
 test("login with wrong password shows error", async ({ page }) => {
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "wrongpassword")
   await page.click('button[type="submit"]')
   await expect(page.locator("text=Invalid credentials")).toBeVisible()
 })
 ```
 
-- [ ] **6.3** Graph e2e test:
+- [x] **6.3** Graph e2e test:
 
 ```typescript
 // frontend/tests/e2e/graph.spec.ts
 import { test, expect } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
-  // Log in first
+  // Log in first ([plan-fix] admin@example.com — see auth.spec.ts)
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "admin1234")
   await page.click('button[type="submit"]')
   await page.waitForURL(/\/graph/)
 })
 
 test("graph page renders canvas element", async ({ page }) => {
+  // [plan-fix] requires a live Neo4j: /api/v1/graph/overview 503s without it
+  // and the page shows its error state instead of the canvas. Set
+  // E2E_SKIP_NEO4J=1 to skip in Neo4j-less environments (sandbox); runs by
+  // default on the Docker stack.
+  test.skip(process.env.E2E_SKIP_NEO4J === "1", "requires Neo4j (graph overview 503s)")
   await expect(page.locator("canvas")).toBeVisible({ timeout: 10_000 })
 })
 
@@ -1340,15 +1349,16 @@ test("graph page shows sidebar links", async ({ page }) => {
 })
 ```
 
-- [ ] **6.4** Search e2e test:
+- [x] **6.4** Search e2e test:
 
 ```typescript
 // frontend/tests/e2e/search.spec.ts
 import { test, expect } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
+  // [plan-fix] admin@example.com — see auth.spec.ts
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "admin1234")
   await page.click('button[type="submit"]')
   await page.waitForURL(/\/graph/)
@@ -1364,21 +1374,32 @@ test("search returns results or empty list", async ({ page }) => {
   await page.goto("/search")
   await page.fill('input[placeholder*="Search"]', "knowledge")
   await page.click('button[type="submit"]')
-  // Either results appear or no error is shown
-  await expect(page.locator("text=Searching…").or(page.locator("ul"))).toBeVisible({ timeout: 10_000 })
+  // Either results appear or no error is shown. [plan-fix] .first(): both the
+  // transient "Searching…" state and the <ul> can be visible at once, which
+  // trips Playwright's strict mode on an .or() locator.
+  await expect(
+    page.locator("text=Searching…").or(page.locator("ul")).first()
+  ).toBeVisible({ timeout: 10_000 })
 })
 ```
 
-- [ ] **6.5** Run e2e tests (requires running stack):
+- [x] **6.5** Run e2e tests (requires running stack):
 ```bash
 cd frontend
 npx playwright install chromium
 # Start the stack first: cd .. && make up api
 npx playwright test
 # Expected: 3+ passed
+# Sandbox run 2026-07-24 (real output): backend `EMBEDDING_BACKEND=fake uvicorn
+# app.main:app --port 8000` + `npx next start -p 3000` + seeded admin:
+#   E2E_SKIP_NEO4J=1 npx playwright test --reporter=line
+#   -> 6 passed, 1 skipped (canvas test needs Neo4j)
+# On the Docker stack run WITHOUT E2E_SKIP_NEO4J: expect 7 passed.
+# Note: e2e backend must run with EMBEDDING_BACKEND=fake (or a real model
+# installed) or /api/v1/search 500s trying to load sentence-transformers.
 ```
 
-- [ ] **6.6** Run final checks:
+- [x] **6.6** Run final checks:
 ```bash
 cd frontend
 npm run lint    # ESLint + tsc --noEmit
@@ -1386,7 +1407,7 @@ npm run build   # Next.js production build
 npx vitest run  # Unit tests
 ```
 
-- [ ] **6.7** Commit:
+- [x] **6.7** Commit:
 ```
 feat(frontend): Playwright e2e tests — auth, graph, search
 ```
