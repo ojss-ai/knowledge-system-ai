@@ -354,16 +354,17 @@ feat(tools): LanguageParser protocol + PythonParser with tree-sitter
 
 ### Steps
 
-- [ ] **2.1** Write failing tests:
+- [x] **2.1** Write failing tests:
 
 ```python
 # tools/kb-codebase-scan/tests/test_typescript_parser.py
 import textwrap
+
+from language_parser import LanguageParser, SymbolKind
 from typescript_parser import TypeScriptParser
-from language_parser import SymbolKind, LanguageParser
 
 
-def test_parses_functions():
+def test_parses_functions() -> None:
     code = "function greet(name: string): string { return `Hello ${name}`; }"
     parser = TypeScriptParser()
     result = parser.parse("greet.ts", code)
@@ -371,7 +372,7 @@ def test_parses_functions():
     assert any(s.name == "greet" for s in funcs)
 
 
-def test_parses_classes():
+def test_parses_classes() -> None:
     code = textwrap.dedent("""
         class GraphCanvas {
             constructor(private container: HTMLElement) {}
@@ -384,7 +385,7 @@ def test_parses_classes():
     assert any(s.name == "GraphCanvas" for s in classes)
 
 
-def test_parses_arrow_functions():
+def test_parses_arrow_functions() -> None:
     code = "const add = (a: number, b: number): number => a + b;"
     parser = TypeScriptParser()
     result = parser.parse("math.ts", code)
@@ -392,13 +393,13 @@ def test_parses_arrow_functions():
     assert any(s.name == "add" for s in funcs)
 
 
-def test_satisfies_protocol():
+def test_satisfies_protocol() -> None:
     parser = TypeScriptParser()
     assert isinstance(parser, LanguageParser)
     assert ".ts" in parser.extensions
 ```
 
-- [ ] **2.2** Create `typescript_parser.py`:
+- [x] **2.2** Create `typescript_parser.py`:
 
 ```python
 # tools/kb-codebase-scan/typescript_parser.py
@@ -407,11 +408,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from language_parser import LanguageParser, ParsedFile, ParsedSymbol, SymbolKind
+from language_parser import ParsedFile, ParsedSymbol, SymbolKind
 
 try:
     import tree_sitter_typescript as tsts
-    from tree_sitter import Language, Parser
+    from tree_sitter import Language, Node, Parser
+
     _TS_LANG = Language(tsts.language_typescript())
     _HAS_TREE_SITTER = True
 except ImportError:
@@ -442,7 +444,7 @@ class TypeScriptParser:
         self._walk_node(tree.root_node, pf, source, parent_fqn=None)
         return pf
 
-    def _walk_node(self, node, pf: ParsedFile, source: str, parent_fqn: str | None):
+    def _walk_node(self, node: Node, pf: ParsedFile, source: str, parent_fqn: str | None) -> None:
         if node.type == "class_declaration":
             name_node = node.child_by_field_name("name")
             name = source[name_node.start_byte:name_node.end_byte] if name_node else "Unknown"
@@ -461,7 +463,8 @@ class TypeScriptParser:
             name_node = node.child_by_field_name("name")
             if name_node:
                 name = source[name_node.start_byte:name_node.end_byte]
-                kind = SymbolKind.METHOD if parent_fqn and "." in parent_fqn else SymbolKind.FUNCTION
+                is_method = parent_fqn is not None and "." in parent_fqn
+                kind = SymbolKind.METHOD if is_method else SymbolKind.FUNCTION
                 fqn = f"{parent_fqn or pf.module_fqn}.{name}"
                 sym = ParsedSymbol(
                     name=name, kind=kind, fqn=fqn,
@@ -513,13 +516,13 @@ class TypeScriptParser:
         return pf
 ```
 
-- [ ] **2.3** Run tests:
+- [x] **2.3** Run tests:
 ```bash
 cd tools/kb-codebase-scan && python -m pytest tests/test_typescript_parser.py -v
 # Expected: 4 passed
 ```
 
-- [ ] **2.4** Commit:
+- [x] **2.4** Commit:
 ```
 feat(tools): TypeScriptParser with tree-sitter (.ts, .tsx)
 ```
