@@ -30,16 +30,19 @@
 
 ### Steps
 
-- [x] **1.1** Write the failing tests: *([plan-fix]: dropped unused `import pytest` — ruff F401)*
+- [x] **1.1** Write the failing tests: *([plan-fix]: dropped unused `import pytest` — ruff F401; [1.R]: async `complete`, settings-driven factory)*
 
 ```python
 # backend/tests/services/test_llm_service.py
-from app.services.llm_service import FakeLLM, LLMAdapter, get_llm
+import inspect
+
+from app.core.config import settings
+from app.services.llm_service import FakeLLM, LLMAdapter, OllamaLLM, get_llm
 
 
-def test_fake_llm_returns_string():
+async def test_fake_llm_returns_string():
     llm = FakeLLM()
-    result = llm.complete("Summarise: hello world")
+    result = await llm.complete("Summarise: hello world")
     assert isinstance(result, str)
     assert len(result) > 0
 
@@ -49,20 +52,41 @@ def test_fake_llm_is_adapter():
     assert isinstance(llm, LLMAdapter)
 
 
+def test_adapter_complete_is_async():
+    # 1.R.1: a sync complete() (blocking httpx.post) inside the async /ask path
+    # stalls the event loop for up to 60s — every adapter must be awaitable.
+    assert inspect.iscoroutinefunction(FakeLLM.complete)
+    assert inspect.iscoroutinefunction(OllamaLLM.complete)
+
+
 def test_get_llm_returns_fake_when_disabled(monkeypatch):
-    monkeypatch.setenv("LLM_ALLOW_EXTERNAL", "false")
-    monkeypatch.setenv("LLM_BACKEND", "fake")
+    monkeypatch.setattr(settings, "llm_allow_external", False)
+    monkeypatch.setattr(settings, "llm_backend", "fake")
     llm = get_llm()
     assert isinstance(llm, FakeLLM)
 
 
-def test_llm_complete_accepts_system_prompt():
+def test_get_llm_reads_settings_not_environ(monkeypatch):
+    # 1.R.2: the factory must read app.core.config settings (like every other
+    # service), not os.environ directly — env alone must not decide the backend.
+    monkeypatch.setenv("LLM_BACKEND", "fake")
+    monkeypatch.setenv("OLLAMA_MODEL", "env-model")
+    monkeypatch.setattr(settings, "llm_backend", "ollama")
+    monkeypatch.setattr(settings, "ollama_model", "settings-model")
+    monkeypatch.setattr(settings, "ollama_base_url", "http://ollama-host:11434")
+    llm = get_llm()
+    assert isinstance(llm, OllamaLLM)
+    assert llm._model == "settings-model"
+    assert llm._base_url == "http://ollama-host:11434"
+
+
+async def test_llm_complete_accepts_system_prompt():
     llm = FakeLLM()
-    result = llm.complete("What is Python?", system="You are a helpful assistant.")
+    result = await llm.complete("What is Python?", system="You are a helpful assistant.")
     assert isinstance(result, str)
 ```
 
-- [x] **1.2** Implement: *([plan-fix]: `requests` is not a backend dependency — OllamaLLM uses `httpx` (moved to runtime deps); OpenAIAdapter fully typed and `openai.*` mypy override added so `mypy --strict app/services/` passes)*
+- [x] **1.2** Implement: *([plan-fix]: `requests` is not a backend dependency — OllamaLLM uses `httpx` (moved to runtime deps); OpenAIAdapter fully typed and `openai.*` mypy override added so `mypy --strict app/services/` passes; [1.R]: async adapters via `httpx.AsyncClient`/`AsyncOpenAI`, settings-driven factory, adapters raise instead of stubbing)*
 
 ```python
 # backend/app/services/llm_service.py
@@ -74,37 +98,46 @@ Feature flag:
   LLM_ALLOW_EXTERNAL=true            → external APIs allowed (OpenAI)
 
 Backends:
-  LLM_BACKEND=fake            → FakeLLM (tests + graceful degradation)
+  LLM_BACKEND=fake            → FakeLLM (tests + local dev without Ollama)
   LLM_BACKEND=ollama          → Ollama local server
   LLM_BACKEND=openai          → OpenAI API (requires LLM_ALLOW_EXTERNAL=true)
+
+Adapters are async (the /ask path runs on the event loop) and RAISE on backend
+failure — they never fabricate answer text. The ADR-010 graceful-degradation
+path (ranked sources without synthesis) is owned by rag_service.
 """
+
 from __future__ import annotations
 
-import os
 from typing import Any, Protocol, runtime_checkable
+
+import httpx
+
+from app.core.config import settings
 
 
 @runtime_checkable
 class LLMAdapter(Protocol):
-    def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
-        """Send a prompt and return the text completion."""
+    async def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+        """Send a prompt and return the text completion. Raises on backend failure."""
         ...
 
 
 class FakeLLM:
     """
-    Deterministic fake for tests and graceful degradation fallback.
+    Deterministic fake for tests and local dev without an LLM backend.
     Returns a templated string so tests can assert on structure.
     """
 
-    def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+    async def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
         return f"[FakeLLM response to: {prompt[:80]}]"
 
 
 class OllamaLLM:
     """
-    Adapter for a local Ollama server (HTTP API via httpx).
-    On any failure the adapter degrades gracefully to a stub response.
+    Adapter for a local Ollama server (async HTTP via httpx.AsyncClient —
+    a sync client here would block the event loop for the full 60s timeout).
+    Failures propagate; rag_service owns the degrade path (ADR-010).
     """
 
     def __init__(
@@ -115,61 +148,55 @@ class OllamaLLM:
         self._model = model
         self._base_url = base_url
 
-    def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
-        try:
-            import httpx
-
-            payload = {
-                "model": self._model,
-                "prompt": prompt,
-                "system": system,
-                "stream": False,
-                "options": {"num_predict": max_tokens},
-            }
-            r = httpx.post(f"{self._base_url}/api/generate", json=payload, timeout=60)
-            r.raise_for_status()
-            response = r.json().get("response", "")
-            return response if isinstance(response, str) else ""
-        except Exception as exc:
-            # Graceful degradation: fall back to stub
-            return f"[LLM unavailable: {exc}]"
+    async def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+        payload = {
+            "model": self._model,
+            "prompt": prompt,
+            "system": system,
+            "stream": False,
+            "options": {"num_predict": max_tokens},
+        }
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(f"{self._base_url}/api/generate", json=payload)
+        r.raise_for_status()
+        response = r.json().get("response", "")
+        return response if isinstance(response, str) else ""
 
 
 def get_llm() -> LLMAdapter:
     """
     Factory respecting the LLM_ALLOW_EXTERNAL feature flag.
     If LLM_ALLOW_EXTERNAL=false, external backends are silently downgraded to FakeLLM.
+    Config comes from app.core.config settings (env var names unchanged via
+    pydantic-settings) — never from os.environ directly.
     """
-    allow_external = os.environ.get("LLM_ALLOW_EXTERNAL", "false").lower() == "true"
-    backend = os.environ.get("LLM_BACKEND", "ollama")
-
-    if backend == "fake":
+    if settings.llm_backend == "fake":
         return FakeLLM()
 
-    if backend == "ollama":
-        model = os.environ.get("OLLAMA_MODEL", "llama3")
-        url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        return OllamaLLM(model=model, base_url=url)
+    if settings.llm_backend == "ollama":
+        return OllamaLLM(model=settings.ollama_model, base_url=settings.ollama_base_url)
 
-    if backend == "openai":
-        if not allow_external:
+    if settings.llm_backend == "openai":
+        if not settings.llm_allow_external:
             # ADR-010: external APIs blocked by default
             return FakeLLM()
         # openai backend (optional dep)
         try:
-            from openai import OpenAI
+            from openai import AsyncOpenAI
 
             class OpenAIAdapter:
                 def __init__(self) -> None:
-                    self._client = OpenAI()
-                    self._model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+                    self._client = AsyncOpenAI()
+                    self._model = settings.openai_model
 
-                def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+                async def complete(
+                    self, prompt: str, *, system: str = "", max_tokens: int = 512
+                ) -> str:
                     msgs: list[dict[str, str]] = []
                     if system:
                         msgs.append({"role": "system", "content": system})
                     msgs.append({"role": "user", "content": prompt})
-                    r: Any = self._client.chat.completions.create(
+                    r: Any = await self._client.chat.completions.create(
                         model=self._model, messages=msgs, max_tokens=max_tokens
                     )
                     content = r.choices[0].message.content
@@ -182,12 +209,13 @@ def get_llm() -> LLMAdapter:
     return FakeLLM()
 ```
 
-- [x] **1.3** Add to `config.py` (also in pyproject: `httpx>=0.27` moved dev → runtime deps; `[[tool.mypy.overrides]] module = "openai.*"` added):
+- [x] **1.3** Add to `config.py` (also in pyproject: `httpx>=0.27` moved dev → runtime deps; `[[tool.mypy.overrides]] module = "openai.*"` added; [1.R]: `openai_model` added — these fields are now actually consumed by `get_llm()`):
 ```python
 llm_backend: str = "ollama"  # fake | ollama | openai
 llm_allow_external: bool = False
 ollama_model: str = "llama3"
 ollama_base_url: str = "http://localhost:11434"
+openai_model: str = "gpt-4o-mini"
 ```
 
 - [x] **1.4** Run tests:
@@ -200,6 +228,22 @@ cd backend && pytest tests/services/test_llm_service.py -v
 ```
 feat(llm): LLMAdapter protocol, FakeLLM, OllamaLLM, get_llm() with LLM_ALLOW_EXTERNAL gate
 ```
+
+### 1.R Review fixes (post-commit 22d0423)
+
+- [x] **1.R.1** (CRITICAL) `complete()` was a sync `httpx.post` called inside the async `/ask`
+  path — it blocked the event loop for up to 60s. `LLMAdapter.complete` is now `async def`;
+  OllamaLLM uses `httpx.AsyncClient`, FakeLLM is async, OpenAIAdapter uses `AsyncOpenAI`.
+  Test: `test_adapter_complete_is_async`.
+- [x] **1.R.2** (IMPORTANT) `get_llm()` read `os.environ` directly, leaving the four Settings
+  fields dead. The factory now reads `app.core.config.settings` like every other service
+  (env var names unchanged via pydantic-settings); `openai_model` added to Settings.
+  Test: `test_get_llm_reads_settings_not_environ`. `tests/conftest.py` autouse fixture
+  (`_fake_ai_backends`) now also forces `settings.llm_backend = "fake"` so API tests never
+  touch a live Ollama.
+- [x] **1.R.3** OllamaLLM no longer swallows exceptions into a `[LLM unavailable: {exc}]` stub —
+  that leaked internal exception text into answer bodies. Adapters raise; the ADR-010 degrade
+  path lives in rag_service (see 2.R.1).
 
 ---
 

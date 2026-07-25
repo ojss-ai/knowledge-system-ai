@@ -86,7 +86,7 @@ async def ask(
     prompt = f"Context:\n\n{context}\n\n---\n\nQuestion: {query}"
 
     # Step 3: LLM completion
-    answer = llm.complete(prompt, system=_SYSTEM_PROMPT)
+    answer = await llm.complete(prompt, system=_SYSTEM_PROMPT)
 
     return RAGResult(
         answer=answer,

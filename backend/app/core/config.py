@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     llm_allow_external: bool = False
     ollama_model: str = "llama3"
     ollama_base_url: str = "http://localhost:11434"
+    openai_model: str = "gpt-4o-mini"
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
