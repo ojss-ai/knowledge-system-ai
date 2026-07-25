@@ -537,14 +537,13 @@ feat(tools): TypeScriptParser with tree-sitter (.ts, .tsx)
 
 ### Steps
 
-- [ ] **3.1** Write failing tests:
+- [x] **3.1** Write failing tests ([plan-fix] dropped unused `os`/`MagicMock` imports — ruff F401 — and added `-> None` annotations for `mypy --strict`, matching the other test files):
 
 ```python
 # tools/kb-codebase-scan/tests/test_repo_walker.py
-import os
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
+
 from repo_walker import RepoWalker, ScanConfig
 
 
@@ -557,7 +556,7 @@ def make_temp_repo(files: dict[str, str]) -> str:
     return d
 
 
-def test_walker_finds_python_files():
+def test_walker_finds_python_files() -> None:
     repo_dir = make_temp_repo({
         "main.py": "def main(): pass",
         "lib/util.py": "def helper(): pass",
@@ -572,7 +571,7 @@ def test_walker_finds_python_files():
     assert not any(".md" in p for p in paths)
 
 
-def test_walker_skips_excluded_dirs():
+def test_walker_skips_excluded_dirs() -> None:
     repo_dir = make_temp_repo({
         "src/app.py": "x = 1",
         "node_modules/dep.py": "ignored",
@@ -588,7 +587,7 @@ def test_walker_skips_excluded_dirs():
     assert not any("__pycache__" in f for f in files)
 
 
-def test_incremental_skips_unchanged():
+def test_incremental_skips_unchanged() -> None:
     """Files with same commit hash as cache should be skipped."""
     repo_dir = make_temp_repo({"mod.py": "def f(): pass"})
     config = ScanConfig(repo_path=repo_dir, languages=["python"])
@@ -605,7 +604,7 @@ def test_incremental_skips_unchanged():
     assert not any("mod.py" in f for f in files)
 ```
 
-- [ ] **3.2** Create `repo_walker.py`:
+- [x] **3.2** Create `repo_walker.py` ([plan-fix] `Generator` imported from `collections.abc` — ruff UP035 — and `_load_cache` assigns `json.load` to a typed local before returning, since `mypy --strict` rejects returning `Any`):
 
 ```python
 # tools/kb-codebase-scan/repo_walker.py
@@ -614,9 +613,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generator
 
 _EXCLUDED_DIRS = frozenset({
     "node_modules", ".venv", "venv", "__pycache__", ".git",
@@ -655,7 +654,8 @@ class RepoWalker:
     def _load_cache(self) -> dict[str, str]:
         try:
             with open(self._config.hash_cache_file) as f:
-                return json.load(f)
+                cache: dict[str, str] = json.load(f)
+                return cache
         except FileNotFoundError:
             return {}
 
@@ -693,13 +693,13 @@ class RepoWalker:
         self._hash_cache[rel] = self._file_hash(path)
 ```
 
-- [ ] **3.3** Run tests:
+- [x] **3.3** Run tests:
 ```bash
 cd tools/kb-codebase-scan && python -m pytest tests/test_repo_walker.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **3.4** Commit:
+- [x] **3.4** Commit:
 ```
 feat(tools): RepoWalker with incremental scan via content-hash cache
 ```
