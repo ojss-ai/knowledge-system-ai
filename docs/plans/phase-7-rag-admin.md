@@ -648,13 +648,14 @@ feat(rag): rag_service with visibility-filtered retrieval + POST /api/v1/ask
 
 ### Steps
 
-- [ ] **3.1** Write failing test:
+- [x] **3.1** Write failing test:
 
 ```python
 # backend/tests/services/test_audit_service.py
 import pytest
-from app.services import audit_service as audit
+
 from app.models.user import Role
+from app.services import audit_service as audit
 from app.services.visibility import Viewer
 
 pytestmark = pytest.mark.asyncio
@@ -663,18 +664,26 @@ pytestmark = pytest.mark.asyncio
 async def test_log_action(db, make_user):
     owner = await make_user(email="audit1@test.com")
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
-    await audit.log(db, viewer=viewer, action="node.create", resource_type="node",
-                    resource_id=str(owner.id), meta={"title": "Test"})
+    await audit.log(
+        db,
+        viewer=viewer,
+        action="node.create",
+        resource_type="node",
+        resource_id=str(owner.id),
+        meta={"title": "Test"},
+    )
     await db.flush()
     from sqlalchemy import select
+
     from app.models.audit import AuditLog
+
     rows = await db.scalars(select(AuditLog).where(AuditLog.actor_id == owner.id))
     entries = list(rows)
     assert len(entries) == 1
     assert entries[0].action == "node.create"
 ```
 
-- [ ] **3.2** Create model:
+- [x] **3.2** Create model (also export `AuditLog` from `app/models/__init__.py`): *([plan-fix]: plan named the table `audit_logs`; kb-conventions canonical vocabulary and the phase-1 Task 8 carry-over say `audit_log` — renamed in model + migration)*
 
 ```python
 # backend/app/models/audit.py
@@ -692,17 +701,23 @@ from app.core.db import Base
 
 
 class AuditLog(Base):
-    __tablename__ = "audit_logs"
+    # [plan-fix] plan named the table "audit_logs"; kb-conventions canonical
+    # vocabulary (and the phase-1 Task 8 carry-over) say "audit_log" — kept canonical.
+    __tablename__ = "audit_log"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    actor_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
-    action: Mapped[str] = mapped_column(String(128), nullable=False)       # "node.create", "node.delete" etc.
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    action: Mapped[str] = mapped_column(String(128), nullable=False)  # "node.create" etc.
     resource_type: Mapped[str | None] = mapped_column(String(64))
     resource_id: Mapped[str | None] = mapped_column(String(256))
     ip_address: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(String(512))
     meta: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
     __table_args__ = (
         Index("ix_audit_actor", "actor_id"),
@@ -711,7 +726,7 @@ class AuditLog(Base):
     )
 ```
 
-- [ ] **3.3** Create audit service:
+- [x] **3.3** Create audit service:
 
 ```python
 # backend/app/services/audit_service.py
@@ -751,56 +766,78 @@ async def log(
     # Non-blocking: do not flush here — caller's transaction commits it
 ```
 
-- [ ] **3.4** Migration `0006_audit_log.py`:
+- [x] **3.4** Migration `0006_audit_log.py`: *([plan-fix]: table renamed `audit_logs` → `audit_log` (canonical); header matches the typed house style of 0005)*
 
 ```python
 # backend/alembic/versions/0006_audit_log.py
-"""audit_logs table
+"""audit_log table
 
 Revision ID: 0006
 Revises: 0005
+Create Date: 2026-07-25
 """
-from alembic import op
+
+from collections.abc import Sequence
+
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0006"
-down_revision = "0005"
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "0006"
+down_revision: str | Sequence[str] | None = "0005"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
+    # [plan-fix] plan named the table "audit_logs"; canonical name is "audit_log".
     op.create_table(
-        "audit_logs",
+        "audit_log",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("actor_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="SET NULL"), nullable=True),
+        sa.Column(
+            "actor_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
         sa.Column("action", sa.String(128), nullable=False),
         sa.Column("resource_type", sa.String(64)),
         sa.Column("resource_id", sa.String(256)),
         sa.Column("ip_address", sa.String(64)),
         sa.Column("user_agent", sa.String(512)),
         sa.Column("meta", postgresql.JSONB, nullable=False, server_default="{}"),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
     )
-    op.create_index("ix_audit_actor", "audit_logs", ["actor_id"])
-    op.create_index("ix_audit_action", "audit_logs", ["action"])
-    op.create_index("ix_audit_created_at", "audit_logs", ["created_at"])
+    op.create_index("ix_audit_actor", "audit_log", ["actor_id"])
+    op.create_index("ix_audit_action", "audit_log", ["action"])
+    op.create_index("ix_audit_created_at", "audit_log", ["created_at"])
 
 
 def downgrade() -> None:
-    op.drop_table("audit_logs")
+    op.drop_table("audit_log")
 ```
 
-- [ ] **3.5** Apply and run tests:
+- [x] **3.5** Apply and run tests:
 ```bash
 cd backend && alembic upgrade head
 pytest tests/services/test_audit_service.py -v
 # Expected: 1 passed
 ```
 
-- [ ] **3.6** Commit:
+- [x] **3.6** Commit:
 ```
 feat(audit): AuditLog model + migration 0006 + audit_service.log()
 ```
+
+> **Carry-over from phase-1 Task 8 (now actionable):** the audit mechanism exists as of
+> this task, but nothing calls it yet. Task 6 (admin API) MUST call
+> `audit_service.log()` on every `/api/v1/admin/*` read that exposes another user's
+> non-public data (ADR-004 / kb-visibility-filter rule 5) — the Task 6 code blocks as
+> written do not do this and must be extended when Task 6 is executed.
 
 ---
 
@@ -1044,6 +1081,12 @@ feat(api): Redis sliding-window rate limiting on /ask and /search (20/60s, 60/60
 ---
 
 ## Task 6 — Admin API + dashboards
+
+> **Carry-over from phase-1 Task 8 (via Task 3):** every `/api/v1/admin/*` read that
+> exposes another user's non-public data must write an audit entry via
+> `audit_service.log()` (ADR-004 / kb-visibility-filter rule 5). The code blocks below
+> predate the audit service and do not include these calls — add them (plus tests)
+> when executing this task.
 
 **Files:**
 - Create: `backend/app/api/v1/admin.py`
