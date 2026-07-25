@@ -706,27 +706,418 @@ feat(tools): RepoWalker with incremental scan via content-hash cache
 
 ---
 
-## Task 4 — Scanner orchestrator + KB uploader
+## Task 4a — Backend: `POST /api/v1/uploads/ingest-batch` + DB-fallback edge resolution
+
+> **[re-plan, human-approved 2026-07-25]** The original Task 4 posted edges to `/api/v1/edges` —
+> that endpoint takes node UUIDs (`EdgeCreate.source_id/target_id`), has no score/props, and is
+> owner-gated interactive mutation, not ingestion. Scanner edges instead ride the existing
+> `KnowledgeIngestor` two-pass via a new batch endpoint. `DEFINED_IN` is dead: canonical label is
+> `DEFINES` (file → symbol). Deliberate scope cuts (Phase 7 candidates): no PARENT_OF hierarchy,
+> no IMPORTS edges, batch endpoint is bounded-synchronous (no run tracking).
 
 **Files:**
-- Create: `tools/kb-codebase-scan/scanner.py`
-- Create: `tools/kb-codebase-scan/tests/test_scanner.py`
+- Modify: `backend/app/services/ingest/base.py` (stats counters, `resolve_edges` db fallback)
+- Modify: `backend/app/api/v1/uploads.py` (schemas + endpoint)
+- Modify: `backend/tests/services/ingest/test_ingest_base.py`
+- Create: `backend/tests/api/test_ingest_batch_api.py`
 
 ### Steps
 
-- [ ] **4.1** Write failing tests:
+- [ ] **4a.1** Write failing service tests — append to `backend/tests/services/ingest/test_ingest_base.py` (reuses its `_graph_recorder`, `db`, `make_user` fixtures; note `_graph_recorder`'s `fake_merge` already accepts `score=None` — extend the tuple it records with `score` so 4a's last test can assert on it: `calls.append(("edge", str(source_id), str(target_id), label, created_by, score))`, and update the existing `("edge", ...)` assertions in this file to compare `c[:5]` or unpack/ignore the extra element):
 
 ```python
-# tools/kb-codebase-scan/tests/test_scanner.py
+async def test_resolve_edges_db_fallback_resolves_committed_ref(db, make_user, monkeypatch):
+    """A ref absent from this batch resolves against an already-persisted row."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    first = KnowledgeIngestor(db, viewer)
+    tgt = await first.upsert(
+        IngestItem(source="codebase", source_ref="r/a.py#a.beta", title="beta", body="b")
+    )
+    await db.flush()
+
+    second = KnowledgeIngestor(db, viewer)  # fresh: empty _ref_to_node
+    src = await second.upsert(
+        IngestItem(source="codebase", source_ref="r/b.py#b.alpha", title="alpha", body="a")
+    )
+    second.add_edge_spec(
+        EdgeSpec(
+            source_ref="r/b.py#b.alpha",
+            target_ref="r/a.py#a.beta",
+            label="CALLS",
+            props={"score": 0.7},
+        )
+    )
+    dangling = await second.resolve_edges(db_fallback=True)
+    assert dangling == 0
+    await ns.run_pending_graph_ops(db)
+    assert ("edge", str(src.id), str(tgt.id), "CALLS", "ingest", 0.7) in calls
+
+
+async def test_resolve_edges_db_fallback_never_crosses_owners(db, make_user, monkeypatch):
+    """Fallback is pinned to (viewer visibility, owner) — another user's node never resolves."""
+    _graph_recorder(monkeypatch)
+    other = await make_user(email="ing_fb_other@test.com")
+    other_viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
+    await KnowledgeIngestor(db, other_viewer).upsert(
+        IngestItem(source="codebase", source_ref="shared.py#x", title="x", body="x")
+    )
+    await db.flush()
+
+    owner = await make_user(email="ing_fb_me@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="mine.py#m", title="m", body="m"))
+    ing.add_edge_spec(EdgeSpec(source_ref="mine.py#m", target_ref="shared.py#x", label="CALLS"))
+    assert await ing.resolve_edges(db_fallback=True) == 1  # dangling, not another owner's node
+
+
+async def test_upsert_stats_created_updated_skipped(db, make_user):
+    owner = await make_user(email="ing_stats@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="s.py", title="S", body="1"))
+    await ing.upsert(IngestItem(source="codebase", source_ref="s.py", title="S", body="1"))
+    await ing.upsert(IngestItem(source="codebase", source_ref="s.py", title="S", body="2"))
+    assert ing.stats == {"created": 1, "skipped": 1, "updated": 1}
+```
+
+- [ ] **4a.2** Run them — MUST fail (`TypeError: unexpected keyword argument 'db_fallback'` / no `stats`):
+```bash
+cd backend && python -m pytest tests/services/ingest/test_ingest_base.py -v   # RED
+```
+
+- [ ] **4a.3** Amend `backend/app/services/ingest/base.py`. In `__init__`, after `self._edge_specs`:
+
+```python
+        # created/updated/skipped counts for this ingestor's lifetime — the
+        # batch endpoint reports them; workers may ignore them.
+        self.stats: dict[str, int] = {"created": 0, "updated": 0, "skipped": 0}
+```
+
+In `upsert`, add one counter per branch: in the `existing is not None` branch, `self.stats["updated"] += 1` right after the `ns.update_node(...)` call and `self.stats["skipped"] += 1` in the unchanged-hash branch; in the create branch, `self.stats["created"] += 1` after `ns.create_node(...)`. Then replace `resolve_edges` entirely and add `_resolve_ref`:
+
+```python
+    async def resolve_edges(self, *, db_fallback: bool = False) -> int:
+        """
+        Pass 2: resolve queued EdgeSpecs to node IDs and QUEUE the graph MERGEs
+        for post-commit run_pending_graph_ops() — never awaited in-transaction
+        (ADR-011). Unresolvable refs are skipped and counted (dangling links are
+        expected in batch imports, not errors). Returns the dangling count.
+
+        db_fallback=True additionally resolves refs not seen by THIS ingestor
+        against persisted rows — same visibility clause + owner pin as upsert's
+        probe (kb-visibility-filter rule 1). Used by the HTTP batch path, where
+        CALLS targets may have been ingested in an earlier request or scan run.
+        """
+        dangling = 0
+        for spec in self._edge_specs:
+            src_node = await self._resolve_ref(spec.source_ref, db_fallback)
+            tgt_node = await self._resolve_ref(spec.target_ref, db_fallback)
+            if src_node is None or tgt_node is None:
+                dangling += 1
+                continue
+            score = spec.props.get("score")
+            ns.queue_graph_op(self._db, partial(gs.upsert_vertex, src_node))
+            ns.queue_graph_op(self._db, partial(gs.upsert_vertex, tgt_node))
+            ns.queue_graph_op(
+                self._db,
+                partial(
+                    gs.merge_edge,
+                    src_node.id,
+                    tgt_node.id,
+                    spec.label,
+                    created_by=str(spec.props.get("created_by", "ingest")),
+                    score=float(score) if score is not None else None,
+                ),
+            )
+        self._edge_specs.clear()
+        return dangling
+
+    async def _resolve_ref(self, ref: str, db_fallback: bool) -> KnowledgeNode | None:
+        node = self._ref_to_node.get(ref)
+        if node is not None or not db_fallback:
+            return node
+        # Owner pin for the same reason as upsert's probe: the visibility
+        # clause alone would match another owner's public node with this ref.
+        node = await self._db.scalar(
+            select(KnowledgeNode).where(
+                visible_nodes_clause(self._viewer),
+                KnowledgeNode.owner_id == self._viewer.user_id,
+                KnowledgeNode.source_ref == ref,
+            )
+        )
+        if node is not None:
+            self._ref_to_node[ref] = node  # memoize: CALLS fan-in hits the same target
+        return node
+```
+
+- [ ] **4a.4** Verify GREEN, including the untouched md-worker path:
+```bash
+cd backend && python -m pytest tests/services/ingest/ tests/workers/test_ingest_md.py -v
+```
+
+- [ ] **4a.5** Write failing API tests — create `backend/tests/api/test_ingest_batch_api.py`:
+
+```python
+"""ingest-batch API tests (Task 4a). Auth/idempotency mirror test_ingest_item_api."""
+
+from httpx import AsyncClient
+
+
+def _item(ref: str, title: str, body: str = "b") -> dict:
+    return {
+        "title": title,
+        "body": body,
+        "node_type": "code_symbol",
+        "source": "codebase",
+        "source_ref": ref,
+        "tags": ["code"],
+    }
+
+
+async def test_batch_creates_nodes_and_queues_edges(client: AsyncClient, auth_headers):
+    r = await client.post(
+        "/api/v1/uploads/ingest-batch",
+        headers=auth_headers,
+        json={
+            "items": [_item("r/f.py", "f.py"), _item("r/f.py#f.alpha", "alpha")],
+            "edges": [
+                {"source_ref": "r/f.py", "target_ref": "r/f.py#f.alpha", "label": "DEFINES"}
+            ],
+        },
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["created"] == 2 and data["edges_queued"] == 1 and data["edges_dangling"] == 0
+
+
+async def test_batch_idempotent_second_run_creates_nothing(client: AsyncClient, auth_headers):
+    payload = {"items": [_item("r/idem.py", "idem.py")], "edges": []}
+    await client.post("/api/v1/uploads/ingest-batch", json=payload, headers=auth_headers)
+    r2 = await client.post("/api/v1/uploads/ingest-batch", json=payload, headers=auth_headers)
+    assert r2.json()["created"] == 0 and r2.json()["skipped"] == 1
+
+
+async def test_batch_resolves_ref_from_previous_request(client: AsyncClient, auth_headers):
+    await client.post(
+        "/api/v1/uploads/ingest-batch",
+        headers=auth_headers,
+        json={"items": [_item("r/prev.py#p.f", "f")], "edges": []},
+    )
+    r = await client.post(
+        "/api/v1/uploads/ingest-batch",
+        headers=auth_headers,
+        json={
+            "items": [_item("r/next.py#n.g", "g")],
+            "edges": [
+                {
+                    "source_ref": "r/next.py#n.g",
+                    "target_ref": "r/prev.py#p.f",
+                    "label": "CALLS",
+                    "confidence": 0.7,
+                }
+            ],
+        },
+    )
+    assert r.json()["edges_queued"] == 1 and r.json()["edges_dangling"] == 0
+
+
+async def test_batch_counts_dangling_edges(client: AsyncClient, auth_headers):
+    r = await client.post(
+        "/api/v1/uploads/ingest-batch",
+        headers=auth_headers,
+        json={
+            "items": [_item("r/only.py", "only.py")],
+            "edges": [
+                {"source_ref": "r/only.py", "target_ref": "r/ghost.py", "label": "DEFINES"}
+            ],
+        },
+    )
+    assert r.status_code == 200 and r.json()["edges_dangling"] == 1
+
+
+async def test_batch_unknown_label_is_422(client: AsyncClient, auth_headers):
+    r = await client.post(
+        "/api/v1/uploads/ingest-batch",
+        headers=auth_headers,
+        json={
+            "items": [],
+            "edges": [{"source_ref": "a", "target_ref": "b", "label": "DEFINED_IN"}],
+        },
+    )
+    assert r.status_code == 422
+
+
+async def test_batch_unauthenticated_is_401(client: AsyncClient):
+    r = await client.post("/api/v1/uploads/ingest-batch", json={"items": [], "edges": []})
+    assert r.status_code == 401
+```
+
+```bash
+cd backend && python -m pytest tests/api/test_ingest_batch_api.py -v   # RED: 404s
+```
+
+- [ ] **4a.6** Add to `backend/app/api/v1/uploads.py`. Imports: extend the existing `from app.services.ingest.base import ...` line with `EdgeSpec`, add `field_validator` to the pydantic import and `from app.services.graph_service import ALLOWED_EDGE_LABELS`. Below `IngestItemIn`:
+
+```python
+class EdgeSpecIn(BaseModel):
+    """Ref-addressed edge for batch ingestion. `confidence` (ADR-009 call edges)
+    maps to merge_edge's score. Label check mirrors EdgeCreate: the label is
+    interpolated into Cypher, only the fixed vocabulary may pass (422)."""
+
+    source_ref: str = Field(..., min_length=1)
+    target_ref: str = Field(..., min_length=1)
+    label: str = "LINKS_TO"
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+    @field_validator("label")
+    @classmethod
+    def _label_allowed(cls, v: str) -> str:
+        if v not in ALLOWED_EDGE_LABELS:
+            raise ValueError("unknown edge label")
+        return v
+
+
+class IngestBatchIn(BaseModel):
+    # Bounded sync upsert (same tradeoff as ingest-item; the run-tracked async
+    # path is the Phase 7 upgrade). Caps keep one request under the kb-api
+    # long-work threshold; clients chunk.
+    items: list[IngestItemIn] = Field(default_factory=list, max_length=200)
+    edges: list[EdgeSpecIn] = Field(default_factory=list, max_length=2000)
+
+
+class IngestBatchOut(BaseModel):
+    created: int
+    updated: int
+    skipped: int
+    edges_queued: int
+    edges_dangling: int
+```
+
+And the endpoint, after `ingest_single_item`:
+
+```python
+@router.post(
+    "/ingest-batch",
+    response_model=IngestBatchOut,
+    summary="Upsert a batch of knowledge nodes and ref-addressed edges",
+    operation_id="ingestBatch",
+)
+async def ingest_batch(
+    payload: IngestBatchIn,
+    viewer: Viewer = Depends(_require_ingest_scope),
+    db: AsyncSession = Depends(get_db),
+) -> IngestBatchOut:
+    """Batch upsert for connectors (codebase scanner). Two-pass edge resolution
+    with DB fallback: refs may point at nodes from earlier batches or scans.
+    Dangling refs are counted, never errors (kb-ingestion-connectors)."""
+    ingestor = KnowledgeIngestor(db, viewer)
+    for item_in in payload.items:
+        await ingestor.upsert(
+            IngestItem(
+                source=item_in.source or "api",
+                source_ref=item_in.source_ref or str(uuid.uuid4()),
+                title=item_in.title,
+                body=item_in.body,
+                node_type=item_in.node_type,
+                visibility=item_in.visibility,
+                tags=item_in.tags,
+                meta=item_in.meta,
+            )
+        )
+    for e in payload.edges:
+        props: dict = {"score": e.confidence} if e.confidence is not None else {}
+        ingestor.add_edge_spec(
+            EdgeSpec(source_ref=e.source_ref, target_ref=e.target_ref, label=e.label, props=props)
+        )
+    dangling = await ingestor.resolve_edges(db_fallback=True)
+    await db.commit()
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
+    return IngestBatchOut(
+        created=ingestor.stats["created"],
+        updated=ingestor.stats["updated"],
+        skipped=ingestor.stats["skipped"],
+        edges_queued=len(payload.edges) - dangling,
+        edges_dangling=dangling,
+    )
+```
+
+- [ ] **4a.7** Full gate:
+```bash
+cd backend && python -m pytest tests/api/test_ingest_batch_api.py tests/services/ingest/ -v  # green
+ruff check app tests && mypy app/services app/schemas
+```
+
+- [ ] **4a.8** Commit:
+```
+feat(api): POST /uploads/ingest-batch — ref-addressed edges with DB-fallback resolution
+```
+
+---
+
+## Task 4b — Scanner orchestrator posting to ingest-batch
+
+**Files:**
+- Modify: `tools/kb-codebase-scan/repo_walker.py` (+ test) — per-repo cache path
+- Create: `tools/kb-codebase-scan/scanner.py`
+- Create: `tools/kb-codebase-scan/tests/test_scanner.py`
+- Modify: `tools/kb-codebase-scan/requirements.txt` (append `types-requests>=2.31` for mypy --strict)
+
+### Steps
+
+- [ ] **4b.1** RED — append to `tools/kb-codebase-scan/tests/test_repo_walker.py` (the cwd-relative default cache breaks test isolation and cross-repo scans):
+
+```python
+def test_cache_file_lives_in_scanned_repo() -> None:
+    repo_dir = make_temp_repo({"m.py": "def f(): pass"})
+    walker = RepoWalker(ScanConfig(repo_path=repo_dir, languages=["python"]))
+    for f in walker.iter_changed_files():
+        walker.mark_scanned(f)
+    walker.save_cache()
+    assert (Path(repo_dir) / ".codebase_scan_cache.json").exists()
+```
+
+- [ ] **4b.2** GREEN — in `repo_walker.py` add a `_cache_path` helper and use it in `_load_cache`/`save_cache` (relative `hash_cache_file` resolves under the repo root; absolute paths still honored). `_load_cache` also self-heals on garbage, mirroring sync_engine 5.R.4:
+
+```python
+    def _cache_path(self) -> Path:
+        p = Path(self._config.hash_cache_file)
+        return p if p.is_absolute() else self._root / p
+
+    def _load_cache(self) -> dict[str, str]:
+        try:
+            with open(self._cache_path()) as f:
+                cache: dict[str, str] = json.load(f)
+                return cache
+        except FileNotFoundError:
+            return {}
+        except (json.JSONDecodeError, OSError):
+            return {}  # unreadable cache → full re-scan; upserts are idempotent
+
+    def save_cache(self) -> None:
+        with open(self._cache_path(), "w") as f:
+            json.dump(self._hash_cache, f)
+```
+```bash
+cd tools/kb-codebase-scan && python -m pytest tests/test_repo_walker.py -v   # 4 passed
+```
+
+- [ ] **4b.3** RED — create `tools/kb-codebase-scan/tests/test_scanner.py`:
+
+```python
 import tempfile
 import textwrap
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
-from scanner import CodebaseScanner, ScanResult
+
 from repo_walker import ScanConfig
+from scanner import CodebaseScanner
 
 
-def make_temp_repo(files):
+def make_temp_repo(files: dict[str, str]) -> str:
     d = tempfile.mkdtemp()
     for name, content in files.items():
         p = Path(d) / name
@@ -735,68 +1126,131 @@ def make_temp_repo(files):
     return d
 
 
-def test_scan_produces_ingest_items():
-    code = textwrap.dedent("""
-        def alpha():
-            beta()
+CALLS_CODE = textwrap.dedent("""
+    def alpha():
+        beta()
 
-        def beta():
-            pass
-    """)
-    repo_dir = make_temp_repo({"lib.py": code})
-    config = ScanConfig(repo_path=repo_dir, languages=["python"], dry_run=True)
-    scanner = CodebaseScanner(config)
-    items, edge_specs = scanner.collect()
-    assert any(item.title == "alpha" or "alpha" in item.title for item in items)
-    assert any(item.title == "beta" or "beta" in item.title for item in items)
+    def beta():
+        pass
+""")
 
 
-def test_scan_dry_run_no_api_calls():
-    """Dry run must not make HTTP calls."""
-    repo_dir = make_temp_repo({"mod.py": "def foo(): pass"})
-    config = ScanConfig(repo_path=repo_dir, languages=["python"], dry_run=True)
-    scanner = CodebaseScanner(config)
+def test_collect_produces_file_and_symbol_items() -> None:
+    repo = make_temp_repo({"lib.py": CALLS_CODE})
+    items, _ = CodebaseScanner(
+        ScanConfig(repo_path=repo, languages=["python"], dry_run=True)
+    ).collect()
+    titles = [i.title for i in items]
+    assert "lib.py" in titles and "alpha" in titles and "beta" in titles
+    assert {i.node_type for i in items} == {"code_file", "code_symbol"}
+    repo_tag = f"codebase:{Path(repo).name}"
+    assert all(repo_tag in i.tags for i in items)
+
+
+def test_defines_edge_is_file_to_symbol() -> None:
+    repo = make_temp_repo({"lib.py": CALLS_CODE})
+    _, edges = CodebaseScanner(
+        ScanConfig(repo_path=repo, languages=["python"], dry_run=True)
+    ).collect()
+    defines = [e for e in edges if e.label == "DEFINES"]
+    assert defines and all(e.source_ref == "lib.py" and "#" in e.target_ref for e in defines)
+
+
+def test_calls_edge_carries_confidence() -> None:
+    repo = make_temp_repo({"lib.py": CALLS_CODE})
+    _, edges = CodebaseScanner(
+        ScanConfig(repo_path=repo, languages=["python"], dry_run=True)
+    ).collect()
+    calls = [e for e in edges if e.label == "CALLS"]
+    assert any(
+        e.source_ref.endswith("#lib.alpha")
+        and e.target_ref.endswith("#lib.beta")
+        and e.confidence == 0.7
+        for e in calls
+    )
+
+
+def test_dry_run_makes_no_api_calls() -> None:
+    repo = make_temp_repo({"mod.py": "def foo(): pass"})
+    scanner = CodebaseScanner(ScanConfig(repo_path=repo, languages=["python"], dry_run=True))
     with patch("requests.Session.post") as mock_post:
         result = scanner.run()
         mock_post.assert_not_called()
     assert result.total >= 1
 
 
-def test_incremental_second_scan_is_empty():
-    """After full scan, a second scan on same files should yield 0 new items."""
-    repo_dir = make_temp_repo({"mod.py": "def foo(): pass"})
-    config = ScanConfig(repo_path=repo_dir, languages=["python"], dry_run=True)
+def test_incremental_second_scan_is_empty() -> None:
+    repo = make_temp_repo({"mod.py": "def foo(): pass"})
+    config = ScanConfig(repo_path=repo, languages=["python"], dry_run=True)
+    CodebaseScanner(config).run()
+    assert CodebaseScanner(config).run().new_items == 0
+
+
+def test_run_posts_batches_to_ingest_batch() -> None:
+    repo = make_temp_repo({"lib.py": CALLS_CODE})
+    config = ScanConfig(
+        repo_path=repo, languages=["python"], kb_token="tok", kb_api_url="http://kb.local"
+    )
     scanner = CodebaseScanner(config)
-    result1 = scanner.run()
-    # Second run — cache should prevent re-processing
-    result2 = scanner.run()
-    assert result2.new_items == 0
+    ok = MagicMock(status_code=200)
+    ok.json.return_value = {
+        "created": 3,
+        "updated": 0,
+        "skipped": 0,
+        "edges_queued": 3,
+        "edges_dangling": 0,
+    }
+    with patch("requests.Session.post", return_value=ok) as mock_post:
+        result = scanner.run()
+    urls = [c.args[0] for c in mock_post.call_args_list]
+    assert urls and all(u == "http://kb.local/api/v1/uploads/ingest-batch" for u in urls)
+    first_payload: dict[str, Any] = mock_post.call_args_list[0].kwargs["json"]
+    assert set(first_payload) == {"items", "edges"}
+    assert result.new_items == 3 and result.failed_batches == 0
+
+
+def test_changed_caller_still_links_to_unchanged_callee() -> None:
+    """Symbol table spans ALL files; items only re-emit for changed ones."""
+    repo = make_temp_repo({"a.py": "def alpha():\n    beta()\n", "b.py": "def beta(): pass"})
+    config = ScanConfig(repo_path=repo, languages=["python"], dry_run=True)
+    CodebaseScanner(config).run()  # everything cached
+    Path(repo, "a.py").write_text("def alpha():\n    beta()\n    beta()\n")
+    items, edges = CodebaseScanner(config).collect()
+    assert all(i.source_ref.startswith("a.py") for i in items)  # only a.py re-emits
+    assert any(e.label == "CALLS" and e.target_ref.endswith("#b.beta") for e in edges)
+```
+```bash
+cd tools/kb-codebase-scan && python -m pytest tests/test_scanner.py -v   # RED: ImportError
 ```
 
-- [ ] **4.2** Create `scanner.py`:
+- [ ] **4b.4** GREEN — create `tools/kb-codebase-scan/scanner.py`:
 
 ```python
 # tools/kb-codebase-scan/scanner.py
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 import requests
 
-from language_parser import ParsedFile, SymbolKind
+from language_parser import LanguageParser, ParsedFile
 from python_parser import PythonParser
-from typescript_parser import TypeScriptParser
 from repo_walker import RepoWalker, ScanConfig
-
-# Import IngestItem-like dataclass (standalone, no backend dependency)
-from dataclasses import dataclass as _dc
+from typescript_parser import TypeScriptParser
 
 logger = logging.getLogger("kb-codebase-scan")
 
+_CALL_CONFIDENCE = 0.7   # heuristic static resolution (ADR-009)
+_MAX_CALL_TARGETS = 3    # cap fan-out per ambiguous call name
+_BATCH_ITEMS = 200       # server cap (IngestBatchIn)
+_BATCH_EDGES = 2000
+_TIMEOUT_S = 30
 
-@_dc
+
+@dataclass
 class ScanIngestItem:
     source: str
     source_ref: str
@@ -804,16 +1258,16 @@ class ScanIngestItem:
     body: str
     node_type: str = "code_symbol"
     visibility: str = "private"
-    tags: list = field(default_factory=list)
-    meta: dict = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
-@_dc
+@dataclass
 class ScanEdgeSpec:
     source_ref: str
     target_ref: str
     label: str = "CALLS"
-    props: dict = field(default_factory=dict)
+    confidence: float | None = None
 
 
 @dataclass
@@ -823,184 +1277,191 @@ class ScanResult:
     updated_items: int = 0
     skipped_files: int = 0
     failed_files: int = 0
+    failed_batches: int = 0
+    edges_sent: int = 0
+    edges_dangling: int = 0
     api_calls: int = 0
 
 
 class CodebaseScanner:
-    """
-    Orchestrates codebase scanning: walk → parse → upsert via KB API.
-    """
+    """Walk → parse → POST /api/v1/uploads/ingest-batch (items + ref edges).
+
+    All symbols across the repo feed the fqn table; only CHANGED files emit
+    items/edges. Edges to unchanged targets resolve server-side (DB fallback);
+    first-run refs resolve in-batch. DEFINES is file → symbol (canonical)."""
 
     def __init__(self, config: ScanConfig) -> None:
         self._config = config
+        self._root = Path(config.repo_path).resolve()
+        self._repo_tag = f"codebase:{self._root.name}"
         self._walker = RepoWalker(config)
-        self._parsers = {
-            ext: parser
-            for parser in [PythonParser(), TypeScriptParser()]
-            for ext in parser.extensions
+        parsers: list[LanguageParser] = [PythonParser(), TypeScriptParser()]
+        self._parsers: dict[str, LanguageParser] = {
+            ext: p for p in parsers for ext in p.extensions
         }
         self._kb_session = requests.Session()
         self._kb_session.headers["Authorization"] = f"Bearer {config.kb_token}"
         self._kb_session.headers["Content-Type"] = "application/json"
+        self._changed: list[Path] = []
 
-    def _make_source_ref(self, file_path: Path, symbol_fqn: str | None = None) -> str:
-        rel = str(file_path.relative_to(Path(self._config.repo_path).resolve()))
-        prefix = self._config.source_ref_prefix
-        base = f"{prefix}{rel}" if prefix else rel
-        return f"{base}#{symbol_fqn}" if symbol_fqn else base
+    def _ref(self, rel_path: str, fqn: str | None = None) -> str:
+        base = f"{self._config.source_ref_prefix}{rel_path}"
+        return f"{base}#{fqn}" if fqn else base
+
+    def _parse(self, path: Path) -> ParsedFile | None:
+        parser = self._parsers.get(path.suffix)
+        if parser is None:
+            return None
+        rel = str(path.relative_to(self._root)).replace("\\", "/")
+        try:
+            return parser.parse(rel, path.read_text(encoding="utf-8", errors="replace"))
+        except Exception as exc:  # error-tolerant by design (ADR-009)
+            logger.warning(f"Parse error in {path}: {exc}")
+            return None
 
     def collect(self) -> tuple[list[ScanIngestItem], list[ScanEdgeSpec]]:
-        """Parse all changed files and return items + edge specs (no API calls)."""
-        items: list[ScanIngestItem] = []
-        edge_specs: list[ScanEdgeSpec] = []
+        """Parse the repo once; emit items + edges for changed files only."""
+        self._changed = list(self._walker.iter_changed_files())
+        changed_rel = {str(p.relative_to(self._root)).replace("\\", "/") for p in self._changed}
+        parsed_files = [pf for p in self._walker.iter_source_files() if (pf := self._parse(p))]
+
         fqn_to_ref: dict[str, str] = {}
+        for pf in parsed_files:
+            for sym in pf.symbols:
+                fqn_to_ref[sym.fqn] = self._ref(pf.file_path, sym.fqn)
 
-        for file_path in self._walker.iter_changed_files():
-            parser = self._parsers.get(file_path.suffix)
-            if not parser:
+        items: list[ScanIngestItem] = []
+        edges: list[ScanEdgeSpec] = []
+        for pf in parsed_files:
+            if pf.file_path not in changed_rel:
                 continue
-
-            try:
-                source = file_path.read_text(encoding="utf-8", errors="replace")
-                parsed = parser.parse(str(file_path.relative_to(Path(self._config.repo_path).resolve())), source)
-            except Exception as exc:
-                logger.warning(f"Parse error in {file_path}: {exc}")
-                continue
-
-            # File-level node
-            file_ref = self._make_source_ref(file_path)
-            file_body = f"# {file_path.name}\n\nModule: `{parsed.module_fqn}`\n\n**Imports:**\n" + "\n".join(f"- `{i}`" for i in parsed.imports[:20])
-            items.append(ScanIngestItem(
-                source="codebase",
-                source_ref=file_ref,
-                title=file_path.name,
-                body=file_body,
-                node_type="code_file",
-                tags=["code", parsed.language],
-                meta={"language": parsed.language, "module_fqn": parsed.module_fqn},
-            ))
-
-            # Symbol-level nodes
-            for sym in parsed.symbols:
-                sym_ref = self._make_source_ref(file_path, sym.fqn)
-                fqn_to_ref[sym.fqn] = sym_ref
-                body = f"# `{sym.fqn}`\n\nType: {sym.kind.value}  Lines: {sym.line_start}–{sym.line_end}\n\n{sym.docstring}"
-                items.append(ScanIngestItem(
+            file_ref = self._ref(pf.file_path)
+            imports_md = "\n".join(f"- `{i}`" for i in pf.imports[:20])
+            items.append(
+                ScanIngestItem(
                     source="codebase",
-                    source_ref=sym_ref,
-                    title=sym.name,
-                    body=body.strip(),
-                    node_type="code_symbol",
-                    tags=["code", parsed.language, sym.kind.value],
-                    meta={"fqn": sym.fqn, "kind": sym.kind.value, "language": parsed.language},
-                ))
+                    source_ref=file_ref,
+                    title=Path(pf.file_path).name,
+                    body=(
+                        f"# {Path(pf.file_path).name}\n\nModule: `{pf.module_fqn}`\n\n"
+                        f"**Imports:**\n{imports_md}"
+                    ),
+                    node_type="code_file",
+                    visibility=self._config.visibility,
+                    tags=["code", pf.language, self._repo_tag],
+                    meta={
+                        "language": pf.language,
+                        "module_fqn": pf.module_fqn,
+                        "file_path": pf.file_path,
+                    },
+                )
+            )
+            for sym in pf.symbols:
+                sym_ref = self._ref(pf.file_path, sym.fqn)
+                items.append(
+                    ScanIngestItem(
+                        source="codebase",
+                        source_ref=sym_ref,
+                        title=sym.name,
+                        body=(
+                            f"# `{sym.fqn}`\n\nType: {sym.kind.value}  "
+                            f"Lines: {sym.line_start}-{sym.line_end}\n\n{sym.docstring}"
+                        ).strip(),
+                        node_type="code_symbol",
+                        visibility=self._config.visibility,
+                        tags=["code", pf.language, sym.kind.value, self._repo_tag],
+                        meta={
+                            "fqn": sym.fqn,
+                            "kind": sym.kind.value,
+                            "language": pf.language,
+                            "file_path": pf.file_path,
+                            "line_start": sym.line_start,
+                        },
+                    )
+                )
+                edges.append(
+                    ScanEdgeSpec(source_ref=file_ref, target_ref=sym_ref, label="DEFINES")
+                )
+                for called in sym.calls:
+                    matches = [f for f in fqn_to_ref if f.endswith(f".{called}")]
+                    for match in matches[:_MAX_CALL_TARGETS]:
+                        if fqn_to_ref[match] != sym_ref:
+                            edges.append(
+                                ScanEdgeSpec(
+                                    source_ref=sym_ref,
+                                    target_ref=fqn_to_ref[match],
+                                    label="CALLS",
+                                    confidence=_CALL_CONFIDENCE,
+                                )
+                            )
+        return items, edges
 
-                # DEFINED_IN: symbol → file
-                edge_specs.append(ScanEdgeSpec(
-                    source_ref=sym_ref, target_ref=file_ref, label="DEFINED_IN",
-                ))
-
-        # CALLS edges (heuristic, confidence=0.7)
-        for file_path in self._walker.iter_source_files():
-            parser = self._parsers.get(file_path.suffix)
-            if not parser:
-                continue
-            try:
-                source = file_path.read_text(encoding="utf-8", errors="replace")
-                parsed = parser.parse(str(file_path.relative_to(Path(self._config.repo_path).resolve())), source)
-            except Exception:
-                continue
-            for sym in parsed.symbols:
-                caller_ref = self._make_source_ref(file_path, sym.fqn)
-                for called_name in sym.calls:
-                    # Find best matching target FQN
-                    matches = [fqn for fqn in fqn_to_ref if fqn.endswith(f".{called_name}")]
-                    for match_fqn in matches[:3]:  # top-3 candidates
-                        edge_specs.append(ScanEdgeSpec(
-                            source_ref=caller_ref,
-                            target_ref=fqn_to_ref[match_fqn],
-                            label="CALLS",
-                            props={"confidence": 0.7},
-                        ))
-
-        return items, edge_specs
+    def _post_batch(
+        self,
+        items: list[ScanIngestItem],
+        edges: list[ScanEdgeSpec],
+        result: ScanResult,
+    ) -> None:
+        r = self._kb_session.post(
+            f"{self._config.kb_api_url}/api/v1/uploads/ingest-batch",
+            json={"items": [asdict(i) for i in items], "edges": [asdict(e) for e in edges]},
+            timeout=_TIMEOUT_S,
+        )
+        result.api_calls += 1
+        r.raise_for_status()
+        data = r.json()
+        result.new_items += int(data["created"])
+        result.updated_items += int(data["updated"])
+        result.edges_sent += int(data["edges_queued"])
+        result.edges_dangling += int(data["edges_dangling"])
 
     def run(self) -> ScanResult:
         result = ScanResult()
-        items, edge_specs = self.collect()
+        items, edges = self.collect()
         result.total = len(items)
 
         if self._config.dry_run:
-            logger.info(f"[DRY RUN] Would upsert {len(items)} items and {len(edge_specs)} edges")
+            logger.info(f"[DRY RUN] Would upsert {len(items)} items, {len(edges)} edges")
             result.new_items = len(items)
-            # Mark files as scanned (update hash cache) even in dry-run
-            for file_path in self._walker.iter_changed_files():
-                self._walker.mark_scanned(file_path)
-            self._walker.save_cache()
-            return result
+        else:
+            failed = False
+            # Items first (all batches), edges after: every ref is committed
+            # before any edge resolution — dangling only for genuinely absent refs.
+            for start in range(0, len(items), _BATCH_ITEMS):
+                try:
+                    self._post_batch(items[start : start + _BATCH_ITEMS], [], result)
+                except Exception as exc:
+                    logger.error(f"Batch upsert failed: {exc}")
+                    result.failed_batches += 1
+                    failed = True
+            for start in range(0, len(edges), _BATCH_EDGES):
+                try:
+                    self._post_batch([], edges[start : start + _BATCH_EDGES], result)
+                except Exception as exc:
+                    logger.error(f"Edge batch failed: {exc}")
+                    result.failed_batches += 1
+                    failed = True
+            if failed:
+                result.failed_files = result.failed_batches  # Task 5 exit-code signal
+                return result  # cache NOT saved → next run re-sends (idempotent upserts)
 
-        # Upsert items
-        for item in items:
-            try:
-                r = self._kb_session.post(
-                    f"{self._config.kb_api_url}/api/v1/uploads/ingest-item",
-                    json={
-                        "title": item.title,
-                        "body": item.body,
-                        "node_type": item.node_type,
-                        "visibility": item.visibility,
-                        "source": item.source,
-                        "source_ref": item.source_ref,
-                        "meta": item.meta,
-                        "tags": item.tags,
-                    },
-                    timeout=30,
-                )
-                result.api_calls += 1
-                r.raise_for_status()
-                if r.status_code == 201:
-                    result.new_items += 1
-                else:
-                    result.updated_items += 1
-            except Exception as exc:
-                logger.error(f"Failed to upsert {item.source_ref}: {exc}")
-                result.failed_files += 1
-
-        # Upsert edges via graph API
-        for spec in edge_specs:
-            try:
-                r = self._kb_session.post(
-                    f"{self._config.kb_api_url}/api/v1/edges",
-                    json={
-                        "source_ref": spec.source_ref,
-                        "target_ref": spec.target_ref,
-                        "label": spec.label,
-                        "props": spec.props,
-                    },
-                    timeout=30,
-                )
-                result.api_calls += 1
-                # 404 on unresolved refs is expected and benign
-            except Exception:
-                pass
-
-        # Mark files as scanned
-        for file_path in self._walker.iter_changed_files():
-            self._walker.mark_scanned(file_path)
+        for path in self._changed:
+            self._walker.mark_scanned(path)
         self._walker.save_cache()
-
         return result
 ```
 
-- [ ] **4.3** Run tests:
+- [ ] **4b.5** Append `types-requests>=2.31` to `tools/kb-codebase-scan/requirements.txt`, then the full gate:
 ```bash
-cd tools/kb-codebase-scan && python -m pytest tests/test_scanner.py -v
-# Expected: 3 passed
+cd tools/kb-codebase-scan
+python -m pytest tests/ -v          # all green (parser 9, walker 4, scanner 8)
+ruff check .                        # clean
+mypy --strict language_parser.py python_parser.py typescript_parser.py repo_walker.py scanner.py
 ```
 
-- [ ] **4.4** Commit:
+- [ ] **4b.6** Commit:
 ```
-feat(tools): CodebaseScanner orchestrator — parse, upsert, CALLS edges with confidence=0.7
+feat(tools): CodebaseScanner — ingest-batch upserts, DEFINES file→symbol, CALLS confidence=0.7
 ```
 
 ---
