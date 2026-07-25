@@ -8,6 +8,9 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Review IMPORTANT: retries alone don't bound a hung socket — every request times out.
+_REQUEST_TIMEOUT = 30  # seconds
+
 
 @dataclass
 class ConfluencePage:
@@ -16,7 +19,7 @@ class ConfluencePage:
     version: int
     space_key: str
     web_url: str
-    body_storage: str | None = None       # XHTML storage format
+    body_storage: str | None = None  # XHTML storage format
     parent_id: str | None = None
     labels: list[str] = field(default_factory=list)
 
@@ -31,7 +34,7 @@ class ConfluenceClient:
         self,
         base_url: str,
         token: str,
-        email: str | None = None,        # required for Cloud (email:token basic auth)
+        email: str | None = None,  # required for Cloud (email:token basic auth)
         verify_ssl: bool = True,
     ) -> None:
         self._base = base_url.rstrip("/")
@@ -67,7 +70,9 @@ class ConfluenceClient:
                 "start": start,
                 "expand": "version,ancestors",
             }
-            r = self._session.get(f"{self._base}/rest/api/content", params=params)
+            r = self._session.get(
+                f"{self._base}/rest/api/content", params=params, timeout=_REQUEST_TIMEOUT
+            )
             r.raise_for_status()
             data = r.json()
 
@@ -79,11 +84,7 @@ class ConfluenceClient:
                         version=item["version"]["number"],
                         space_key=space_key,
                         web_url=item.get("_links", {}).get("webui", ""),
-                        parent_id=(
-                            item["ancestors"][-1]["id"]
-                            if item.get("ancestors")
-                            else None
-                        ),
+                        parent_id=(item["ancestors"][-1]["id"] if item.get("ancestors") else None),
                     )
                 )
 
@@ -98,13 +99,13 @@ class ConfluenceClient:
         r = self._session.get(
             f"{self._base}/rest/api/content/{page_id}",
             params={"expand": "body.storage,version,space,ancestors,metadata.labels"},
+            timeout=_REQUEST_TIMEOUT,
         )
         r.raise_for_status()
         item = r.json()
 
         labels = [
-            lbl["name"]
-            for lbl in item.get("metadata", {}).get("labels", {}).get("results", [])
+            lbl["name"] for lbl in item.get("metadata", {}).get("labels", {}).get("results", [])
         ]
 
         return ConfluencePage(
@@ -114,8 +115,6 @@ class ConfluenceClient:
             space_key=item.get("space", {}).get("key", ""),
             web_url=item.get("_links", {}).get("webui", ""),
             body_storage=item.get("body", {}).get("storage", {}).get("value", ""),
-            parent_id=(
-                item["ancestors"][-1]["id"] if item.get("ancestors") else None
-            ),
+            parent_id=(item["ancestors"][-1]["id"] if item.get("ancestors") else None),
             labels=labels,
         )

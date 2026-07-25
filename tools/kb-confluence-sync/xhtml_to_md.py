@@ -18,9 +18,7 @@ def convert_storage_to_md(xhtml: str, return_meta: Literal[False] = False) -> st
 
 
 @overload
-def convert_storage_to_md(
-    xhtml: str, return_meta: Literal[True]
-) -> tuple[str, dict[str, Any]]: ...
+def convert_storage_to_md(xhtml: str, return_meta: Literal[True]) -> tuple[str, dict[str, Any]]: ...
 
 
 def convert_storage_to_md(
