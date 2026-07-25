@@ -496,24 +496,50 @@ feat(tools): XHTML→Markdown converter with Confluence macro handling
 
 ### Steps
 
-- [ ] **3.1** Write failing tests:
+- [x] **3.1** Write failing tests:
+
+> **[plan-fix]** Adjusted from the original block for this repo's gates: typed signatures + no
+> unused imports (ruff/`mypy --strict`, matching Task 1/2 test style); tests write the version
+> cache to `tmp_path` instead of the repo cwd; added a fourth test
+> (`test_sync_twice_second_run_all_skipped`) — the sync-twice idempotency test required by
+> `kb-ingestion-connectors` and this plan's exit criteria.
 
 ```python
 # tools/kb-confluence-sync/tests/test_sync_engine.py
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-import pytest
-from sync_engine import SyncEngine, SyncConfig, SyncResult
+
 from confluence_client import ConfluencePage
+from sync_engine import SyncConfig, SyncEngine, SyncResult
 
 
-def make_page(pid="1", title="Test", version=1, body="<p>Content</p>"):
+def make_page(
+    pid: str = "1", title: str = "Test", version: int = 1, body: str = "<p>Content</p>"
+) -> ConfluencePage:
     return ConfluencePage(
-        page_id=pid, title=title, version=version,
-        space_key="TS", web_url=f"/pages/{pid}", body_storage=body,
+        page_id=pid,
+        title=title,
+        version=version,
+        space_key="TS",
+        web_url=f"/pages/{pid}",
+        body_storage=body,
     )
 
 
-def test_sync_result_counts():
+def make_config(dry_run: bool, cache_file: str) -> SyncConfig:
+    return SyncConfig(
+        confluence_url="https://example.atlassian.net/wiki",
+        confluence_token="tok",
+        confluence_email="user@test.com",
+        space_keys=["TS"],
+        kb_api_url="http://localhost:8000",
+        kb_token="kb-tok",
+        dry_run=dry_run,
+        version_cache_file=cache_file,
+    )
+
+
+def test_sync_result_counts() -> None:
     result = SyncResult()
     result.created += 1
     result.updated += 2
@@ -521,37 +547,24 @@ def test_sync_result_counts():
     assert result.total == 6
 
 
-def test_sync_engine_dry_run():
+def test_sync_engine_dry_run(tmp_path: Path) -> None:
     """Dry run must not call the KB API."""
-    config = SyncConfig(
-        confluence_url="https://example.atlassian.net/wiki",
-        confluence_token="tok",
-        confluence_email="user@test.com",
-        space_keys=["TS"],
-        kb_api_url="http://localhost:8000",
-        kb_token="kb-tok",
-        dry_run=True,
-    )
+    config = make_config(dry_run=True, cache_file=str(tmp_path / "versions.json"))
     engine = SyncEngine(config)
     pages = [make_page("1", "Page 1"), make_page("2", "Page 2")]
-    with patch.object(engine._client, "list_pages", return_value=pages), \
-         patch.object(engine._client, "get_page", side_effect=lambda pid: make_page(pid)):
+    with (
+        patch.object(engine._client, "list_pages", return_value=pages),
+        patch.object(engine._client, "get_page", side_effect=lambda pid: make_page(pid)),
+    ):
         result = engine.sync_space("TS")
         assert result.total > 0
         # In dry run mode, no HTTP calls to KB API
         assert result.api_calls == 0
 
 
-def test_sync_skips_unchanged_page():
+def test_sync_skips_unchanged_page(tmp_path: Path) -> None:
     """Page with same version should be skipped (idempotency)."""
-    config = SyncConfig(
-        confluence_url="https://example.atlassian.net/wiki",
-        confluence_token="tok",
-        space_keys=["TS"],
-        kb_api_url="http://localhost:8000",
-        kb_token="kb-tok",
-        dry_run=False,
-    )
+    config = make_config(dry_run=False, cache_file=str(tmp_path / "versions.json"))
     engine = SyncEngine(config)
     # Simulate: page already synced at version 3
     engine._version_cache["TS:1"] = 3
@@ -562,9 +575,41 @@ def test_sync_skips_unchanged_page():
         assert result.skipped == 1
         assert result.created == 0
         assert result.updated == 0
+
+
+def test_sync_twice_second_run_all_skipped(tmp_path: Path) -> None:
+    """Full idempotency: re-sync with a fresh engine skips every unchanged page."""
+    config = make_config(dry_run=False, cache_file=str(tmp_path / "versions.json"))
+    pages = [make_page("1", "Page 1"), make_page("2", "Page 2")]
+
+    def run_sync() -> SyncResult:
+        engine = SyncEngine(config)
+        engine._kb_session = MagicMock()
+        engine._kb_session.post.return_value.status_code = 201
+        with (
+            patch.object(engine._client, "list_pages", return_value=pages),
+            patch.object(engine._client, "get_page", side_effect=lambda pid: make_page(pid)),
+        ):
+            return engine.sync_space("TS")
+
+    first = run_sync()
+    assert first.created == 2
+    assert first.failed == 0
+
+    second = run_sync()  # fresh engine → cache re-loaded from disk
+    assert second.skipped == 2
+    assert second.created == 0
+    assert second.updated == 0
+    assert second.api_calls == 0
 ```
 
-- [ ] **3.2** Create `sync_engine.py`:
+- [x] **3.2** Create `sync_engine.py`:
+
+> **[plan-fix]** Deviations from the original block, all forced by ruff/`mypy --strict`:
+> removed unused `field`/`Any` imports; `_load_cache` assigns `json.load` to a typed local
+> (mypy strict forbids returning `Any`); `sync_all` annotates `results`; dropped the dead
+> `r = self._kb_session.get(/api/v1/nodes...)` existence check (F841 — its response was never
+> read; the ingest-item endpoint owns upsert semantics per Task 4).
 
 ```python
 # tools/kb-confluence-sync/sync_engine.py
@@ -572,8 +617,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import requests
 
@@ -632,7 +676,8 @@ class SyncEngine:
     def _load_cache(self) -> dict[str, int]:
         try:
             with open(self._config.version_cache_file) as f:
-                return json.load(f)
+                cache: dict[str, int] = json.load(f)
+                return cache
         except FileNotFoundError:
             return {}
 
@@ -694,14 +739,7 @@ class SyncEngine:
             "tags": page.labels,
         }
 
-        # Check if node already exists by source_ref
-        r = self._kb_session.get(
-            f"{self._config.kb_api_url}/api/v1/nodes",
-            params={"source_ref": source_ref, "limit": 1},
-        )
-        result.api_calls += 1
-
-        # Simple upsert: POST creates or PATCH updates (server handles idempotency)
+        # Upsert: the ingest-item endpoint creates (201) or updates (200) by source_ref
         ingest_r = self._kb_session.post(
             f"{self._config.kb_api_url}/api/v1/uploads/ingest-item",
             json=payload,
@@ -715,20 +753,20 @@ class SyncEngine:
             result.updated += 1
 
     def sync_all(self) -> dict[str, SyncResult]:
-        results = {}
+        results: dict[str, SyncResult] = {}
         for space_key in self._config.space_keys:
             logger.info(f"Syncing space: {space_key}")
             results[space_key] = self.sync_space(space_key)
         return results
 ```
 
-- [ ] **3.3** Run tests:
+- [x] **3.3** Run tests:
 ```bash
 cd tools/kb-confluence-sync && python -m pytest tests/test_sync_engine.py -v
-# Expected: 3 passed
+# Expected: 4 passed  [plan-fix: was 3 — sync-twice idempotency test added in 3.1]
 ```
 
-- [ ] **3.4** Commit:
+- [x] **3.4** Commit:
 ```
 feat(tools): SyncEngine with incremental sync, version cache, dry-run mode
 ```
