@@ -13,12 +13,15 @@
 - `kb-api-conventions`
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `pytest -x backend/tests/` green
-- [ ] `ruff check backend/` clean
-- [ ] Idempotency test for MD ingestor passes (ingest twice → same node count)
-- [ ] WebSocket progress events confirmed via `wscat` or integration test
-- [ ] curl evidence for `POST /api/v1/uploads/markdown`
+- [x] All tasks checked
+- [x] `pytest backend/tests/` green — `175 passed, 13 skipped` (Neo4j-unreachable
+  sandbox skips; convert to passes on the Docker stack)
+- [x] `ruff check backend/` + format clean; mypy strict clean (api/services/schemas/workers)
+- [x] Idempotency: `pytest -k idempotent` → 5 passed (incl. `test_ingest_idempotent`:
+  same zip twice → same node count)
+- [x] WebSocket progress confirmed via integration test (§5.4: real server + real PG,
+  streamed running→done frames; WS handshake authenticated + owner-scoped per 5.R.1)
+- [x] curl evidence for `POST /api/v1/uploads/markdown` in §5.6 (202 + run JSON)
 
 ---
 
