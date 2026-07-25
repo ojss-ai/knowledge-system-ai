@@ -21,7 +21,9 @@ async def test_fts_finds_node(db, make_user, make_node):
     await db.flush()
 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
-    results, total = await ss.hybrid_search(db, "PostgreSQL", viewer, fake_embedder=FakeEmbedder())
+    results, total = await ss.hybrid_search(
+        db, "PostgreSQL", viewer, embedder_override=FakeEmbedder()
+    )
     ids = [r["id"] for r in results]
     assert str(node.id) in ids
 
@@ -39,7 +41,7 @@ async def test_vector_finds_similar(db, make_user, make_node, fake_embedder):
 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     results, total = await ss.hybrid_search(
-        db, "embeddings similarity", viewer, fake_embedder=fake_embedder
+        db, "embeddings similarity", viewer, embedder_override=fake_embedder
     )
     ids = [r["id"] for r in results]
     assert str(node.id) in ids
@@ -65,7 +67,9 @@ async def test_private_node_excluded_from_search(db, make_user, make_node, fake_
     await _embed_node_impl(db, decoy.id, fake_embedder)
 
     viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
-    results, _ = await ss.hybrid_search(db, "secret private", viewer, fake_embedder=fake_embedder)
+    results, _ = await ss.hybrid_search(
+        db, "secret private", viewer, embedder_override=fake_embedder
+    )
     ids = [r["id"] for r in results]
     assert str(decoy.id) in ids, "sanity: both search legs ran for this viewer"
     assert str(node.id) not in ids, "Private node must not appear in another user's search"
@@ -86,7 +90,7 @@ async def test_search_special_characters_do_not_crash(db, make_user, make_node, 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
 
     for q in ["issue(#123)", "a & b | c", "unbalanced (paren", "'quote", "!:*"]:
-        results, _total = await ss.hybrid_search(db, q, viewer, fake_embedder=fake_embedder)
+        results, _total = await ss.hybrid_search(db, q, viewer, embedder_override=fake_embedder)
         assert isinstance(results, list)  # must not raise
 
 
@@ -103,10 +107,10 @@ async def test_search_pagination_deterministic_on_ties(db, make_user, make_node,
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
 
     page1, _ = await ss.hybrid_search(
-        db, "gadget", viewer, fake_embedder=fake_embedder, limit=3, offset=0
+        db, "gadget", viewer, embedder_override=fake_embedder, limit=3, offset=0
     )
     page2, _ = await ss.hybrid_search(
-        db, "gadget", viewer, fake_embedder=fake_embedder, limit=3, offset=3
+        db, "gadget", viewer, embedder_override=fake_embedder, limit=3, offset=3
     )
     ids1 = {r["id"] for r in page1}
     ids2 = {r["id"] for r in page2}

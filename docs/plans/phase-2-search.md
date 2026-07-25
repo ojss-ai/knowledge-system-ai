@@ -1587,7 +1587,9 @@ async def test_fts_finds_node(db, make_user, make_node):
     await db.flush()
 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
-    results, total = await ss.hybrid_search(db, "PostgreSQL", viewer, fake_embedder=FakeEmbedder())
+    results, total = await ss.hybrid_search(
+        db, "PostgreSQL", viewer, embedder_override=FakeEmbedder()
+    )
     ids = [r["id"] for r in results]
     assert str(node.id) in ids
 
@@ -1605,7 +1607,7 @@ async def test_vector_finds_similar(db, make_user, make_node, fake_embedder):
 
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     results, total = await ss.hybrid_search(
-        db, "embeddings similarity", viewer, fake_embedder=fake_embedder
+        db, "embeddings similarity", viewer, embedder_override=fake_embedder
     )
     ids = [r["id"] for r in results]
     assert str(node.id) in ids
@@ -1631,7 +1633,9 @@ async def test_private_node_excluded_from_search(db, make_user, make_node, fake_
     await _embed_node_impl(db, decoy.id, fake_embedder)
 
     viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
-    results, _ = await ss.hybrid_search(db, "secret private", viewer, fake_embedder=fake_embedder)
+    results, _ = await ss.hybrid_search(
+        db, "secret private", viewer, embedder_override=fake_embedder
+    )
     ids = [r["id"] for r in results]
     assert str(decoy.id) in ids, "sanity: both search legs ran for this viewer"
     assert str(node.id) not in ids, "Private node must not appear in another user's search"
@@ -1639,7 +1643,7 @@ async def test_private_node_excluded_from_search(db, make_user, make_node, fake_
     assert not any("Secret" in r["title"] for r in results)
 ```
 
-- [x] **7.2** Implement `search_service.py` with exact RRF fusion from kb-pgvector-search skill:
+- [x] **7.2** Implement `search_service.py` with exact RRF fusion from kb-pgvector-search skill: *([phase-7 2.R.3]: the `fake_embedder` kwarg was renamed `embedder_override` once rag_service started injecting an embedder on a production path — snippets below updated to match)*
 
 ```python
 # backend/app/services/search_service.py
@@ -1674,15 +1678,19 @@ async def hybrid_search(
     *,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
-    fake_embedder: Embedder | None = None,
+    embedder_override: Embedder | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """
     Hybrid RRF search: FTS leg + vector leg fused with Reciprocal Rank Fusion.
     Returns (results, total_count).
 
     score = Σ 1 / (k + rank_i)   where k=60
+
+    embedder_override injects an already-constructed Embedder — a production
+    path (rag_service passes its embedder through), not a test-only hook.
+    Defaults to get_embedder().
     """
-    embedder = fake_embedder or get_embedder()
+    embedder = embedder_override or get_embedder()
     query_vec = embedder.embed([query])[0]
 
     # Build visibility predicate as a subquery node_id list

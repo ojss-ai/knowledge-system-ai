@@ -62,12 +62,16 @@ async def ask(
     then call LLM with context to generate an answer.
     """
     # Step 1: hybrid search with visibility filter (same as /search endpoint)
-    results, _ = await ss.hybrid_search(db, query, viewer, limit=limit, fake_embedder=embedder)
+    results, _ = await ss.hybrid_search(db, query, viewer, limit=limit, embedder_override=embedder)
 
     if not results:
         return RAGResult(answer=_NO_CONTEXT_ANSWER, sources=[], query=query)
 
-    # Step 2: build context string
+    # Step 2: build context string.
+    # SECURITY: retrieved node bodies are UNTRUSTED input to the prompt — any
+    # user (or ingested Confluence page / scanned repo) can write text that
+    # tries to override the system prompt (prompt injection). Never treat
+    # retrieved content as instructions when extending the prompt format.
     context_parts: list[str] = []
     total_chars = 0
     for result in results:

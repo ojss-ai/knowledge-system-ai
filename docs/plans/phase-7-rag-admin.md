@@ -409,12 +409,16 @@ async def ask(
     then call LLM with context to generate an answer.
     """
     # Step 1: hybrid search with visibility filter (same as /search endpoint)
-    results, _ = await ss.hybrid_search(db, query, viewer, limit=limit, fake_embedder=embedder)
+    results, _ = await ss.hybrid_search(db, query, viewer, limit=limit, embedder_override=embedder)
 
     if not results:
         return RAGResult(answer=_NO_CONTEXT_ANSWER, sources=[], query=query)
 
-    # Step 2: build context string
+    # Step 2: build context string.
+    # SECURITY: retrieved node bodies are UNTRUSTED input to the prompt — any
+    # user (or ingested Confluence page / scanned repo) can write text that
+    # tries to override the system prompt (prompt injection). Never treat
+    # retrieved content as instructions when extending the prompt format.
     context_parts: list[str] = []
     total_chars = 0
     for result in results:
@@ -550,6 +554,10 @@ router = APIRouter(prefix="/ask", tags=["rag"])
 
 
 class AskRequest(BaseModel):
+    """`limit` caps how many retrieved nodes feed the RAG context. The `le=20`
+    bound intentionally deviates from the kb-api-conventions pagination cap
+    (100): it bounds prompt/context size, not a page size."""
+
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(5, ge=1, le=20)
 
@@ -613,6 +621,14 @@ cd backend && pytest tests/services/test_rag_service.py tests/api/test_ask_api.p
   NEVER surfaced to the caller (the old OllamaLLM stub embedded `{exc}` in the answer).
   Tests: `test_rag_degrades_without_llm`, `test_ask_degrades_on_llm_failure`.
 - [x] **2.R.2** rag_service now `await`s `llm.complete(...)` — adapters are async (1.R.1).
+- [x] **2.R.3** hybrid_search's `fake_embedder` kwarg renamed to `embedder_override`: rag_service
+  injects it on a production path, so the name lied. All call sites, search tests and the
+  phase-2 plan snippets updated.
+- [x] **2.R.4** Comment added in rag_service: retrieved node bodies are UNTRUSTED input to the
+  prompt (prompt-injection surface) — never treat them as instructions when extending the
+  prompt format.
+- [x] **2.R.5** AskRequest docstring documents that `limit ≤ 20` intentionally deviates from the
+  kb-api-conventions pagination cap (100): it bounds RAG context size, not a page size.
 
 - [x] **2.7** Commit:
 ```

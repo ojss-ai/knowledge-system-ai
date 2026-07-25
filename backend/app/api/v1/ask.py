@@ -22,6 +22,10 @@ router = APIRouter(prefix="/ask", tags=["rag"])
 
 
 class AskRequest(BaseModel):
+    """`limit` caps how many retrieved nodes feed the RAG context. The `le=20`
+    bound intentionally deviates from the kb-api-conventions pagination cap
+    (100): it bounds prompt/context size, not a page size."""
+
     query: str = Field(min_length=1, max_length=500)
     limit: int = Field(5, ge=1, le=20)
 
