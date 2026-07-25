@@ -121,3 +121,10 @@ async def test_revoke_other_users_token_is_404(
 async def test_revoke_missing_token_is_404(client: AsyncClient, auth_headers):
     r = await client.delete(f"/api/v1/tokens/{uuid.uuid4()}", headers=auth_headers)
     assert r.status_code == 404
+
+
+async def test_revoke_token_unauthenticated_is_401(client):
+    import uuid
+
+    r = await client.delete(f"/api/v1/tokens/{uuid.uuid4()}")
+    assert r.status_code == 401
