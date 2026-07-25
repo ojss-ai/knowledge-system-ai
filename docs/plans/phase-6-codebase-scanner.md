@@ -27,19 +27,28 @@
 - Create: `tools/kb-codebase-scan/language_parser.py`
 - Create: `tools/kb-codebase-scan/python_parser.py`
 - Create: `tools/kb-codebase-scan/tests/test_python_parser.py`
+- Create: `tools/kb-codebase-scan/ruff.toml` ([plan-fix] mirrors `tools/kb-confluence-sync/ruff.toml` so the phase exit criterion `ruff check tools/kb-codebase-scan/` runs with project settings)
+
+> **[plan-fix] block sync (Tasks 1–2):** code blocks below updated to match the committed code:
+> `SymbolKind` inherits `enum.StrEnum` (ruff UP042; matches backend `NodeType`/`Visibility`); tree-sitter
+> `Node`/`Iterator` type annotations added so `mypy --strict` passes (tree-sitter 0.26 ships py.typed);
+> tests annotated `-> None` and unused imports dropped (ruff F401). Committed files are additionally
+> `ruff format`-ed (slice spacing, call wrapping) — not re-transcribed here. tree-sitter >=0.22 API
+> (`Language(tspython.language())`, `Parser(lang)`) works as written on tree-sitter 0.26.0.
 
 ### Steps
 
-- [ ] **1.1** Write the failing tests:
+- [x] **1.1** Write the failing tests:
 
 ```python
 # tools/kb-codebase-scan/tests/test_python_parser.py
 import textwrap
+
+from language_parser import SymbolKind
 from python_parser import PythonParser
-from language_parser import ParsedFile, ParsedSymbol, SymbolKind
 
 
-def test_parses_functions():
+def test_parses_functions() -> None:
     code = textwrap.dedent("""
         def greet(name: str) -> str:
             return f"Hello, {name}"
@@ -50,7 +59,7 @@ def test_parses_functions():
     assert any(s.name == "greet" for s in syms)
 
 
-def test_parses_classes():
+def test_parses_classes() -> None:
     code = textwrap.dedent("""
         class MyClass:
             def method(self):
@@ -62,14 +71,14 @@ def test_parses_classes():
     assert any(s.name == "MyClass" for s in classes)
 
 
-def test_parses_imports():
+def test_parses_imports() -> None:
     code = "import os\nfrom pathlib import Path\n"
     parser = PythonParser()
     result = parser.parse("imp.py", code)
     assert "os" in result.imports or any("os" in imp for imp in result.imports)
 
 
-def test_detects_function_calls():
+def test_detects_function_calls() -> None:
     code = textwrap.dedent("""
         def main():
             greet("world")
@@ -83,13 +92,14 @@ def test_detects_function_calls():
     assert "greet" in calls[0].calls or "print" in calls[0].calls
 
 
-def test_parse_result_satisfies_protocol():
+def test_parse_result_satisfies_protocol() -> None:
     from language_parser import LanguageParser
+
     parser = PythonParser()
     assert isinstance(parser, LanguageParser)
 ```
 
-- [ ] **1.2** Create `language_parser.py`:
+- [x] **1.2** Create `language_parser.py`:
 
 ```python
 # tools/kb-codebase-scan/language_parser.py
@@ -100,7 +110,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 
-class SymbolKind(str, enum.Enum):
+class SymbolKind(enum.StrEnum):
     MODULE = "module"
     CLASS = "class"
     FUNCTION = "function"
@@ -143,20 +153,22 @@ class LanguageParser(Protocol):
         ...
 ```
 
-- [ ] **1.3** Create `python_parser.py` (uses tree-sitter):
+- [x] **1.3** Create `python_parser.py` (uses tree-sitter):
 
 ```python
 # tools/kb-codebase-scan/python_parser.py
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
-from language_parser import LanguageParser, ParsedFile, ParsedSymbol, SymbolKind
+from language_parser import ParsedFile, ParsedSymbol, SymbolKind
 
 try:
     import tree_sitter_python as tspython
-    from tree_sitter import Language, Parser
+    from tree_sitter import Language, Node, Parser
+
     _PY_LANG = Language(tspython.language())
     _HAS_TREE_SITTER = True
 except ImportError:
@@ -204,7 +216,14 @@ class PythonParser:
         self._walk_node(root, pf, source, parent_fqn=None, class_fqn=None)
         return pf
 
-    def _walk_node(self, node, pf: ParsedFile, source: str, parent_fqn: str | None, class_fqn: str | None):
+    def _walk_node(
+        self,
+        node: Node,
+        pf: ParsedFile,
+        source: str,
+        parent_fqn: str | None,
+        class_fqn: str | None,
+    ) -> None:
         if node.type == "class_definition":
             name_node = node.child_by_field_name("name")
             name = source[name_node.start_byte:name_node.end_byte] if name_node else "Unknown"
@@ -242,7 +261,7 @@ class PythonParser:
             for child in node.children:
                 self._walk_node(child, pf, source, parent_fqn=parent_fqn, class_fqn=class_fqn)
 
-    def _extract_docstring(self, node, source: str) -> str:
+    def _extract_docstring(self, node: Node, source: str) -> str:
         body = node.child_by_field_name("body")
         if not body:
             return ""
@@ -254,7 +273,7 @@ class PythonParser:
                 return raw.strip("\"'").strip()
         return ""
 
-    def _extract_calls(self, func_node, source: str) -> list[str]:
+    def _extract_calls(self, func_node: Node, source: str) -> list[str]:
         calls: list[str] = []
         for node in self._iter_nodes(func_node):
             if node.type == "call":
@@ -266,7 +285,7 @@ class PythonParser:
                     calls.append(name)
         return list(set(calls))
 
-    def _iter_nodes(self, node):
+    def _iter_nodes(self, node: Node) -> Iterator[Node]:
         yield node
         for child in node.children:
             yield from self._iter_nodes(child)
@@ -302,7 +321,7 @@ class PythonParser:
         return pf
 ```
 
-- [ ] **1.4** Create `tools/kb-codebase-scan/requirements.txt`:
+- [x] **1.4** Create `tools/kb-codebase-scan/requirements.txt`:
 ```
 requests>=2.31
 tree-sitter>=0.21
@@ -312,7 +331,7 @@ python-dotenv>=1.0
 gitpython>=3.1
 ```
 
-- [ ] **1.5** Run tests:
+- [x] **1.5** Run tests:
 ```bash
 cd tools/kb-codebase-scan
 pip install -r requirements.txt --break-system-packages
@@ -320,7 +339,7 @@ python -m pytest tests/test_python_parser.py -v
 # Expected: 5 passed
 ```
 
-- [ ] **1.6** Commit:
+- [x] **1.6** Commit:
 ```
 feat(tools): LanguageParser protocol + PythonParser with tree-sitter
 ```
