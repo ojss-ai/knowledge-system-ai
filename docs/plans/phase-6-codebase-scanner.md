@@ -720,6 +720,12 @@ feat(tools): RepoWalker with incremental scan via content-hash cache
 > `scalar()`'s overload to Any (`no-any-return`). Committed test file is additionally `ruff format`-ed
 > (edge-dict lines collapsed) — not re-transcribed here.
 
+> **[review-fix 4.R.1] blocks 4a.1/4a.3/4a.6 updated in place:** `resolve_edges` gained
+> `fallback_source` (the DB probe is source-pinned; skipped when None), `IngestBatchIn` gained an
+> optional `fallback_source` field, and the endpoint derives it from the items' single distinct
+> source. Three new source-scope service tests and three new API tests live in the committed test
+> files (named in 4.R.1) — not re-transcribed here.
+
 **Files:**
 - Modify: `backend/app/services/ingest/base.py` (stats counters, `resolve_edges` db fallback)
 - Modify: `backend/app/api/v1/uploads.py` (schemas + endpoint)
@@ -754,7 +760,7 @@ async def test_resolve_edges_db_fallback_resolves_committed_ref(db, make_user, m
             props={"score": 0.7},
         )
     )
-    dangling = await second.resolve_edges(db_fallback=True)
+    dangling = await second.resolve_edges(db_fallback=True, fallback_source="codebase")
     assert dangling == 0
     await ns.run_pending_graph_ops(db)
     assert ("edge", str(src.id), str(tgt.id), "CALLS", "ingest", 0.7) in calls
@@ -775,7 +781,8 @@ async def test_resolve_edges_db_fallback_never_crosses_owners(db, make_user, mon
     ing = KnowledgeIngestor(db, viewer)
     await ing.upsert(IngestItem(source="codebase", source_ref="mine.py#m", title="m", body="m"))
     ing.add_edge_spec(EdgeSpec(source_ref="mine.py#m", target_ref="shared.py#x", label="CALLS"))
-    assert await ing.resolve_edges(db_fallback=True) == 1  # dangling, not another owner's node
+    dangling = await ing.resolve_edges(db_fallback=True, fallback_source="codebase")
+    assert dangling == 1  # dangling, not another owner's node
 
 
 async def test_upsert_stats_created_updated_skipped(db, make_user):
@@ -804,7 +811,9 @@ cd backend && python -m pytest tests/services/ingest/test_ingest_base.py -v   # 
 In `upsert`, add one counter per branch: in the `existing is not None` branch, `self.stats["updated"] += 1` right after the `ns.update_node(...)` call and `self.stats["skipped"] += 1` in the unchanged-hash branch; in the create branch, `self.stats["created"] += 1` after `ns.create_node(...)`. Then replace `resolve_edges` entirely and add `_resolve_ref`:
 
 ```python
-    async def resolve_edges(self, *, db_fallback: bool = False) -> int:
+    async def resolve_edges(
+        self, *, db_fallback: bool = False, fallback_source: str | None = None
+    ) -> int:
         """
         Pass 2: resolve queued EdgeSpecs to node IDs and QUEUE the graph MERGEs
         for post-commit run_pending_graph_ops() — never awaited in-transaction
@@ -813,13 +822,20 @@ In `upsert`, add one counter per branch: in the `existing is not None` branch, `
 
         db_fallback=True additionally resolves refs not seen by THIS ingestor
         against persisted rows — same visibility clause + owner pin as upsert's
-        probe (kb-visibility-filter rule 1). Used by the HTTP batch path, where
-        CALLS targets may have been ingested in an earlier request or scan run.
+        probe (kb-visibility-filter rule 1), plus a source pin [review-fix
+        4.R.1]: source_ref is only unique WITHIN a source, so the probe filters
+        on fallback_source and is SKIPPED (ref counts as dangling) when
+        fallback_source is None — never probe unscoped, or a same-owner md doc
+        and code file sharing a source_ref would mislink. The in-memory
+        _ref_to_node map is intentionally NOT source-pinned: within one
+        ingestor all items belong to one logical import. Used by the HTTP batch
+        path, where CALLS targets may have been ingested in an earlier request
+        or scan run.
         """
         dangling = 0
         for spec in self._edge_specs:
-            src_node = await self._resolve_ref(spec.source_ref, db_fallback)
-            tgt_node = await self._resolve_ref(spec.target_ref, db_fallback)
+            src_node = await self._resolve_ref(spec.source_ref, db_fallback, fallback_source)
+            tgt_node = await self._resolve_ref(spec.target_ref, db_fallback, fallback_source)
             if src_node is None or tgt_node is None:
                 dangling += 1
                 continue
@@ -840,12 +856,16 @@ In `upsert`, add one counter per branch: in the `existing is not None` branch, `
         self._edge_specs.clear()
         return dangling
 
-    async def _resolve_ref(self, ref: str, db_fallback: bool) -> KnowledgeNode | None:
+    async def _resolve_ref(
+        self, ref: str, db_fallback: bool, fallback_source: str | None
+    ) -> KnowledgeNode | None:
         node = self._ref_to_node.get(ref)
-        if node is not None or not db_fallback:
+        if node is not None or not db_fallback or fallback_source is None:
             return node
         # Owner pin for the same reason as upsert's probe: the visibility
         # clause alone would match another owner's public node with this ref.
+        # Source pin [review-fix 4.R.1]: source_ref is only unique within a
+        # source — probing without it could hijack a same-owner ref collision.
         # [plan-fix] fresh binding (not `node = ...`): reassigning the
         # dict.get-inferred variable makes mypy --strict resolve scalar()'s
         # overload to Any → no-any-return.
@@ -853,6 +873,7 @@ In `upsert`, add one counter per branch: in the `existing is not None` branch, `
             select(KnowledgeNode).where(
                 visible_nodes_clause(self._viewer),
                 KnowledgeNode.owner_id == self._viewer.user_id,
+                KnowledgeNode.source == fallback_source,
                 KnowledgeNode.source_ref == ref,
             )
         )
@@ -994,6 +1015,12 @@ class IngestBatchIn(BaseModel):
     # long-work threshold; clients chunk.
     items: list[IngestItemIn] = Field(default_factory=list, max_length=200)
     edges: list[EdgeSpecIn] = Field(default_factory=list, max_length=2000)
+    # [review-fix 4.R.1] source scope for DB-fallback edge resolution:
+    # source_ref is only unique WITHIN a source. Needed for edge-only batches
+    # (the scanner posts all items first, then edge-only batches); when omitted
+    # it is derived from the items' single distinct source, else the fallback
+    # is skipped entirely — never probe unscoped.
+    fallback_source: str | None = Field(None, min_length=1)
 
 
 class IngestBatchOut(BaseModel):
@@ -1040,7 +1067,13 @@ async def ingest_batch(
         ingestor.add_edge_spec(
             EdgeSpec(source_ref=e.source_ref, target_ref=e.target_ref, label=e.label, props=props)
         )
-    dangling = await ingestor.resolve_edges(db_fallback=True)
+    # [review-fix 4.R.1] pin the DB fallback to one source: explicit field
+    # wins; else the items' single distinct source (after the `or "api"`
+    # defaulting); else None → resolve_edges skips the probe (dangling).
+    sources = {item_in.source or "api" for item_in in payload.items}
+    derived = next(iter(sources)) if len(sources) == 1 else None
+    fallback_source = payload.fallback_source or derived
+    dangling = await ingestor.resolve_edges(db_fallback=True, fallback_source=fallback_source)
     await db.commit()
     await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
     return IngestBatchOut(
@@ -1212,9 +1245,29 @@ def test_run_posts_batches_to_ingest_batch() -> None:
         result = scanner.run()
     urls = [c.args[0] for c in mock_post.call_args_list]
     assert urls and all(u == "http://kb.local/api/v1/uploads/ingest-batch" for u in urls)
-    first_payload: dict[str, Any] = mock_post.call_args_list[0].kwargs["json"]
-    assert set(first_payload) == {"items", "edges"}
+    payloads: list[dict[str, Any]] = [c.kwargs["json"] for c in mock_post.call_args_list]
+    assert set(payloads[0]) == {"items", "edges", "fallback_source"}
+    # [4.R.1] edge-only batches have no items to derive a source from — every
+    # payload pins the DB-fallback scope explicitly.
+    assert all(p["fallback_source"] == "codebase" for p in payloads)
     assert result.new_items == 3 and result.failed_batches == 0
+
+
+def test_run_stops_posting_after_first_failed_batch() -> None:
+    """[4.R.2] One failed POST aborts the run — no requests wasted on batches
+    that will be re-sent next run anyway (cache is not saved on failure)."""
+    repo = make_temp_repo({"a.py": "def a(): pass", "b.py": "def b(): pass"})
+    config = ScanConfig(
+        repo_path=repo, languages=["python"], kb_token="tok", kb_api_url="http://kb.local"
+    )
+    scanner = CodebaseScanner(config)
+    with (
+        patch("scanner._BATCH_ITEMS", 1),
+        patch("requests.Session.post", side_effect=RuntimeError("boom")) as mock_post,
+    ):
+        result = scanner.run()
+    assert mock_post.call_count == 1  # 4 items + 1 edge batch without the early abort
+    assert result.failed_batches == 1 and result.failed_files == 1
 
 
 def test_changed_caller_still_links_to_unchanged_callee() -> None:
@@ -1412,7 +1465,15 @@ class CodebaseScanner:
     ) -> None:
         r = self._kb_session.post(
             f"{self._config.kb_api_url}/api/v1/uploads/ingest-batch",
-            json={"items": [asdict(i) for i in items], "edges": [asdict(e) for e in edges]},
+            json={
+                "items": [asdict(i) for i in items],
+                "edges": [asdict(e) for e in edges],
+                # [4.R.1] source_ref is only unique WITHIN a source: pin the
+                # server's DB-fallback edge resolution to this scanner's source.
+                # Edge-only batches carry no items to derive it from — without
+                # the pin the server skips the fallback and every edge dangles.
+                "fallback_source": "codebase",
+            },
             timeout=_TIMEOUT_S,
         )
         result.api_calls += 1
@@ -1437,6 +1498,9 @@ class CodebaseScanner:
             failed = False
             # Items first (all batches), edges after: every ref is committed
             # before any edge resolution — dangling only for genuinely absent refs.
+            # [4.R.2] first failure aborts both loops: the cache is not saved on
+            # failure, so every remaining batch is re-sent next run anyway —
+            # keep the requests.
             for start in range(0, len(items), _BATCH_ITEMS):
                 try:
                     self._post_batch(items[start : start + _BATCH_ITEMS], [], result)
@@ -1444,13 +1508,16 @@ class CodebaseScanner:
                     logger.error(f"Batch upsert failed: {exc}")
                     result.failed_batches += 1
                     failed = True
-            for start in range(0, len(edges), _BATCH_EDGES):
-                try:
-                    self._post_batch([], edges[start : start + _BATCH_EDGES], result)
-                except Exception as exc:
-                    logger.error(f"Edge batch failed: {exc}")
-                    result.failed_batches += 1
-                    failed = True
+                    break
+            if not failed:
+                for start in range(0, len(edges), _BATCH_EDGES):
+                    try:
+                        self._post_batch([], edges[start : start + _BATCH_EDGES], result)
+                    except Exception as exc:
+                        logger.error(f"Edge batch failed: {exc}")
+                        result.failed_batches += 1
+                        failed = True
+                        break
             if failed:
                 result.failed_files = result.failed_batches  # Task 5 exit-code signal
                 return result  # cache NOT saved → next run re-sends (idempotent upserts)
@@ -1475,6 +1542,41 @@ mypy --strict language_parser.py python_parser.py typescript_parser.py repo_walk
 ```
 feat(tools): CodebaseScanner — ingest-batch upserts, DEFINES file→symbol, CALLS confidence=0.7
 ```
+
+---
+
+## Task 4.R — Review fixes (2026-07-25)
+
+- [x] **4.R.1 IMPORTANT — DB-fallback edge resolution is now source-scoped.**
+  `_resolve_ref`'s DB probe matched on (visibility, owner, source_ref) but not `source`;
+  the contract says source_ref is unique WITHIN a source, so a same-owner ref collision
+  across sources (md doc vs code file with the same source_ref) would mislink edges.
+  `resolve_edges(*, db_fallback: bool = False, fallback_source: str | None = None)` now adds
+  `KnowledgeNode.source == fallback_source` to the probe; with `db_fallback=True` but
+  `fallback_source=None` the probe is SKIPPED and the ref counts as dangling — never probe
+  unscoped. The in-memory `_ref_to_node` map stays source-agnostic (within one ingestor all
+  items are one logical import — noted in the docstring). `ingest_batch` derives
+  fallback_source = the items' single distinct `source` (after the `or "api"` defaulting),
+  else None.
+  **[plan-fix] deviation from the approved note "Scanner is unaffected":** the scanner posts
+  all item batches first, then EDGE-ONLY batches (4b.4 `run()`), so items-derivation alone
+  would skip the fallback on every scanner edge batch and every cross-batch edge would
+  dangle silently. Resolution: optional `IngestBatchIn.fallback_source` (explicit field wins
+  over derivation) and the scanner sends `"fallback_source": "codebase"` in every payload.
+  Tests (RED first): service — `test_resolve_edges_db_fallback_is_source_scoped`,
+  `test_resolve_edges_db_fallback_matching_source_resolves`,
+  `test_resolve_edges_db_fallback_without_source_never_probes` (the two existing fallback
+  tests now pass `fallback_source="codebase"`); API —
+  `test_batch_fallback_never_crosses_sources`,
+  `test_batch_edge_only_with_fallback_source_resolves`,
+  `test_batch_edge_only_without_fallback_source_is_dangling`; tool —
+  `test_run_posts_batches_to_ingest_batch` asserts the payload pin.
+
+- [x] **4.R.2 NIT — scanner aborts batch posting after the first failure.** `run()` kept
+  POSTing every remaining item/edge batch after a failure even though the cache is never
+  saved on a failed run (all batches are re-sent next run anyway). The first failure now
+  `break`s the item loop and skips the edge loop entirely. Test:
+  `test_run_stops_posting_after_first_failed_batch` (RED: 5 requests → GREEN: 1).
 
 ---
 

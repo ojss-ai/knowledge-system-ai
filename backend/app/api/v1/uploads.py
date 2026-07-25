@@ -129,6 +129,12 @@ class IngestBatchIn(BaseModel):
     # long-work threshold; clients chunk.
     items: list[IngestItemIn] = Field(default_factory=list, max_length=200)
     edges: list[EdgeSpecIn] = Field(default_factory=list, max_length=2000)
+    # [review-fix 4.R.1] source scope for DB-fallback edge resolution:
+    # source_ref is only unique WITHIN a source. Needed for edge-only batches
+    # (the scanner posts all items first, then edge-only batches); when omitted
+    # it is derived from the items' single distinct source, else the fallback
+    # is skipped entirely — never probe unscoped.
+    fallback_source: str | None = Field(None, min_length=1)
 
 
 class IngestBatchOut(BaseModel):
@@ -268,7 +274,13 @@ async def ingest_batch(
         ingestor.add_edge_spec(
             EdgeSpec(source_ref=e.source_ref, target_ref=e.target_ref, label=e.label, props=props)
         )
-    dangling = await ingestor.resolve_edges(db_fallback=True)
+    # [review-fix 4.R.1] pin the DB fallback to one source: explicit field
+    # wins; else the items' single distinct source (after the `or "api"`
+    # defaulting); else None → resolve_edges skips the probe (dangling).
+    sources = {item_in.source or "api" for item_in in payload.items}
+    derived = next(iter(sources)) if len(sources) == 1 else None
+    fallback_source = payload.fallback_source or derived
+    dangling = await ingestor.resolve_edges(db_fallback=True, fallback_source=fallback_source)
     await db.commit()
     await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
     return IngestBatchOut(

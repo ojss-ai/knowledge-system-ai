@@ -158,7 +158,7 @@ async def test_resolve_edges_db_fallback_resolves_committed_ref(db, make_user, m
             props={"score": 0.7},
         )
     )
-    dangling = await second.resolve_edges(db_fallback=True)
+    dangling = await second.resolve_edges(db_fallback=True, fallback_source="codebase")
     assert dangling == 0
     await ns.run_pending_graph_ops(db)
     assert ("edge", str(src.id), str(tgt.id), "CALLS", "ingest", 0.7) in calls
@@ -179,7 +179,67 @@ async def test_resolve_edges_db_fallback_never_crosses_owners(db, make_user, mon
     ing = KnowledgeIngestor(db, viewer)
     await ing.upsert(IngestItem(source="codebase", source_ref="mine.py#m", title="m", body="m"))
     ing.add_edge_spec(EdgeSpec(source_ref="mine.py#m", target_ref="shared.py#x", label="CALLS"))
-    assert await ing.resolve_edges(db_fallback=True) == 1  # dangling, not another owner's node
+    dangling = await ing.resolve_edges(db_fallback=True, fallback_source="codebase")
+    assert dangling == 1  # dangling, not another owner's node
+
+
+# --- 4.R.1: DB fallback is source-scoped (source_ref unique WITHIN a source) ---
+
+
+async def test_resolve_edges_db_fallback_is_source_scoped(db, make_user, monkeypatch):
+    """A same-owner ref collision across sources must not mislink: the probe is
+    pinned to fallback_source, so a foreign-source row counts as dangling."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb_src@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await KnowledgeIngestor(db, viewer).upsert(
+        IngestItem(source="md_upload", source_ref="X", title="doc", body="d")
+    )
+    await db.flush()
+
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="c.py#f", title="f", body="f"))
+    ing.add_edge_spec(EdgeSpec(source_ref="c.py#f", target_ref="X", label="CALLS"))
+    assert await ing.resolve_edges(db_fallback=True, fallback_source="codebase") == 1
+    await ns.run_pending_graph_ops(db)
+    assert all(c[0] != "edge" for c in calls)
+
+
+async def test_resolve_edges_db_fallback_matching_source_resolves(db, make_user, monkeypatch):
+    """Same-owner ref collision setup, matching fallback_source: resolves to it."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb_src_ok@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    tgt = await KnowledgeIngestor(db, viewer).upsert(
+        IngestItem(source="md_upload", source_ref="X", title="doc", body="d")
+    )
+    await db.flush()
+
+    ing = KnowledgeIngestor(db, viewer)
+    src = await ing.upsert(IngestItem(source="md_upload", source_ref="y.md", title="y", body="y"))
+    ing.add_edge_spec(EdgeSpec(source_ref="y.md", target_ref="X", label="LINKS_TO"))
+    assert await ing.resolve_edges(db_fallback=True, fallback_source="md_upload") == 0
+    await ns.run_pending_graph_ops(db)
+    assert ("edge", str(src.id), str(tgt.id), "LINKS_TO", "ingest") in [c[:5] for c in calls]
+
+
+async def test_resolve_edges_db_fallback_without_source_never_probes(db, make_user, monkeypatch):
+    """db_fallback with fallback_source=None SKIPS the DB probe (dangling) —
+    an unscoped probe could hit any source's ref (never probe unscoped)."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb_nosrc@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await KnowledgeIngestor(db, viewer).upsert(
+        IngestItem(source="codebase", source_ref="z.py#z", title="z", body="z")
+    )
+    await db.flush()
+
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="w.py#w", title="w", body="w"))
+    ing.add_edge_spec(EdgeSpec(source_ref="w.py#w", target_ref="z.py#z", label="CALLS"))
+    assert await ing.resolve_edges(db_fallback=True) == 1
+    await ns.run_pending_graph_ops(db)
+    assert all(c[0] != "edge" for c in calls)
 
 
 async def test_upsert_stats_created_updated_skipped(db, make_user):
