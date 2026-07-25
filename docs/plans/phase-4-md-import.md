@@ -22,7 +22,12 @@
 
 ---
 
-## Task 1 — attachments + ingestion_runs models + MinIO client
+## Task 1 — ingestion_runs + api_tokens models + MinIO client
+
+> [plan-fix] Title said "attachments + ingestion_runs models" but no task in this
+> plan defines an `attachments` table/model — retitled to match the actual steps
+> (IngestionRun + ApiToken). The `attachments` table lands with AttachmentSpec
+> handling in a later phase.
 
 **Files:**
 - Create: `backend/app/models/ingest.py`
@@ -30,17 +35,18 @@
 - Create: `backend/alembic/versions/0005_ingest.py`
 - Create: `backend/app/services/storage.py`
 - Create: `backend/tests/models/test_ingest_models.py`
+- Create: `backend/tests/services/test_storage.py` ([plan-fix] TDD coverage for ApiToken + storage)
 
 ### Steps
 
-- [ ] **1.1** Write the failing test:
+- [x] **1.1** Write the failing test:
 
 ```python
 # backend/tests/models/test_ingest_models.py
 import uuid
 import pytest
 from sqlalchemy import select
-from app.models.ingest import IngestionRun, RunStatus
+from app.models.ingest import ApiToken, IngestionRun, RunStatus
 
 pytestmark = pytest.mark.asyncio
 
@@ -66,9 +72,29 @@ async def test_ingestion_run_lifecycle(db, make_user):
     await db.flush()
     updated = await db.scalar(select(IngestionRun).where(IngestionRun.id == run.id))
     assert updated.status == RunStatus.done
+
+
+async def test_api_token_roundtrip(db, make_user):
+    # [plan-fix] plan shipped ApiToken with no test; TDD iron law requires one.
+    owner = await make_user(email="token@test.com")
+    token = ApiToken(
+        id=uuid.uuid4(),
+        owner_id=owner.id,
+        name="confluence-sync",
+        token_hash="sha256$abc123",
+        scopes=["ingest", "read"],
+    )
+    db.add(token)
+    await db.flush()
+
+    result = await db.scalar(select(ApiToken).where(ApiToken.id == token.id))
+    assert result.scopes == ["ingest", "read"]
+    assert result.revoked is False
+    assert result.expires_at is None
 ```
 
-- [ ] **1.2** Create the model:
+- [x] **1.2** Create the model ([plan-fix] `RunStatus` is `enum.StrEnum`, not
+  `(str, enum.Enum)` — matches Role/Visibility/NodeType across the codebase):
 
 ```python
 # backend/app/models/ingest.py
@@ -86,7 +112,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.db import Base
 
 
-class RunStatus(str, enum.Enum):
+class RunStatus(enum.StrEnum):
     pending = "pending"
     running = "running"
     done = "done"
@@ -97,39 +123,57 @@ class IngestionRun(Base):
     __tablename__ = "ingestion_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    source: Mapped[str] = mapped_column(String(64), nullable=False)     # md_upload | confluence | codebase
-    status: Mapped[RunStatus] = mapped_column(Enum(RunStatus, name="run_status"), nullable=False, default=RunStatus.pending)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source: Mapped[str] = mapped_column(String(64), nullable=False)  # md_upload|confluence|codebase
+    status: Mapped[RunStatus] = mapped_column(
+        Enum(RunStatus, name="run_status"), nullable=False, default=RunStatus.pending
+    )
     total_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     processed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_log: Mapped[str | None] = mapped_column(Text)
     meta: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ApiToken(Base):
     """Service tokens for CLI tools (Confluence sync, codebase scanner)."""
+
     __tablename__ = "api_tokens"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     token_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
-    scopes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)  # ["ingest", "read"]
+    scopes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)  # ["ingest"]
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked: Mapped[bool] = mapped_column(nullable=False, default=False)
 ```
 
-- [ ] **1.3** Add to `backend/app/models/__init__.py`:
+- [x] **1.3** Add to `backend/app/models/__init__.py` ([plan-fix] sorted imports +
+  `__all__` entries instead of a `# noqa: F401` line — matches the file's style):
 ```python
-from app.models.ingest import IngestionRun, ApiToken, RunStatus  # noqa: F401
+from app.models.ingest import ApiToken, IngestionRun, RunStatus
+# ...and "ApiToken", "IngestionRun", "RunStatus" added to __all__
 ```
 
-- [ ] **1.4** Write migration `0005_ingest.py`:
+- [x] **1.4** Write migration `0005_ingest.py` ([plan-fix] plan's block created the
+  `run_status` enum explicitly AND reused the same `sa.Enum` inside `create_table`,
+  which emits CREATE TYPE twice → DuplicateObject. Uses the 0002 pattern
+  (`postgresql.ENUM(..., create_type=False)`); index names follow the model's
+  `index=True` convention (`ix_..._owner_id`); counters get `server_default` since
+  `default=` is a no-op in DDL):
 
 ```python
 # backend/alembic/versions/0005_ingest.py
@@ -137,75 +181,104 @@ from app.models.ingest import IngestionRun, ApiToken, RunStatus  # noqa: F401
 
 Revision ID: 0005
 Revises: 0004
-Create Date: 2026-01-01
+Create Date: 2026-07-24
 """
-from alembic import op
+
+from collections.abc import Sequence
+
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0005"
-down_revision = "0004"
+from alembic import op
+
+revision: str = "0005"
+down_revision: str | Sequence[str] | None = "0004"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
+
+run_status_enum = postgresql.ENUM(
+    "pending", "running", "done", "failed", name="run_status", create_type=False
+)
 
 
 def upgrade() -> None:
-    run_status = sa.Enum("pending", "running", "done", "failed", name="run_status")
-    run_status.create(op.get_bind())
+    run_status_enum.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "ingestion_runs",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("owner_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "owner_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("source", sa.String(64), nullable=False),
-        sa.Column("status", run_status, nullable=False, server_default="pending"),
-        sa.Column("total_items", sa.Integer, nullable=False, default=0),
-        sa.Column("processed_items", sa.Integer, nullable=False, default=0),
-        sa.Column("failed_items", sa.Integer, nullable=False, default=0),
+        sa.Column("status", run_status_enum, nullable=False, server_default="pending"),
+        sa.Column("total_items", sa.Integer, nullable=False, server_default=sa.text("0")),
+        sa.Column("processed_items", sa.Integer, nullable=False, server_default=sa.text("0")),
+        sa.Column("failed_items", sa.Integer, nullable=False, server_default=sa.text("0")),
         sa.Column("error_log", sa.Text),
         sa.Column("meta", postgresql.JSONB, nullable=False, server_default="{}"),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.Column("finished_at", sa.DateTime(timezone=True)),
     )
-    op.create_index("ix_ingestion_runs_owner", "ingestion_runs", ["owner_id"])
+    op.create_index(op.f("ix_ingestion_runs_owner_id"), "ingestion_runs", ["owner_id"])
 
     op.create_table(
         "api_tokens",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("owner_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+        sa.Column(
+            "owner_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("name", sa.String(128), nullable=False),
         sa.Column("token_hash", sa.String(255), nullable=False, unique=True),
         sa.Column("scopes", postgresql.JSONB, nullable=False, server_default="[]"),
         sa.Column("expires_at", sa.DateTime(timezone=True)),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.Column("last_used_at", sa.DateTime(timezone=True)),
         sa.Column("revoked", sa.Boolean, nullable=False, server_default="false"),
     )
-    op.create_index("ix_api_tokens_owner", "api_tokens", ["owner_id"])
+    op.create_index(op.f("ix_api_tokens_owner_id"), "api_tokens", ["owner_id"])
 
 
 def downgrade() -> None:
     op.drop_table("api_tokens")
     op.drop_table("ingestion_runs")
-    sa.Enum(name="run_status").drop(op.get_bind())
+    run_status_enum.drop(op.get_bind(), checkfirst=True)
 ```
 
-- [ ] **1.5** Create MinIO storage client:
+- [x] **1.5** Create MinIO storage client ([plan-fix] mypy --strict scope covers
+  `app/services`: `_client()` gets a `-> Minio` annotation with a module-level
+  typed import (minio 7.2 ships py.typed); dropped the unused `import io`.
+  Behaviour is covered by `tests/services/test_storage.py` with a faked Minio
+  client — MinIO server is a true boundary; live round-trip is verified against
+  the Docker stack. `minio>=7.2` added to pyproject dependencies):
 
 ```python
 # backend/app/services/storage.py
-"""
-MinIO / S3-compatible object storage client.
+"""MinIO / S3-compatible object storage client.
+
 Used for storing original uploaded files.
 """
+
 from __future__ import annotations
 
-import io
 from typing import BinaryIO
+
+from minio import Minio
 
 from app.core.config import settings
 
 
-def _client():
-    from minio import Minio
+def _client() -> Minio:
     return Minio(
         settings.minio_endpoint,
         access_key=settings.minio_access_key,
@@ -246,7 +319,7 @@ def download_file(object_path: str) -> bytes:
         response.release_conn()
 ```
 
-- [ ] **1.6** Add MinIO settings to `config.py`:
+- [x] **1.6** Add MinIO settings to `config.py`:
 
 ```python
 # backend/app/core/config.py  (add)
@@ -256,14 +329,14 @@ minio_secret_key: str = "minioadmin"
 minio_secure: bool = False
 ```
 
-- [ ] **1.7** Apply migration and run tests:
+- [x] **1.7** Apply migration and run tests:
 ```bash
 cd backend && alembic upgrade head
-pytest tests/models/test_ingest_models.py -v
-# Expected: 1 passed
+pytest tests/models/test_ingest_models.py tests/services/test_storage.py -v
+# Expected: 5 passed (2 model + 3 storage)
 ```
 
-- [ ] **1.8** Commit:
+- [x] **1.8** Commit:
 ```
 feat(models): ingestion_runs, api_tokens + migration 0005; MinIO storage client
 ```

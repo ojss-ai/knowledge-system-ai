@@ -17,6 +17,7 @@ dependencies = [
   "redis>=5.0",
   "neo4j>=5.20",
   "celery>=5.4",
+  "minio>=7.2",
 ]
 
 [project.optional-dependencies]

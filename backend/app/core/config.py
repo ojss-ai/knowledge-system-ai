@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     jwt_refresh_ttl_seconds: int = 604800
     embedding_backend: str = "sentence_transformers"  # fake | sentence_transformers | ollama
     embedding_model: str = "sentence-transformers/all-MiniLM-L12-v2"
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin"
+    minio_secure: bool = False
 
 
 settings = Settings()
