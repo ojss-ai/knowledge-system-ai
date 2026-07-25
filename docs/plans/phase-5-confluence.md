@@ -944,8 +944,28 @@ feat(api): POST /api/v1/uploads/ingest-item — single-item upsert for CLI tools
 
 **Files:**
 - Create: `tools/kb-confluence-sync/__main__.py`
+- Create: `tools/kb-confluence-sync/cli.py` *(plan-fix, see 5.2)*
 - Create: `tools/kb-confluence-sync/pyproject.toml`
 - Create: `tools/kb-confluence-sync/tests/test_cli.py`
+- Modify: `backend/app/core/deps.py`, `backend/app/api/v1/tokens.py` *(plan-fix, see below)*
+- Create: `backend/tests/api/test_service_token_auth.py` *(plan-fix, see below)*
+
+> **[plan-fix] Service-token bearer auth (gap between Tasks 3/5 and Phase 4 Task 6).**
+> The CLI sends `KB_API_TOKEN` (raw token from POST /api/v1/tokens) as
+> `Authorization: Bearer`, but `get_current_viewer` only decoded JWTs — every CLI
+> request would 401. Fixed in the same TDD loop as this task:
+> - Raw token format is now `kb_<token-id-hex>.<secret>` (was bare
+>   `token_urlsafe(32)`); the embedded id makes bearer lookup O(1) by primary key —
+>   argon2 hashes are salted, so rows can't be found by hashing the presented
+>   token. Acceptable format migration: nothing is deployed; hashing/`shown once`
+>   semantics unchanged, all Task 6 (Phase 4) tests still green.
+> - `get_current_viewer` falls back to `_viewer_from_service_token` when JWT decode
+>   fails: PK lookup → revoked/expired check → argon2 verify of the full raw token →
+>   `Viewer(user_id=owner_id, role=service)` (never admin — visibility bypass
+>   unreachable, kb-visibility rule 5; `get_scoped_viewer` passes service through).
+> - Tests: `backend/tests/api/test_service_token_auth.py` — valid token ingests
+>   (200/201), node owned by token owner, revoked → 401, tampered secret → 401,
+>   unknown id → 401.
 
 ### Steps
 

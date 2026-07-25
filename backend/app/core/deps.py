@@ -1,6 +1,10 @@
+import re
 import uuid
+from datetime import UTC, datetime
 
 import jwt as pyjwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerificationError
 from fastapi import Depends, HTTPException, Query, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
@@ -9,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.security import decode_token
 from app.models.group import GroupMember
+from app.models.ingest import ApiToken
 from app.models.user import Role
 
 # THE auth-context type (kb-conventions): the canonical Viewer lives in the
@@ -17,6 +22,10 @@ from app.models.user import Role
 from app.services.visibility import Viewer
 
 _bearer = HTTPBearer(auto_error=False)
+_hasher = PasswordHasher()
+
+# Raw service-token shape from POST /api/v1/tokens: kb_<token-id-hex>.<secret>
+_SERVICE_TOKEN_RE = re.compile(r"^kb_(?P<tid>[0-9a-f]{32})\.[A-Za-z0-9_-]+$")
 
 __all__ = [
     "Viewer",
@@ -36,6 +45,33 @@ async def _viewer_from_token(token: str, db: AsyncSession) -> Viewer:
     return Viewer(user_id=uid, role=Role(claims["role"]), group_ids=frozenset(rows))
 
 
+async def _viewer_from_service_token(token: str, db: AsyncSession) -> Viewer | None:
+    """Resolve a raw `kb_<id-hex>.<secret>` service token to a Viewer, or None.
+
+    The embedded token id gives an O(1) primary-key lookup (argon2 hashes are
+    salted — rows cannot be found by hashing the presented token); argon2 then
+    verifies the full raw token against the stored hash. The token acts on
+    behalf of its owner (user_id = owner_id) with role=service — never admin,
+    so the visibility bypass is unreachable (kb-visibility-filter rule 5).
+    """
+    match = _SERVICE_TOKEN_RE.match(token)
+    if match is None:
+        return None
+    row = await db.get(ApiToken, uuid.UUID(match["tid"]))
+    if row is None or row.revoked:
+        return None
+    if row.expires_at is not None and row.expires_at <= datetime.now(UTC):
+        return None
+    try:
+        _hasher.verify(row.token_hash, token)
+    except VerificationError:
+        return None
+    rows = await db.scalars(
+        select(GroupMember.group_id).where(GroupMember.user_id == row.owner_id)
+    )
+    return Viewer(user_id=row.owner_id, role=Role.service, group_ids=frozenset(rows))
+
+
 async def get_current_viewer(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
@@ -45,6 +81,10 @@ async def get_current_viewer(
     try:
         return await _viewer_from_token(creds.credentials, db)
     except pyjwt.PyJWTError as exc:
+        # Not a JWT — maybe a service token from POST /api/v1/tokens (CLI tools).
+        viewer = await _viewer_from_service_token(creds.credentials, db)
+        if viewer is not None:
+            return viewer
         raise HTTPException(status_code=401, detail="invalid token") from exc
 
 

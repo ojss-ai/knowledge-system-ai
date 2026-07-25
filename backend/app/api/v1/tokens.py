@@ -74,9 +74,13 @@ async def create_token(
     viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
 ) -> TokenCreated:
-    raw = secrets.token_urlsafe(32)
+    # Format: kb_<token-id-hex>.<secret> — the embedded id makes bearer-auth
+    # lookup O(1) by primary key (argon2 hashes are salted and cannot be
+    # searched by value); argon2 then verifies the FULL raw token.
+    token_id = uuid.uuid4()
+    raw = f"kb_{token_id.hex}.{secrets.token_urlsafe(32)}"
     token = ApiToken(
-        id=uuid.uuid4(),
+        id=token_id,
         owner_id=viewer.user_id,
         name=payload.name,
         token_hash=_hasher.hash(raw),
