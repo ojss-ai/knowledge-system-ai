@@ -112,6 +112,26 @@ async def test_upload_rejects_invalid_zip_content(
     assert recorded_delay == []
 
 
+async def test_upload_rejects_zip_bomb(
+    client: AsyncClient, auth_headers, recorded_delay, monkeypatch
+):
+    """[review-fix 5.R.3] a high-ratio zip is refused at the endpoint (422),
+    before a run row or an enqueue happens. Cap lowered to keep the fixture
+    tiny; md_importer reads the constant at call time."""
+    from app.services.ingest import md_importer
+
+    monkeypatch.setattr(md_importer, "ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 1024)
+    zip_bytes = make_zip_bytes({"bomb.md": "# B\n\n" + "0" * 10_000})
+    r = await client.post(
+        "/api/v1/uploads/markdown",
+        files={"file": ("notes.zip", io.BytesIO(zip_bytes), "application/zip")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert "decompressed size" in r.json()["detail"]
+    assert recorded_delay == []
+
+
 async def test_upload_unauthenticated_is_401(client: AsyncClient):
     zip_bytes = make_zip_bytes({"a.md": "# A"})
     r = await client.post(

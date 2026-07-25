@@ -1,6 +1,9 @@
 import io
 import zipfile
 
+import pytest
+
+from app.services.ingest import md_importer
 from app.services.ingest.base import IngestItem
 from app.services.ingest.md_importer import extract_wikilinks, parse_zip
 
@@ -83,3 +86,29 @@ def test_duplicate_titles_resolve_first_wins_deterministically():
     links = [e for e in edges if e.source_ref == "linker.md"]
     assert len(links) == 1
     assert links[0].target_ref == "a-first.md"
+
+
+# --- [review-fix 5.R.3] zip-bomb guards ---
+
+
+def test_zip_bomb_declared_size_rejected(monkeypatch):
+    """A high-ratio zip (tiny on the wire, huge decompressed) must be rejected
+    before any member is extracted. Cap lowered so the fixture stays small —
+    the guard reads the module constant at call time."""
+    monkeypatch.setattr(md_importer, "ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 1024)
+    bomb = _zip_of({"bomb.md": "# B\n\n" + "0" * 10_000})  # ~100 bytes compressed
+    with pytest.raises(ValueError, match="decompressed size"):
+        parse_zip(bomb)
+
+
+def test_zip_too_many_members_rejected(monkeypatch):
+    monkeypatch.setattr(md_importer, "ZIP_MAX_MEMBERS", 2)
+    files = {f"n{i}.md": f"# N{i}" for i in range(3)}
+    with pytest.raises(ValueError, match="members"):
+        parse_zip(_zip_of(files))
+
+
+def test_zip_limit_constants_are_sane():
+    """The real caps: 500 MB decompressed / 5000 members (module-top constants)."""
+    assert md_importer.ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES == 500 * 1024 * 1024
+    assert md_importer.ZIP_MAX_MEMBERS == 5000

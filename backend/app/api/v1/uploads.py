@@ -51,6 +51,7 @@ from app.core.db import get_db
 from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer
 from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
+from app.services.ingest.md_importer import check_zip_limits
 from app.workers.tasks.ingest_md import ingest_md
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
@@ -98,8 +99,15 @@ async def upload_markdown(
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 100 MB)")
-    if not zipfile.is_zipfile(io.BytesIO(content)):
-        raise HTTPException(status_code=422, detail="Not a valid zip file")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            # [review-fix 5.R.3] zip-bomb caps (declared decompressed size,
+            # member count) enforced at the door — same guard parse_zip runs.
+            check_zip_limits(zf)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=422, detail="Not a valid zip file") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     run = IngestionRun(
         id=uuid.uuid4(),

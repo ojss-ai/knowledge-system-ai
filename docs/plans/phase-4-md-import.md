@@ -1822,6 +1822,7 @@ from app.core.db import get_db
 from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer
 from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
+from app.services.ingest.md_importer import check_zip_limits
 from app.workers.tasks.ingest_md import ingest_md
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
@@ -1869,8 +1870,15 @@ async def upload_markdown(
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 100 MB)")
-    if not zipfile.is_zipfile(io.BytesIO(content)):
-        raise HTTPException(status_code=422, detail="Not a valid zip file")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            # [review-fix 5.R.3] zip-bomb caps (declared decompressed size,
+            # member count) enforced at the door — same guard parse_zip runs.
+            check_zip_limits(zf)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=422, detail="Not a valid zip file") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     run = IngestionRun(
         id=uuid.uuid4(),
@@ -2064,7 +2072,21 @@ feat(api): POST /api/v1/uploads/markdown (202 + Celery), GET /runs/:id, WS progr
   payload to MinIO and the progress events to `run:{id}` in the same pass.
   Documented in the WS handler docstring and here.
 
-- [ ] **5.R.3 IMPORTANT — zip-bomb guard in `md_importer.parse_zip`.**
+- [x] **5.R.3 IMPORTANT — zip-bomb guard in `md_importer.parse_zip`.** The
+  100 MB upload cap bounds only the compressed payload; a high-ratio archive
+  can declare gigabytes from kilobytes, and nothing capped member count.
+  Added module-top constants `ZIP_MAX_MEMBERS = 5000` and
+  `ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 500 * 1024 * 1024` plus
+  `check_zip_limits(zf)`, called by `parse_zip` before extracting anything —
+  the DECLARED size sum is a real bound because ZipExtFile never reads past a
+  header's `file_size`. Raises ValueError; the uploads endpoint runs the same
+  guard at the door (ZipFile + check_zip_limits replaces `is_zipfile`) and
+  maps BadZipFile/ValueError to 422; in the worker parse_zip's ValueError
+  marks the run failed like any parse error (Task 4 failure path, already
+  tested). RED first: `test_zip_bomb_declared_size_rejected`,
+  `test_zip_too_many_members_rejected`, `test_zip_limit_constants_are_sane`
+  (importer) and `test_upload_rejects_zip_bomb` (endpoint 422, nothing
+  enqueued) all failed with AttributeError before the constants/guard existed.
 
 - [ ] **5.R.4 IMPORTANT — enqueue-then-crash leaves the run pending forever.**
 

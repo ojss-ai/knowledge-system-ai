@@ -17,6 +17,11 @@ from app.services.ingest.base import EdgeSpec, IngestItem
 
 logger = structlog.get_logger(__name__)
 
+# [review-fix 5.R.3] zip-bomb caps. A 100 MB upload cap alone does not bound
+# extraction work: a high-ratio archive can declare gigabytes from kilobytes.
+ZIP_MAX_MEMBERS = 5000
+ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # 500 MB
+
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
 # [ \t] not \s: \s matches newlines, so "#   \n\nbody" would swallow the blank
 # line and title itself "body" (review CRITICAL — empty-H1 fallback broken).
@@ -25,6 +30,25 @@ _HEADING_RE = re.compile(r"^#[ \t]+(.+)", re.MULTILINE)
 
 def extract_wikilinks(body: str) -> list[str]:
     return _WIKILINK_RE.findall(body)
+
+
+def check_zip_limits(zf: zipfile.ZipFile) -> None:
+    """Zip-bomb guard ([review-fix 5.R.3]): reject before extracting anything.
+
+    Caps member count and the DECLARED total decompressed size. The declared
+    size is trustworthy as a bound: ZipExtFile never reads past the header's
+    file_size, so a member lying low still cannot expand beyond its claim.
+    Raises ValueError — the uploads endpoint maps it to 422; in the worker it
+    marks the run failed like any other parse error.
+    """
+    infos = zf.infolist()
+    if len(infos) > ZIP_MAX_MEMBERS:
+        raise ValueError(f"zip has too many members ({len(infos)} > {ZIP_MAX_MEMBERS})")
+    total = sum(info.file_size for info in infos)
+    if total > ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES:
+        raise ValueError(
+            f"zip decompressed size too large ({total} > {ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES} bytes)"
+        )
 
 
 def _title_from_body_or_filename(body: str, filename: str) -> str:
@@ -52,6 +76,7 @@ def parse_zip(
     title_to_ref: dict[str, str] = {}  # title → source_ref (for wikilink resolution)
 
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        check_zip_limits(zf)
         md_files = [
             n for n in zf.namelist() if n.lower().endswith(".md") and not n.startswith("__MACOSX")
         ]
