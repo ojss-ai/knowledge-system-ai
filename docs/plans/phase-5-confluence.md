@@ -969,10 +969,19 @@ feat(api): POST /api/v1/uploads/ingest-item — single-item upsert for CLI tools
 
 ### Steps
 
-- [ ] **5.1** Write failing tests:
+- [x] **5.1** Write failing tests:
+
+> [plan-fix] vs the block below — there is no `kb_confluence_sync` package (flat-module layout,
+> Tasks 1-3), so the CLI runs as `python __main__.py`; `cwd` resolved from `__file__` (the block's
+> repo-root-relative path breaks — pytest runs from the tool dir); interpreter taken from PATH
+> before `sys.executable` (sandbox python is a loader-wrapped binary that can't exec directly);
+> subprocess env scrubbed of `CONFLUENCE_*`/`KB_*` so the missing-config test is deterministic.
+> Added `test_dry_run_exits_0_against_mocked_confluence` (threaded stdlib HTTP stub) — the phase
+> exit criterion "`--dry-run` exits 0 against a mocked Confluence server".
+> Canonical source: `tools/kb-confluence-sync/tests/test_cli.py`.
 
 ```python
-# tools/kb-confluence-sync/tests/test_cli.py
+# tools/kb-confluence-sync/tests/test_cli.py — excerpt; see file for the mocked-server test
 import subprocess
 import sys
 
@@ -996,7 +1005,16 @@ def test_missing_config_exits_2():
     assert r.returncode == 2
 ```
 
-- [ ] **5.2** Create `__main__.py`:
+- [x] **5.2** Create `__main__.py`:
+
+> [plan-fix] Implementation lives in `cli.py`; `__main__.py` is a two-line shim. A setuptools
+> console script cannot target a module named `__main__` — at runtime that name resolves to the
+> generated script itself. Deviations from the block below, forced by ruff/`mypy --strict`:
+> `argparse` imported top-level (only `python-dotenv` is optional), `SyncConfig`/`SyncEngine`
+> imported normally (no `"SyncConfig"` string annotation + `noqa: F821`),
+> `build_config(args: argparse.Namespace)` typed, `--visibility` read directly (it is defined on
+> the sync subparser — no `getattr` fallback). Behavior and exit codes identical.
+> Canonical source: `tools/kb-confluence-sync/cli.py`.
 
 ```python
 # tools/kb-confluence-sync/__main__.py
@@ -1132,12 +1150,16 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **5.3** Create `pyproject.toml`:
+- [x] **5.3** Create `pyproject.toml`:
+
+> [plan-fix] build-backend `setuptools.backends.legacy:build` does not exist →
+> `setuptools.build_meta`; flat modules declared via `[tool.setuptools] py-modules`; script entry
+> `cli:main` (`kb_confluence_sync.__main__:main` names a nonexistent package).
 
 ```toml
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "kb-confluence-sync"
@@ -1151,33 +1173,43 @@ dependencies = [
 ]
 
 [project.scripts]
-kb-confluence-sync = "kb_confluence_sync.__main__:main"
+kb-confluence-sync = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "confluence_client", "sync_engine", "xhtml_to_md"]
 ```
 
-- [ ] **5.4** Run tests:
+- [x] **5.4** Run tests:
 ```bash
 cd tools/kb-confluence-sync && python -m pytest tests/test_cli.py -v
-# Expected: 2 passed
+# Expected: 3 passed  [plan-fix: was 2 — mocked-server dry-run test added in 5.1]
 ```
 
-- [ ] **5.5** Verify dry-run:
+- [x] **5.5** Verify dry-run:
+
+> [plan-fix] The block pointed the CLI at example.atlassian.net — a REAL network call (dry-run
+> skips the KB API, not the Confluence `list_pages` fetch), which fails offline and contradicts
+> the exit criterion "against a mocked Confluence server". Verified against a local stub instead
+> (executable form: `tests/test_cli.py::test_dry_run_exits_0_against_mocked_confluence`).
+
 ```bash
 cd tools/kb-confluence-sync
-CONFLUENCE_URL=https://example.atlassian.net/wiki \
+python /path/to/confluence_stub.py &   # any local stub serving /rest/api/content JSON
+CONFLUENCE_URL=http://127.0.0.1:8765 \
 CONFLUENCE_TOKEN=fake \
 KB_API_TOKEN=fake \
-python -m __main__ sync --space TS --dry-run
-# Expected: exit 0 (no network calls in dry-run)
+python __main__.py sync --space TS --dry-run
+# Expected: exit 0 (KB API never called in dry-run)
 ```
 
-- [ ] **5.6** Run full lint:
+- [x] **5.6** Run full lint:
 ```bash
 cd tools/kb-confluence-sync
 ruff check .
-mypy --strict confluence_client.py sync_engine.py xhtml_to_md.py
+mypy --strict *.py   # [plan-fix: covers cli.py and __main__.py too]
 ```
 
-- [ ] **5.7** Commit:
+- [x] **5.7** Commit:
 ```
 feat(tools): kb-confluence-sync CLI — sync, dry-run, --json output, exit codes 0/1/2
 ```
