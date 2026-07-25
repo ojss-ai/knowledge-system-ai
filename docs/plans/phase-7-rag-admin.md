@@ -1205,74 +1205,107 @@ feat(api): Redis sliding-window rate limiting on /ask and /search (20/60s, 60/60
 > when executing this task.
 
 **Files:**
-- Create: `backend/app/api/v1/admin.py`
-- Modify: `backend/app/main.py`
+- Create: `backend/app/api/v1/admin/stats.py` *([plan-fix]: admin is a package since phase-1 Task 8, not a single `admin.py`)*
+- Create: `backend/app/api/v1/admin/audit_logs.py`
+- Modify: `backend/app/api/v1/admin/__init__.py`
 - Create: `frontend/src/app/admin/page.tsx`
+- Modify: `frontend/src/lib/api.ts`, `frontend/src/lib/types.ts` *(typed client — kb-conventions forbid raw fetch)*
 - Create: `backend/tests/api/test_admin_api.py`
 
 ### Steps
 
-- [ ] **6.1** Write failing tests:
+- [x] **6.1** Write failing tests: *([plan-fix]: no seeded admin / form login exists — JSON login + `auth_service.register` like every API test; `admin@kb.local` fails EmailStr (`.local` reserved) → `admin@kb.example`; added 401 case, filter/pagination cases, and the carry-over audit-of-admin-read tests)*
 
 ```python
 # backend/tests/api/test_admin_api.py
-import pytest
-from httpx import AsyncClient
+from sqlalchemy import select
 
-pytestmark = pytest.mark.asyncio
+from app.models.audit import AuditLog
+from app.models.user import Role
+from app.services import auth_service
 
 
-async def test_admin_stats_requires_admin(client: AsyncClient, auth_headers):
+async def _admin_headers(db, client) -> tuple[dict[str, str], object]:
+    admin = await auth_service.register(
+        db, email="admin@kb.example", password="admin1234", display_name="Admin", role=Role.admin
+    )
+    r = await client.post(
+        "/api/v1/auth/login", json={"email": "admin@kb.example", "password": "admin1234"}
+    )
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}, admin
+
+
+async def test_admin_stats_requires_auth(client) -> None:
+    r = await client.get("/api/v1/admin/stats")
+    assert r.status_code == 401
+
+
+async def test_admin_stats_requires_admin(client, auth_headers) -> None:
     r = await client.get("/api/v1/admin/stats", headers=auth_headers)
     assert r.status_code == 403
 
 
-async def test_admin_stats_for_admin(client: AsyncClient):
-    # Login as seeded admin
-    r = await client.post("/api/v1/auth/login",
-        data={"username": "admin@kb.local", "password": "admin1234"})
-    token = r.json()["access_token"]
-    r2 = await client.get("/api/v1/admin/stats",
-        headers={"Authorization": f"Bearer {token}"})
-    assert r2.status_code == 200
-    data = r2.json()
-    assert "total_users" in data
-    assert "total_nodes" in data
-    assert "total_chunks" in data
+async def test_admin_stats_for_admin(db, client) -> None:
+    headers, _ = await _admin_headers(db, client)
+    r = await client.get("/api/v1/admin/stats", headers=headers)
+    assert r.status_code == 200
+    data = r.json()
+    for key in ("total_users", "active_users", "total_nodes", "total_chunks", "total_audit_events"):
+        assert key in data
+    assert data["total_users"] >= 1
 
 
-async def test_admin_audit_log(client: AsyncClient):
-    r = await client.post("/api/v1/auth/login",
-        data={"username": "admin@kb.local", "password": "admin1234"})
-    token = r.json()["access_token"]
-    r2 = await client.get("/api/v1/admin/audit-logs",
-        headers={"Authorization": f"Bearer {token}"})
-    assert r2.status_code == 200
-    assert "items" in r2.json()
+async def test_admin_stats_excludes_soft_deleted_nodes(db, client, make_user, make_node) -> None:
+    ...  # soft-deleted node not counted in total_nodes (see test file)
+
+
+async def test_admin_audit_log(db, client) -> None:
+    headers, _ = await _admin_headers(db, client)
+    r = await client.get("/api/v1/admin/audit-logs", headers=headers)
+    assert r.status_code == 200
+    assert "items" in r.json() and "total" in r.json()
+
+
+async def test_admin_audit_logs_requires_admin(client, auth_headers) -> None:
+    r = await client.get("/api/v1/admin/audit-logs", headers=auth_headers)
+    assert r.status_code == 403
+
+
+async def test_admin_audit_logs_filter_and_pagination(db, client, make_user) -> None:
+    ...  # ?action= filters items; ?limit=101 → 422 (shared Pagination caps at 100)
+
+
+# Carry-over (phase-1 Task 8 via Task 3): admin reads of cross-user,
+# non-public data must themselves be audit-logged (kb-visibility-filter rule 5).
+
+async def test_admin_stats_read_is_audited(db, client) -> None:
+    headers, admin = await _admin_headers(db, client)
+    assert (await client.get("/api/v1/admin/stats", headers=headers)).status_code == 200
+    rows = await db.scalars(
+        select(AuditLog).where(AuditLog.actor_id == admin.id, AuditLog.action == "admin.stats.read")
+    )
+    assert len(list(rows)) == 1
+
+
+async def test_admin_audit_logs_read_is_audited(db, client) -> None:
+    headers, admin = await _admin_headers(db, client)
+    r = await client.get("/api/v1/admin/audit-logs?action=node.create", headers=headers)
+    assert r.status_code == 200
+    rows = await db.scalars(
+        select(AuditLog).where(
+            AuditLog.actor_id == admin.id, AuditLog.action == "admin.audit_logs.read"
+        )
+    )
+    entries = list(rows)
+    assert len(entries) == 1
+    assert entries[0].meta.get("action_filter") == "node.create"
 ```
 
-- [ ] **6.2** Create admin router:
+- [x] **6.2** Create admin router modules: *([plan-fix]: split into the existing admin package (`stats.py`, `audit_logs.py`, registered in `admin/__init__.py`); the plan's `/users` endpoint was dropped — `GET /admin/users` (adminListUsers, proper `UserOut`) has existed since phase-1 Task 8; carry-over honored: both reads call `audit_service.log()` with the full-role viewer; `total` on /audit-logs now respects the `action` filter; limit ≤ 100 via shared `Pagination` dep, not `le=200`)*
 
 ```python
-# backend/app/api/v1/admin.py
-from __future__ import annotations
-
-import uuid
-from datetime import datetime
-
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.db import get_db
-from app.core.deps import get_current_viewer, require_admin
-from app.models.audit import AuditLog
-from app.models.chunk import NodeChunk
-from app.models.knowledge import KnowledgeNode
-from app.models.user import User
-
-router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+# backend/app/api/v1/admin/stats.py  (require_admin applied at package include)
+router = APIRouter(tags=["admin"])
 
 
 class StatsOut(BaseModel):
@@ -1283,6 +1316,39 @@ class StatsOut(BaseModel):
     total_audit_events: int
 
 
+@router.get("/stats", response_model=StatsOut, summary="Admin dashboard stats",
+            operation_id="adminGetStats")
+async def get_stats(
+    viewer: Viewer = Depends(get_current_viewer),  # full-role: audited admin exception
+    db: AsyncSession = Depends(get_db),
+) -> StatsOut:
+    total_users = await db.scalar(select(func.count()).select_from(User)) or 0
+    active_users = (
+        await db.scalar(select(func.count()).select_from(User).where(User.is_active.is_(True))) or 0
+    )
+    total_nodes = (
+        await db.scalar(
+            select(func.count())
+            .select_from(KnowledgeNode)
+            .where(KnowledgeNode.deleted_at.is_(None))
+        )
+        or 0
+    )
+    total_chunks = await db.scalar(select(func.count()).select_from(NodeChunk)) or 0
+    total_audit = await db.scalar(select(func.count()).select_from(AuditLog)) or 0
+    stats = StatsOut(total_users=total_users, active_users=active_users,
+                     total_nodes=total_nodes, total_chunks=total_chunks,
+                     total_audit_events=total_audit)
+    await audit_service.log(db, viewer=viewer, action="admin.stats.read",
+                            resource_type="stats", meta=stats.model_dump())
+    return stats
+```
+
+```python
+# backend/app/api/v1/admin/audit_logs.py
+router = APIRouter(tags=["admin"])
+
+
 class AuditLogOut(BaseModel):
     id: uuid.UUID
     actor_id: uuid.UUID | None
@@ -1290,7 +1356,7 @@ class AuditLogOut(BaseModel):
     resource_type: str | None
     resource_id: str | None
     created_at: datetime
-    meta: dict
+    meta: dict[str, Any]
 
     model_config = {"from_attributes": True}
 
@@ -1300,71 +1366,32 @@ class AuditLogsListOut(BaseModel):
     total: int
 
 
-@router.get("/stats", response_model=StatsOut)
-async def get_stats(db: AsyncSession = Depends(get_db)):
-    total_users = await db.scalar(select(func.count()).select_from(User)) or 0
-    active_users = await db.scalar(select(func.count()).select_from(User).where(User.is_active == True)) or 0
-    total_nodes = await db.scalar(
-        select(func.count()).select_from(KnowledgeNode).where(KnowledgeNode.deleted_at.is_(None))
-    ) or 0
-    total_chunks = await db.scalar(select(func.count()).select_from(NodeChunk)) or 0
-    total_audit = await db.scalar(select(func.count()).select_from(AuditLog)) or 0
-    return StatsOut(
-        total_users=total_users,
-        active_users=active_users,
-        total_nodes=total_nodes,
-        total_chunks=total_chunks,
-        total_audit_events=total_audit,
-    )
-
-
-@router.get("/audit-logs", response_model=AuditLogsListOut)
-async def get_audit_logs(
-    offset: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
-    action: str | None = None,
+@router.get("/audit-logs", response_model=AuditLogsListOut,
+            summary="List audit log entries", operation_id="adminListAuditLogs")
+async def list_audit_logs(
+    action: str | None = Query(None, max_length=128),
+    page: Pagination = Depends(),
+    viewer: Viewer = Depends(get_current_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    q = select(AuditLog).order_by(AuditLog.created_at.desc())
+) -> AuditLogsListOut:
+    stmt = select(AuditLog).order_by(AuditLog.created_at.desc())
+    count_stmt = select(func.count()).select_from(AuditLog)
     if action:
-        q = q.where(AuditLog.action == action)
-    total = await db.scalar(select(func.count()).select_from(AuditLog))
-    rows = await db.scalars(q.offset(offset).limit(limit))
-    return AuditLogsListOut(items=list(rows), total=total or 0)
-
-
-@router.get("/users", response_model=list[dict])
-async def list_all_users(
-    offset: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
-):
-    rows = await db.scalars(select(User).order_by(User.created_at.desc()).offset(offset).limit(limit))
-    return [
-        {"id": str(u.id), "email": u.email, "role": u.role.value,
-         "is_active": u.is_active, "created_at": u.created_at.isoformat()}
-        for u in rows
-    ]
+        stmt = stmt.where(AuditLog.action == action)
+        count_stmt = count_stmt.where(AuditLog.action == action)
+    total = await db.scalar(count_stmt) or 0
+    rows = await db.scalars(stmt.offset(page.offset).limit(page.limit))
+    items = [AuditLogOut.model_validate(r) for r in rows]
+    await audit_service.log(db, viewer=viewer, action="admin.audit_logs.read",
+                            resource_type="audit_log",
+                            meta={"action_filter": action, "offset": page.offset,
+                                  "limit": page.limit, "returned": len(items)})
+    return AuditLogsListOut(items=items, total=total)
 ```
 
-- [ ] **6.3** Add `require_admin` dep if not already in `deps.py`:
+- [x] **6.3** ~~Add `require_admin` dep~~ *([plan-fix]: already exists in `app/core/deps.py` since phase-1 (raises 403 for non-admin, returns the full-role `Viewer`) — no change needed)*
 
-```python
-# backend/app/core/deps.py (add)
-from fastapi import HTTPException
-from app.models.user import Role
-
-async def require_admin(viewer=Depends(get_current_viewer)):
-    if viewer.role != Role.admin:
-        raise HTTPException(status_code=403, detail="Admin required")
-    return viewer
-```
-
-- [ ] **6.4** Register in `main.py`:
-```python
-from app.api.v1 import admin as admin_router
-app.include_router(admin_router.router, prefix="/api/v1")
-```
+- [x] **6.4** ~~Register in `main.py`~~ *([plan-fix]: the admin package router is already registered in `create_app()` since phase-1 — the new modules are included via `admin/__init__.py` instead)*
 
 - [ ] **6.5** Create admin frontend page:
 
