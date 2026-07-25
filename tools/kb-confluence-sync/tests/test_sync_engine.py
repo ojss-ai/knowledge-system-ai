@@ -1,6 +1,9 @@
 # tools/kb-confluence-sync/tests/test_sync_engine.py
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from confluence_client import ConfluencePage
 from sync_engine import SyncConfig, SyncEngine, SyncResult
@@ -94,3 +97,50 @@ def test_sync_twice_second_run_all_skipped(tmp_path: Path) -> None:
     assert second.created == 0
     assert second.updated == 0
     assert second.api_calls == 0
+
+
+# --- 5.R.4: corrupt version cache is self-healing ------------------------------
+
+
+def test_corrupt_cache_file_warns_and_starts_empty(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A truncated/garbage cache file must not crash the tool — warn, treat as
+    empty (worst case: pages re-sync, which is idempotent)."""
+    cache_file = tmp_path / "versions.json"
+    cache_file.write_text("{not valid json", encoding="utf-8")
+    config = make_config(dry_run=True, cache_file=str(cache_file))
+    with caplog.at_level(logging.WARNING, logger="kb-confluence-sync"):
+        engine = SyncEngine(config)
+    assert engine._version_cache == {}
+    assert any("cache" in rec.message.lower() for rec in caplog.records)
+
+
+def test_unreadable_cache_file_warns_and_starts_empty(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """OSError (cache path is a directory here) gets the same self-healing."""
+    cache_dir = tmp_path / "versions.json"
+    cache_dir.mkdir()  # open() → IsADirectoryError, an OSError
+    config = make_config(dry_run=True, cache_file=str(cache_dir))
+    with caplog.at_level(logging.WARNING, logger="kb-confluence-sync"):
+        engine = SyncEngine(config)
+    assert engine._version_cache == {}
+    assert any("cache" in rec.message.lower() for rec in caplog.records)
+
+
+# --- 5.R.5: dry run distinguishes would-create vs would-update ------------------
+
+
+def test_dry_run_splits_would_create_and_would_update(tmp_path: Path) -> None:
+    """A page already in the version cache (older version) is a would-update;
+    an uncached page is a would-create. Still zero KB API calls."""
+    config = make_config(dry_run=True, cache_file=str(tmp_path / "versions.json"))
+    engine = SyncEngine(config)
+    engine._version_cache["TS:1"] = 1  # previously synced at v1
+    pages = [make_page("1", "Known", version=2), make_page("2", "New", version=1)]
+    with patch.object(engine._client, "list_pages", return_value=pages):
+        result = engine.sync_space("TS")
+    assert result.updated == 1
+    assert result.created == 1
+    assert result.api_calls == 0

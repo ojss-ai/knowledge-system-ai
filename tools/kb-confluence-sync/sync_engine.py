@@ -65,6 +65,15 @@ class SyncEngine:
                 cache: dict[str, int] = json.load(f)
                 return cache
         except FileNotFoundError:
+            return {}  # first run — silent
+        except (json.JSONDecodeError, OSError) as exc:
+            # [review-fix 5.R.4] self-healing: a truncated/garbage/unreadable
+            # cache must not brick the tool. Worst case every page re-syncs —
+            # the ingest-item endpoint is an idempotent upsert by source_ref.
+            logger.warning(
+                f"Version cache {self._config.version_cache_file!r} unreadable "
+                f"({exc}); starting with an empty cache — all pages will re-sync"
+            )
             return {}
 
     def _save_cache(self) -> None:
@@ -87,8 +96,15 @@ class SyncEngine:
                 continue
 
             if self._config.dry_run:
-                logger.info(f"[DRY RUN] Would sync: {page.title} (v{page.version})")
-                result.created += 1
+                # [review-fix 5.R.5] a cached page (older version) is a
+                # would-update; an uncached one a would-create. Best-effort from
+                # local knowledge only — dry run never asks the KB API.
+                if cache_key in self._version_cache:
+                    logger.info(f"[DRY RUN] Would update: {page.title} (v{page.version})")
+                    result.updated += 1
+                else:
+                    logger.info(f"[DRY RUN] Would create: {page.title} (v{page.version})")
+                    result.created += 1
                 continue
 
             try:

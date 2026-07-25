@@ -29,9 +29,7 @@ PYTHON = shutil.which("python") or sys.executable
 
 
 def run_cli(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    base_env = {
-        k: v for k, v in os.environ.items() if not k.startswith(("CONFLUENCE_", "KB_"))
-    }
+    base_env = {k: v for k, v in os.environ.items() if not k.startswith(("CONFLUENCE_", "KB_"))}
     if env:
         base_env.update(env)
     return subprocess.run(
