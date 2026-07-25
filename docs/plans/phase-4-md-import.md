@@ -1504,19 +1504,43 @@ async def task_session() -> AsyncIterator[AsyncSession]:
 - Create: `backend/app/api/v1/uploads.py`
 - Modify: `backend/app/main.py`
 - Create: `backend/tests/api/test_uploads_api.py`
+- Modify: `backend/pyproject.toml` ([plan-fix] `python-multipart` — required by
+  `UploadFile` form parsing, never declared)
 
 ### Steps
 
-- [ ] **5.1** Write failing tests:
+- [x] **5.1** Write failing tests ([plan-fix] vs the original block: `ingest_md.delay`
+  is monkeypatched to a recorder — kb-celery-jobs forbids a live broker in unit
+  tests — and the 202 test asserts the enqueued primitive args; the
+  `Content-Type` dict-comp was a no-op (the fixture only carries Authorization)
+  and is dropped; added the kb-api-conventions checklist tests (401, cross-user
+  404-generic, bad-content 422) and sync WS integration tests via starlette's
+  TestClient against the real DB, because httpx ASGITransport — the `client`
+  fixture — cannot speak WebSocket; rows are committed and cleaned up):
 
 ```python
-# backend/tests/api/test_uploads_api.py
+# backend/tests/api/test_uploads_api.py  (as built — see file for full docstring)
+import asyncio
+import base64
+import concurrent.futures
 import io
+import uuid
 import zipfile
+from collections.abc import Awaitable, Callable
+from typing import Any
+
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
-pytestmark = pytest.mark.asyncio
+from app.core.config import settings
+from app.models.ingest import IngestionRun, RunStatus
+from app.models.user import Role, User
+
+# No module-level asyncio pytestmark: asyncio_mode="auto" already collects the
+# async tests, and the mark would mis-tag the sync WS integration test.
 
 
 def make_zip_bytes(files: dict[str, str]) -> bytes:
@@ -1527,26 +1551,75 @@ def make_zip_bytes(files: dict[str, str]) -> bytes:
     return buf.getvalue()
 
 
-async def test_upload_markdown_returns_202(client: AsyncClient, auth_headers):
+@pytest.fixture(autouse=True)
+def recorded_delay(monkeypatch):
+    """Record ingest_md enqueues instead of publishing to the broker."""
+    from app.workers.tasks.ingest_md import ingest_md
+
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(ingest_md, "delay", lambda *args, **kwargs: calls.append((args, kwargs)))
+    return calls
+
+
+# --- POST /api/v1/uploads/markdown ---
+
+
+async def test_upload_markdown_returns_202(client: AsyncClient, auth_headers, recorded_delay):
     zip_bytes = make_zip_bytes({"hello.md": "# Hello\n\nContent."})
     r = await client.post(
         "/api/v1/uploads/markdown",
         files={"file": ("notes.zip", io.BytesIO(zip_bytes), "application/zip")},
-        headers={k: v for k, v in auth_headers.items() if k != "Content-Type"},
+        headers=auth_headers,
     )
     assert r.status_code == 202
     data = r.json()
     assert "run_id" in data
     assert data["status"] == "pending"
 
+    # The task got the committed run id and primitive viewer args (rule 2).
+    assert len(recorded_delay) == 1
+    args, kwargs = recorded_delay[0]
+    assert kwargs == {}
+    run_id, zip_b64, user_id, role, group_ids = args
+    assert run_id == data["run_id"]
+    assert base64.b64decode(zip_b64) == zip_bytes
+    uuid.UUID(user_id)  # a plain str uuid, not an ORM object
+    assert role == "user"
+    assert group_ids == []
 
-async def test_upload_requires_zip(client: AsyncClient, auth_headers):
+
+async def test_upload_requires_zip(client: AsyncClient, auth_headers, recorded_delay):
     r = await client.post(
         "/api/v1/uploads/markdown",
         files={"file": ("notes.txt", io.BytesIO(b"not a zip"), "text/plain")},
-        headers={k: v for k, v in auth_headers.items() if k != "Content-Type"},
+        headers=auth_headers,
     )
     assert r.status_code == 422
+    assert recorded_delay == []
+
+
+async def test_upload_rejects_invalid_zip_content(
+    client: AsyncClient, auth_headers, recorded_delay
+):
+    r = await client.post(
+        "/api/v1/uploads/markdown",
+        files={"file": ("notes.zip", io.BytesIO(b"zip by name only"), "application/zip")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 422
+    assert recorded_delay == []
+
+
+async def test_upload_unauthenticated_is_401(client: AsyncClient):
+    zip_bytes = make_zip_bytes({"a.md": "# A"})
+    r = await client.post(
+        "/api/v1/uploads/markdown",
+        files={"file": ("notes.zip", io.BytesIO(zip_bytes), "application/zip")},
+    )
+    assert r.status_code == 401
+
+
+# --- GET /api/v1/uploads/runs/{run_id} ---
 
 
 async def test_get_run_status(client: AsyncClient, auth_headers):
@@ -1554,37 +1627,189 @@ async def test_get_run_status(client: AsyncClient, auth_headers):
     r = await client.post(
         "/api/v1/uploads/markdown",
         files={"file": ("notes.zip", io.BytesIO(zip_bytes), "application/zip")},
-        headers={k: v for k, v in auth_headers.items() if k != "Content-Type"},
+        headers=auth_headers,
     )
     run_id = r.json()["run_id"]
     r2 = await client.get(f"/api/v1/uploads/runs/{run_id}", headers=auth_headers)
     assert r2.status_code == 200
-    assert r2.json()["id"] == run_id
+    body = r2.json()
+    assert body["id"] == run_id
+    assert body["status"] == "pending"
+    assert body["processed_items"] == 0
+
+
+async def test_get_run_of_another_user_is_404(
+    client: AsyncClient, auth_headers, auth_headers_other
+):
+    """Invisible == nonexistent: a 403 would confirm the run id exists."""
+    zip_bytes = make_zip_bytes({"secret.md": "# Secret"})
+    r = await client.post(
+        "/api/v1/uploads/markdown",
+        files={"file": ("notes.zip", io.BytesIO(zip_bytes), "application/zip")},
+        headers=auth_headers,
+    )
+    run_id = r.json()["run_id"]
+    r2 = await client.get(f"/api/v1/uploads/runs/{run_id}", headers=auth_headers_other)
+    assert r2.status_code == 404
+    assert r2.json()["detail"] == "Run not found"  # generic body, nothing confirmed
+
+
+async def test_get_run_missing_is_404(client: AsyncClient, auth_headers):
+    r = await client.get(f"/api/v1/uploads/runs/{uuid.uuid4()}", headers=auth_headers)
+    assert r.status_code == 404
+
+
+# --- WS /api/v1/uploads/runs/{run_id}/progress (integration, real DB) ---
+
+
+def _recv_json(ws, timeout: float = 10.0) -> Any:
+    """receive_json with a watchdog — a silent server must fail the test, not hang it."""
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        return ex.submit(ws.receive_json).result(timeout=timeout)
+    finally:
+        ex.shutdown(wait=False)
+
+
+def _run_db(fn: Callable[[AsyncSession], Awaitable[None]]) -> None:
+    """Run one committed unit of work on the real DB in a throwaway loop/engine."""
+
+    async def _go() -> None:
+        engine = create_async_engine(settings.database_url, poolclass=NullPool)
+        try:
+            async with AsyncSession(engine) as session:
+                await fn(session)
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_go())
+
+
+# fastapi re-exports starlette.testclient, which warns about httpx2 at import;
+# environmental noise, not ours to fix here.
+@pytest.mark.filterwarnings("ignore:Using `httpx` with `starlette.testclient`")
+def test_ws_progress_streams_until_done():
+    """Progress events flow over the WS while the run advances, ending at done."""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    user_id, run_id = uuid.uuid4(), uuid.uuid4()
+
+    async def _setup(s: AsyncSession) -> None:
+        s.add(
+            User(
+                id=user_id,
+                email=f"ws-{uuid.uuid4().hex[:8]}@test.com",
+                password_hash="x",
+                display_name="ws-test",
+                role=Role.user,
+            )
+        )
+        await s.flush()  # no ORM relationship → order the FK parent explicitly
+        s.add(
+            IngestionRun(
+                id=run_id,
+                owner_id=user_id,
+                source="md_upload",
+                status=RunStatus.running,
+                total_items=3,
+                processed_items=1,
+            )
+        )
+
+    async def _advance(s: AsyncSession) -> None:
+        run = await s.get(IngestionRun, run_id)
+        run.processed_items = 3
+        run.status = RunStatus.done
+
+    async def _cleanup(s: AsyncSession) -> None:
+        await s.execute(delete(IngestionRun).where(IngestionRun.id == run_id))
+        await s.execute(delete(User).where(User.id == user_id))
+
+    _run_db(_setup)
+    try:
+        with TestClient(create_app()) as tc:
+            with tc.websocket_connect(f"/api/v1/uploads/runs/{run_id}/progress") as ws:
+                first = _recv_json(ws)
+                assert first == {"processed": 1, "total": 3, "status": "running"}
+
+                _run_db(_advance)  # the "worker" commits progress behind the WS session
+
+                evt = _recv_json(ws)
+                while evt["status"] == "running":
+                    evt = _recv_json(ws)
+                assert evt == {"processed": 3, "total": 3, "status": "done"}
+
+            # unknown run: one error frame, then the server closes
+            with tc.websocket_connect(f"/api/v1/uploads/runs/{uuid.uuid4()}/progress") as ws:
+                assert _recv_json(ws) == {"error": "Run not found"}
+    finally:
+        _run_db(_cleanup)
 ```
 
-- [ ] **5.2** Create the router:
+- [x] **5.2** Create the router ([plan-fix] vs the original block — details in the
+  module docstring: `get_scoped_viewer` not `get_current_viewer` (admin bypass
+  only under /api/v1/admin/*); `zipfile.is_zipfile` needs a file-like object,
+  the plan passed raw bytes (`content.__class__(content)`), which it cannot
+  read; get_run answers another user's run 404-generic (invisible ==
+  nonexistent) instead of 403, which confirms the run id exists; the WS poll
+  re-selects with `populate_existing=True` or the session identity map would
+  replay the first read forever and never show worker progress;
+  summary/operation_id added; plain `file: UploadFile` (no `File(...)` default —
+  ruff B008); `RunOut.model_validate(run)` — routers never return ORM objects.
+  Also [plan-fix]: `python-multipart` added to pyproject dependencies —
+  `UploadFile` form parsing requires it and the plan never declared it):
 
 ```python
-# backend/app/api/v1/uploads.py
+# backend/app/api/v1/uploads.py  (as built)
+"""Uploads router — POST a zip of Markdown files, ingest asynchronously (Celery),
+track the run, and stream progress over WebSocket.
+
+The run-status probes here are sanctioned raw queries (daily_logs precedent):
+`ingestion_runs` is upload bookkeeping owned by exactly one user, not a
+knowledge read path — ownership (owner_id == viewer.user_id) is the whole
+visibility rule, answered 404-generic like any invisible read.
+
+> Scale note (Task 5 plan blockquote): `ingest_md.delay(..., base64(zip))`
+> pushes up to ~133 MB per message through Redis at the 100 MB cap. Phase 7
+> hardening candidate: store the upload in MinIO (`storage.upload_file`) and
+> pass the object path instead of the payload. Do not redesign here.
+"""
+
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
 import uuid
+import zipfile
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import get_current_viewer
+from app.core.deps import Viewer, get_scoped_viewer
+from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
-from app.services.visibility import Viewer
+from app.workers.tasks.ingest_md import ingest_md
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+_WS_POLL_SECONDS = 0.5
 
 
 class RunOut(BaseModel):
@@ -1604,22 +1829,26 @@ class UploadStarted(BaseModel):
     status: RunStatus
 
 
-@router.post("/markdown", response_model=UploadStarted, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/markdown",
+    response_model=UploadStarted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Upload a zip of Markdown files for ingestion",
+    operation_id="uploadMarkdown",
+)
 async def upload_markdown(
-    file: UploadFile = File(...),
-    viewer: Viewer = Depends(get_current_viewer),
+    file: UploadFile,
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
+) -> UploadStarted:
+    # Request-shape validation (not domain logic), so HTTPException is correct here.
     if not file.filename or not file.filename.endswith(".zip"):
         raise HTTPException(status_code=422, detail="File must be a .zip archive of Markdown files")
 
     content = await file.read()
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 100 MB)")
-
-    # Validate it's actually a zip
-    import zipfile
-    if not zipfile.is_zipfile(content.__class__(content)):
+    if not zipfile.is_zipfile(io.BytesIO(content)):
         raise HTTPException(status_code=422, detail="Not a valid zip file")
 
     run = IngestionRun(
@@ -1630,10 +1859,9 @@ async def upload_markdown(
         total_items=0,
     )
     db.add(run)
-    await db.commit()
+    await db.commit()  # the worker reads this row — it must be durable before enqueue
 
-    # Dispatch Celery task (args are primitives only)
-    from app.workers.tasks.ingest_md import ingest_md
+    # Primitive args only (kb-celery-jobs rule 2); the zip travels base64.
     ingest_md.delay(
         str(run.id),
         base64.b64encode(content).decode(),
@@ -1645,19 +1873,22 @@ async def upload_markdown(
     return UploadStarted(run_id=run.id, status=RunStatus.pending)
 
 
-@router.get("/runs/{run_id}", response_model=RunOut)
+@router.get(
+    "/runs/{run_id}",
+    response_model=RunOut,
+    summary="Get ingestion run status",
+    operation_id="getIngestionRun",
+)
 async def get_run(
     run_id: uuid.UUID,
-    viewer: Viewer = Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    from app.core.errors import ForbiddenError, NotFoundError
+) -> RunOut:
     run = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
-    if run is None:
-        raise NotFoundError(f"Run {run_id} not found")
-    if run.owner_id != viewer.user_id:
-        raise ForbiddenError("Not your run")
-    return run
+    if run is None or run.owner_id != viewer.user_id:
+        # Generic body: invisible == nonexistent, nothing confirmed either way.
+        raise NotFoundError("Run not found")
+    return RunOut.model_validate(run)
 
 
 @router.websocket("/runs/{run_id}/progress")
@@ -1665,59 +1896,98 @@ async def run_progress_ws(
     run_id: uuid.UUID,
     websocket: WebSocket,
     db: AsyncSession = Depends(get_db),
-):
+) -> None:
+    """Stream progress events for an ingestion run.
+
+    Client receives JSON: {"processed": N, "total": M, "status": "..."}.
+    Polls the DB every 500 ms (the worker checkpoints processed_items per item)
+    until the run is done or failed. Exposes counters and status only — no
+    auth per the plan; the run id is an unguessable UUID.
     """
-    WebSocket endpoint: streams progress events for an ingestion run.
-    Client receives JSON: {"processed": N, "total": M, "status": "..."}
-    Polls DB every 500ms until run is done or failed.
-    """
-    import asyncio
     await websocket.accept()
     try:
         while True:
-            run = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
+            run = await db.scalar(
+                select(IngestionRun)
+                .where(IngestionRun.id == run_id)
+                # populate_existing: refresh identity-map attributes each poll,
+                # or the loop would replay the first read forever [plan-fix].
+                .execution_options(populate_existing=True)
+            )
             if run is None:
                 await websocket.send_json({"error": "Run not found"})
                 break
-            await websocket.send_json({
-                "processed": run.processed_items,
-                "total": run.total_items,
-                "status": run.status.value,
-            })
+            await websocket.send_json(
+                {
+                    "processed": run.processed_items,
+                    "total": run.total_items,
+                    "status": run.status.value,
+                }
+            )
             if run.status in (RunStatus.done, RunStatus.failed):
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(_WS_POLL_SECONDS)
     except WebSocketDisconnect:
-        pass
+        return
+    await websocket.close()
 ```
 
-- [ ] **5.3** Register in `main.py`:
+- [x] **5.3** Register in `main.py` ([plan-fix] codebase import style — named
+  router import, alphabetical):
 
 ```python
-from app.api.v1 import uploads as uploads_router
-app.include_router(uploads_router.router, prefix="/api/v1")
+from app.api.v1.uploads import router as uploads_router
+...
+app.include_router(uploads_router, prefix="/api/v1")
 ```
 
-- [ ] **5.4** Run tests:
+- [x] **5.4** Run tests:
 ```bash
 cd backend && pytest tests/api/test_uploads_api.py -v
-# Expected: 3 passed
+# Expected: 8 passed  ([plan-fix] was "3 passed"; see 5.1 for the added tests)
 ```
 
-- [ ] **5.5** curl evidence:
+Evidence (sandbox, 2026-07-24 — RED first: all failed 404/WebSocketDisconnect
+before 5.2/5.3 existed):
+
+```text
+tests/api/test_uploads_api.py::test_upload_markdown_returns_202 PASSED   [ 12%]
+tests/api/test_uploads_api.py::test_upload_requires_zip PASSED           [ 25%]
+tests/api/test_uploads_api.py::test_upload_rejects_invalid_zip_content PASSED [ 37%]
+tests/api/test_uploads_api.py::test_upload_unauthenticated_is_401 PASSED [ 50%]
+tests/api/test_uploads_api.py::test_get_run_status PASSED                [ 62%]
+tests/api/test_uploads_api.py::test_get_run_of_another_user_is_404 PASSED [ 75%]
+tests/api/test_uploads_api.py::test_get_run_missing_is_404 PASSED        [ 87%]
+tests/api/test_uploads_api.py::test_ws_progress_streams_until_done PASSED [100%]
+8 passed in 2.90s
+```
+
+`test_ws_progress_streams_until_done` is the WS exit-criterion evidence
+(integration test in lieu of wscat): a real server streamed
+`{"processed": 1, "total": 3, "status": "running"}` →
+`{"processed": 3, "total": 3, "status": "done"}` as the run advanced.
+
+- [x] **5.5** curl evidence (live uvicorn against sandbox PG, 2026-07-24;
+  evidence rows + Redis queue cleaned up afterwards):
+
 ```bash
-# Create a test zip
-cd /tmp && mkdir notes && echo "# First Note\n\nHello world." > notes/first.md
+cd /tmp && mkdir notes && printf "# First Note\n\nHello world.\n" > notes/first.md
 zip -r notes.zip notes/
 
 curl -s -X POST http://localhost:8000/api/v1/uploads/markdown \
   -H "Authorization: Bearer $TOKEN" \
-  -F "file=@/tmp/notes.zip" | jq .
+  -F "file=@/tmp/notes.zip"
+# → {"run_id":"a7fff7c7-2000-43c4-bbbc-88d2f9ff1212","status":"pending"}
 
-# Expected: {"run_id": "...", "status": "pending"}
+curl -s http://localhost:8000/api/v1/uploads/runs/a7fff7c7-2000-43c4-bbbc-88d2f9ff1212 \
+  -H "Authorization: Bearer $TOKEN"
+# → {"id":"a7fff7c7-2000-43c4-bbbc-88d2f9ff1212","status":"pending","total_items":0,
+#    "processed_items":0,"failed_items":0,
+#    "created_at":"2026-07-25T03:28:56.950584Z","finished_at":null}
+# (status stays pending: no Celery worker runs in the sandbox)
 ```
 
-- [ ] **5.6** Commit:
+- [x] **5.6** Commit:
 ```
 feat(api): POST /api/v1/uploads/markdown (202 + Celery), GET /runs/:id, WS progress
 ```
