@@ -54,9 +54,7 @@ async def refresh(payload: RefreshIn, db: AsyncSession = Depends(get_db)) -> Tok
             # [4.R.2] Fail CLOSED: without Redis, single-use cannot be enforced,
             # so rotating tokens blind would reopen the replay hole. Generic
             # detail — no internals leak across the auth boundary.
-            raise HTTPException(
-                status_code=503, detail="service temporarily unavailable"
-            ) from exc
+            raise HTTPException(status_code=503, detail="service temporarily unavailable") from exc
         if not claimed:
             raise HTTPException(status_code=401, detail="refresh token reused")
 
