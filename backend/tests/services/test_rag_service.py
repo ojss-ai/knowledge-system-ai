@@ -31,6 +31,41 @@ async def test_rag_returns_answer(db, make_user, make_node, fake_embedder):
     assert result.answer is not None
     assert len(result.answer) > 0
     assert isinstance(result.sources, list)
+    assert result.degraded is False
+
+
+class _ExplodingLLM:
+    """Adapter that fails like an unreachable backend would (2.R.1)."""
+
+    async def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+        raise RuntimeError("boom-internal-detail")
+
+
+async def test_rag_degrades_without_llm(db, make_user, make_node, fake_embedder):
+    """2.R.1 (ADR-010): on LLM failure, return ranked sources WITHOUT synthesis —
+    answer is None, degraded is True, and no internal exception detail leaks."""
+    owner = await make_user(email="rag_d1@test.com")
+    node = await make_node(
+        owner,
+        title="Python Guide",
+        body="Python is great for data science and ML pipelines.",
+        visibility=Visibility.public,
+    )
+    await db.flush()
+    await _embed_node_impl(db, node.id, fake_embedder)
+
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    result = await rag.ask(
+        db,
+        "What is Python good for?",
+        viewer,
+        embedder=fake_embedder,
+        llm=_ExplodingLLM(),
+    )
+    assert result.answer is None
+    assert result.degraded is True
+    assert str(node.id) in [s["id"] for s in result.sources]
+    assert "boom-internal-detail" not in repr(result)
 
 
 async def test_rag_respects_visibility(db, make_user, make_node, fake_embedder):

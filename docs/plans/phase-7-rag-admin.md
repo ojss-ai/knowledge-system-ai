@@ -288,6 +288,35 @@ async def test_rag_returns_answer(db, make_user, make_node, fake_embedder):
     assert result.answer is not None
     assert len(result.answer) > 0
     assert isinstance(result.sources, list)
+    assert result.degraded is False
+
+
+class _ExplodingLLM:
+    """Adapter that fails like an unreachable backend would (2.R.1)."""
+
+    async def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+        raise RuntimeError("boom-internal-detail")
+
+
+async def test_rag_degrades_without_llm(db, make_user, make_node, fake_embedder):
+    """2.R.1 (ADR-010): on LLM failure, return ranked sources WITHOUT synthesis —
+    answer is None, degraded is True, and no internal exception detail leaks."""
+    owner = await make_user(email="rag_d1@test.com")
+    node = await make_node(owner, title="Python Guide",
+                          body="Python is great for data science and ML pipelines.",
+                          visibility=Visibility.public)
+    await db.flush()
+    await _embed_node_impl(db, node.id, fake_embedder)
+
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    result = await rag.ask(
+        db, "What is Python good for?", viewer,
+        embedder=fake_embedder, llm=_ExplodingLLM(),
+    )
+    assert result.answer is None
+    assert result.degraded is True
+    assert str(node.id) in [s["id"] for s in result.sources]
+    assert "boom-internal-detail" not in repr(result)
 
 
 async def test_rag_respects_visibility(db, make_user, make_node, fake_embedder):
@@ -325,6 +354,7 @@ in context, even if the LLM would not directly reveal them (ADR-004).
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -351,11 +381,18 @@ _SYSTEM_PROMPT = (
 _NO_CONTEXT_ANSWER = "I don't have enough information in the knowledge base to answer that."
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class RAGResult:
-    answer: str
+    """RAG outcome. `answer is None` + `degraded=True` means the LLM was
+    unavailable and the caller gets ranked sources without synthesis (ADR-010)."""
+
+    answer: str | None
     sources: list[dict[str, Any]]
     query: str
+    degraded: bool = False
 
 
 async def ask(
@@ -403,8 +440,14 @@ async def ask(
     context = "\n\n---\n\n".join(context_parts)
     prompt = f"Context:\n\n{context}\n\n---\n\nQuestion: {query}"
 
-    # Step 3: LLM completion
-    answer = llm.complete(prompt, system=_SYSTEM_PROMPT)
+    # Step 3: LLM completion. On any backend failure, degrade per ADR-010:
+    # ranked sources WITHOUT synthesis. The exception is logged server-side
+    # only — raw exception text must NEVER reach the caller.
+    try:
+        answer = await llm.complete(prompt, system=_SYSTEM_PROMPT)
+    except Exception:
+        logger.exception("llm_completion_failed — degrading to retrieval-only response")
+        return RAGResult(answer=None, sources=results[:limit], query=query, degraded=True)
 
     return RAGResult(
         answer=answer,
@@ -441,11 +484,42 @@ async def test_ask_returns_answer(client: AsyncClient, auth_headers):
     assert "answer" in data
     assert "sources" in data
     assert isinstance(data["sources"], list)
+    assert data["degraded"] is False
 
 
 async def test_ask_requires_auth(client: AsyncClient):
     r = await client.post("/api/v1/ask", json={"query": "test"})
     assert r.status_code == 401
+
+
+async def test_ask_degrades_on_llm_failure(client: AsyncClient, auth_headers, monkeypatch):
+    """2.R.1 (ADR-010): LLM down → 200 with ranked sources, answer null,
+    degraded true — and never any raw exception text in the body."""
+    import app.api.v1.ask as ask_module
+
+    class _ExplodingLLM:
+        async def complete(self, prompt: str, *, system: str = "", max_tokens: int = 512) -> str:
+            raise RuntimeError("boom-internal-detail")
+
+    monkeypatch.setattr(ask_module, "get_llm", lambda: _ExplodingLLM())
+
+    await client.post("/api/v1/nodes", json={
+        "title": "FastAPI",
+        "body": "FastAPI is a modern Python web framework.",
+        "visibility": "public",
+    }, headers=auth_headers)
+
+    r = await client.post(
+        "/api/v1/ask",
+        json={"query": "What is FastAPI?"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["answer"] is None
+    assert data["degraded"] is True
+    assert len(data["sources"]) >= 1
+    assert "boom-internal-detail" not in r.text
 ```
 
 - [x] **2.4** Create the router ([plan-fix]: `get_current_viewer` → `get_scoped_viewer` — /ask is not an admin-console route, so the admin visibility bypass must be scoped down (kb-visibility-filter rule 5, matches every other non-admin router); added `summary`/`operation_id` per kb-api-conventions; bounded `query`/`limit` fields for 422 validation; typed signature):
@@ -481,9 +555,13 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
-    answer: str
+    """`answer: null` + `degraded: true` = LLM unavailable; `sources` still
+    carries the ranked retrieval results (ADR-010 graceful degradation)."""
+
+    answer: str | None
     sources: list[dict[str, Any]]
     query: str
+    degraded: bool = False
 
 
 @router.post(
@@ -505,7 +583,12 @@ async def ask(
         llm=get_llm(),
         limit=payload.limit,
     )
-    return AskResponse(answer=result.answer, sources=result.sources, query=result.query)
+    return AskResponse(
+        answer=result.answer,
+        sources=result.sources,
+        query=result.query,
+        degraded=result.degraded,
+    )
 ```
 
 - [x] **2.5** Register in `main.py` ([plan-fix]: import style matches the existing `from app.api.v1.<mod> import router as <mod>_router` pattern):
@@ -519,7 +602,17 @@ app.include_router(ask_router, prefix="/api/v1")
 cd backend && pytest tests/services/test_rag_service.py tests/api/test_ask_api.py -v
 # Expected: 4 passed
 # Actual: 4 passed in 1.17s (full suite: 213 passed, 13 Neo4j-skips)
+# After review fixes (1.R/2.R): 6 passed in these files; full suite 218 passed
 ```
+
+### 2.R Review fixes (post-commit 3ffe27c)
+
+- [x] **2.R.1** (CRITICAL, ADR-010 degrade shape) On LLM failure/unavailability, /ask now
+  returns HTTP 200 with the ranked sources and NO synthesis: `answer: null` +
+  `degraded: true` (smallest schema addition). Raw exception text is logged server-side and
+  NEVER surfaced to the caller (the old OllamaLLM stub embedded `{exc}` in the answer).
+  Tests: `test_rag_degrades_without_llm`, `test_ask_degrades_on_llm_failure`.
+- [x] **2.R.2** rag_service now `await`s `llm.complete(...)` — adapters are async (1.R.1).
 
 - [x] **2.7** Commit:
 ```

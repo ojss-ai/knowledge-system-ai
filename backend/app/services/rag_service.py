@@ -7,6 +7,7 @@ in context, even if the LLM would not directly reveal them (ADR-004).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -33,11 +34,18 @@ _SYSTEM_PROMPT = (
 _NO_CONTEXT_ANSWER = "I don't have enough information in the knowledge base to answer that."
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class RAGResult:
-    answer: str
+    """RAG outcome. `answer is None` + `degraded=True` means the LLM was
+    unavailable and the caller gets ranked sources without synthesis (ADR-010)."""
+
+    answer: str | None
     sources: list[dict[str, Any]]
     query: str
+    degraded: bool = False
 
 
 async def ask(
@@ -85,8 +93,14 @@ async def ask(
     context = "\n\n---\n\n".join(context_parts)
     prompt = f"Context:\n\n{context}\n\n---\n\nQuestion: {query}"
 
-    # Step 3: LLM completion
-    answer = await llm.complete(prompt, system=_SYSTEM_PROMPT)
+    # Step 3: LLM completion. On any backend failure, degrade per ADR-010:
+    # ranked sources WITHOUT synthesis. The exception is logged server-side
+    # only — raw exception text must NEVER reach the caller.
+    try:
+        answer = await llm.complete(prompt, system=_SYSTEM_PROMPT)
+    except Exception:
+        logger.exception("llm_completion_failed — degrading to retrieval-only response")
+        return RAGResult(answer=None, sources=results[:limit], query=query, degraded=True)
 
     return RAGResult(
         answer=answer,

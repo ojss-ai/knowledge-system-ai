@@ -27,9 +27,13 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
-    answer: str
+    """`answer: null` + `degraded: true` = LLM unavailable; `sources` still
+    carries the ranked retrieval results (ADR-010 graceful degradation)."""
+
+    answer: str | None
     sources: list[dict[str, Any]]
     query: str
+    degraded: bool = False
 
 
 @router.post(
@@ -51,4 +55,9 @@ async def ask(
         llm=get_llm(),
         limit=payload.limit,
     )
-    return AskResponse(answer=result.answer, sources=result.sources, query=result.query)
+    return AskResponse(
+        answer=result.answer,
+        sources=result.sources,
+        query=result.query,
+        degraded=result.degraded,
+    )
