@@ -863,9 +863,10 @@ feat(ingest): Markdown zip parser with wikilink edge extraction
 
 > [plan-fix] carried over from Task 2: the ingest contract QUEUES all graph ops
 > on the session (PG-first, ADR-011) but this task's block never drained them —
-> `_run_ingest` (worker orchestration) runs `ns.run_pending_graph_ops(db)` AFTER
-> `task_session` commits; recorder tests prove vertices/edges only flow
-> post-commit. Also: under the real `task_session` an exception ROLLS BACK the
+> the per-batch checkpoint in `_run_ingest`/`_ingest_md_impl` drains them with
+> `ns.run_pending_graph_ops(db)` right after each commit, INSIDE the open
+> `task_session` (see 4.R.2; recorder tests prove vertices/edges only flow
+> post-commit). Also: under the real `task_session` an exception ROLLS BACK the
 > impl's in-transaction `status=failed` write, so `_mark_run_failed` re-marks
 > the run in a fresh transaction before the error propagates for retry. Task
 > shape mirrors `embed_node`: `queue="ingest"` (kb-celery-jobs rule 6),
@@ -875,6 +876,7 @@ feat(ingest): Markdown zip parser with wikilink edge extraction
 **Files:**
 - Create: `backend/app/workers/tasks/ingest_md.py`
 - Create: `backend/tests/workers/test_ingest_md.py`
+- Modify ([review-fix 4.R]): `backend/app/workers/celery_app.py`, `backend/tests/workers/test_celery_app.py`
 
 ### Steps
 
@@ -883,7 +885,11 @@ feat(ingest): Markdown zip parser with wikilink edge extraction
 
 ```python
 # backend/tests/workers/test_ingest_md.py
-"""Ingest Celery task: idempotent zip ingestion + IngestionRun tracking."""
+"""Ingest Celery task: idempotent zip ingestion + IngestionRun tracking.
+
+[review-fix 4.R]: per-item durability (mid-zip failure keeps committed nodes +
+counters, resumable), and the fake task_session now exercises REAL close
+semantics (separate session, logged commits, actual close)."""
 
 import io
 import uuid
@@ -892,11 +898,13 @@ from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ingest import IngestionRun, RunStatus
 from app.models.knowledge import KnowledgeNode
 from app.models.user import Role
 from app.services import node_service as ns
+from app.services.ingest.base import KnowledgeIngestor
 from app.services.visibility import Viewer
 from app.workers.tasks import ingest_md as ingest_md_module
 from app.workers.tasks.ingest_md import (
@@ -1033,15 +1041,36 @@ def _graph_recorder(monkeypatch, log: list[tuple[str, ...]]) -> None:
 
 
 def _fake_task_session(db, log: list[tuple[str, ...]]):
-    """Mimic task_session on the test session: savepoint (rolled back on error,
-    released on success), then a 'commit' marker — so the log shows whether
-    graph ops ran before or after the commit boundary."""
+    """[review-fix 4.R] Mirror REAL task_session semantics on the test
+    connection: a SEPARATE AsyncSession whose commits release savepoints on the
+    test's outer transaction (join_transaction_mode="create_savepoint", so
+    'durable' work still rolls back with the test), a logged ("commit",) marker
+    per commit, commit-on-clean-exit, and a REAL close (("close",) marker).
+
+    The previous fake yielded the long-lived test session inside one savepoint:
+    it could not represent mid-block batch commits and kept the session
+    artificially open after the context exited — hiding that the worker drained
+    graph ops on an already-closed session."""
 
     @asynccontextmanager
     async def fake():
-        async with db.begin_nested():
-            yield db
-        log.append(("commit",))
+        conn = await db.connection()
+        inner = AsyncSession(
+            bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint"
+        )
+        real_commit = inner.commit
+
+        async def logged_commit() -> None:
+            await real_commit()
+            log.append(("commit",))
+
+        inner.commit = logged_commit  # type: ignore[method-assign]
+        try:
+            yield inner
+            await inner.commit()  # the real task_session commits on clean exit
+        finally:
+            await inner.close()
+            log.append(("close",))
 
     return fake
 
@@ -1069,7 +1098,8 @@ async def test_impl_queues_graph_ops_without_running_them(db, make_user, monkeyp
 
 
 async def test_run_ingest_drains_graph_ops_post_commit(db, make_user, monkeypatch):
-    """[plan-fix] worker orchestration: vertices/edges flow only AFTER commit."""
+    """[review-fix 4.R] worker orchestration: graph ops flow batch-by-batch —
+    each drain AFTER its batch's commit and BEFORE the task session closes."""
     log: list[tuple[str, ...]] = []
     _graph_recorder(monkeypatch, log)
     monkeypatch.setattr(ingest_md_module, "task_session", _fake_task_session(db, log))
@@ -1086,11 +1116,18 @@ async def test_run_ingest_drains_graph_ops_post_commit(db, make_user, monkeypatc
     )
     await _run_ingest(run.id, zip_bytes, viewer)
 
-    commit_idx = log.index(("commit",))
+    commit_idxs = [i for i, e in enumerate(log) if e == ("commit",)]
+    close_idx = log.index(("close",))
     graph_idxs = [i for i, e in enumerate(log) if e[0] in ("vertex", "edge")]
     assert graph_idxs, "the worker must drain the queued graph ops"
-    assert all(i > commit_idx for i in graph_idxs), (
-        "graph ops ran before the commit boundary (ADR-011 violation)"
+    assert all(i > min(commit_idxs) for i in graph_idxs), (
+        "graph ops ran before the first commit boundary (ADR-011 violation)"
+    )
+    assert all(i < close_idx for i in graph_idxs), (
+        "graph ops must drain while the task session is still open, not after close"
+    )
+    assert any(i < max(commit_idxs) for i in graph_idxs), (
+        "graph ops must flow batch-by-batch, not lumped after the final commit"
     )
     assert any(log[i][0] == "edge" for i in graph_idxs), "wikilink edge must be merged"
 
@@ -1104,17 +1141,87 @@ async def test_run_ingest_marks_run_failed_in_fresh_tx(db, make_user, monkeypatc
 
     owner = await make_user(email="imd_failtx@test.com")
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
-    run = await _make_run(db, owner)
+    run_id = (await _make_run(db, owner)).id
 
     with pytest.raises(zipfile.BadZipFile):
-        await _run_ingest(run.id, b"not a zip", viewer)
+        await _run_ingest(run_id, b"not a zip", viewer)
 
-    run_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run.id))
+    db.expire_all()  # the fake task session updated the row behind this session
+    run_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
     assert run_result.status == RunStatus.failed
     assert run_result.error_log
     assert all(e[0] not in ("vertex", "edge") for e in log), (
         "graph ops from a rolled-back transaction must never run"
     )
+
+
+async def test_run_ingest_failure_mid_zip_keeps_committed_progress(db, make_user, monkeypatch):
+    """[review-fix 4.R, kb-celery-jobs rule 5] per-item durability: items
+    committed before a mid-zip failure persist — their nodes AND the
+    processed_items counter — and the run is marked failed WITH the accumulated
+    counts. A re-run of the same zip then converges idempotently (content-hash
+    skip), making the job resumable."""
+    log: list[tuple[str, ...]] = []
+    _graph_recorder(monkeypatch, log)
+    monkeypatch.setattr(ingest_md_module, "task_session", _fake_task_session(db, log))
+
+    real_upsert = KnowledgeIngestor.upsert
+
+    async def flaky_upsert(self, item):
+        if item.source_ref == "b.md":
+            raise RuntimeError("injected failure on item 2")
+        return await real_upsert(self, item)
+
+    monkeypatch.setattr(KnowledgeIngestor, "upsert", flaky_upsert)
+
+    owner = await make_user(email="imd_midzip@test.com")
+    owner_id = owner.id  # captured: expire_all() below makes attribute access lazy-load
+    viewer = Viewer(user_id=owner_id, role=Role.user, group_ids=frozenset())
+    run_id = (await _make_run(db, owner)).id
+
+    zip_bytes = make_zip(
+        {
+            "a.md": "# A\n\nfirst",
+            "b.md": "# B\n\nsecond",
+            "c.md": "# C\n\nthird",
+        }
+    )
+    with pytest.raises(RuntimeError, match="injected failure"):
+        await _run_ingest(run_id, zip_bytes, viewer)
+
+    db.expire_all()
+    run_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
+    assert run_result.status == RunStatus.failed
+    assert run_result.error_log
+    assert run_result.processed_items == 1, (
+        "counters committed before the failure must survive it (rule 5)"
+    )
+
+    titles = (
+        await db.scalars(
+            select(KnowledgeNode.title).where(
+                KnowledgeNode.owner_id == owner_id, KnowledgeNode.source == "md_upload"
+            )
+        )
+    ).all()
+    assert titles == ["A"], "nodes committed before the failure must persist"
+
+    # Resumable: re-running the (now healthy) zip converges without duplicates.
+    monkeypatch.setattr(KnowledgeIngestor, "upsert", real_upsert)
+    await db.refresh(owner)  # expired above; _make_run reads owner.id
+    run2_id = (await _make_run(db, owner)).id
+    await _run_ingest(run2_id, zip_bytes, viewer)
+
+    db.expire_all()
+    count = await db.scalar(
+        select(func.count())
+        .select_from(KnowledgeNode)
+        .where(KnowledgeNode.owner_id == owner_id, KnowledgeNode.source == "md_upload")
+    )
+    assert count == 3, "re-run must converge: A skipped by content hash, B and C created"
+    run2_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run2_id))
+    assert run2_result.status == RunStatus.done
+    assert run2_result.processed_items == 3
 
 
 async def test_mark_run_failed(db, make_user):
@@ -1141,9 +1248,14 @@ async def test_mark_run_failed_missing_run_is_noop(db):
 # backend/app/workers/tasks/ingest_md.py
 """Celery task: idempotent Markdown zip ingestion with IngestionRun tracking.
 
-PG first, Neo4j second (ADR-011): _ingest_md_impl runs inside the caller's
-transaction and only QUEUES graph ops (via KnowledgeIngestor / node_service);
-_run_ingest drains them with run_pending_graph_ops AFTER task_session commits.
+PG first, Neo4j second (ADR-011): _ingest_md_impl only QUEUES graph ops (via
+KnowledgeIngestor / node_service); the per-batch checkpoint drains them with
+run_pending_graph_ops right AFTER each commit, while the session is still open.
+
+Durability ([review-fix 4.R], kb-celery-jobs rule 5): the run commits every
+_COMMIT_EVERY items, so nodes and the processed_items counter survive a
+mid-zip failure — the counts Task 5 status readers see are real, and a re-run
+converges from where the last commit left off (content-hash skip): resumable.
 
 Idempotency (kb-celery-jobs rule 1): KnowledgeIngestor.upsert is keyed on
 (owner_id, source, source_ref) with a content-hash short-circuit, so re-running
@@ -1174,6 +1286,25 @@ from app.workers.celery_app import celery_app, task_session
 # channel run:{ingestion_run_id} (kb-celery-jobs rule 8).
 ProgressCallback = Callable[[int, int], Awaitable[None]]
 
+# Durability checkpoint: commit accumulated work, then drain queued graph ops.
+Checkpoint = Callable[[AsyncSession], Awaitable[None]]
+
+# Items per durability commit (kb-celery-jobs rule 5). 1 because items are
+# whole Markdown files (coarse units) and the Task 5 WS reader polls
+# processed_items — a bigger batch would freeze visible progress and lose more
+# work on a crash. Raise only with evidence that commit overhead matters.
+_COMMIT_EVERY = 1
+
+
+async def _checkpoint(db: AsyncSession) -> None:
+    """[review-fix 4.R] Durability boundary: commit the accumulated batch, then
+    drain the queued graph ops POST-commit while the session is still open
+    (ADR-011 + kb-celery-jobs rule 5). Neo4j stays best-effort — each op is
+    wrapped in _graph_sync, so a graph failure never undoes the committed
+    batch (a Celery retry re-converges the graph)."""
+    await db.commit()
+    await ns.run_pending_graph_ops(db)
+
 
 async def _ingest_md_impl(
     db: AsyncSession,
@@ -1181,9 +1312,13 @@ async def _ingest_md_impl(
     zip_bytes: bytes,
     viewer: Viewer,
     progress_callback: ProgressCallback | None = None,
+    checkpoint: Checkpoint | None = None,
 ) -> None:
-    """Core logic, testable without a broker. Runs INSIDE the caller's
-    transaction: graph ops are only queued here, never awaited (ADR-011)."""
+    """Core logic, testable without a broker. Graph ops are only queued here,
+    never awaited (ADR-011). `checkpoint` (commit + post-commit drain, provided
+    by _run_ingest) runs every _COMMIT_EVERY items and once after edge
+    resolution; without one (in-transaction unit tests) work is only flushed
+    and stays inside the caller's transaction."""
     run = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
     if run is None:
         return
@@ -1204,7 +1339,13 @@ async def _ingest_md_impl(
                 if spec.source_ref == item.source_ref:
                     ingestor.add_edge_spec(spec)
             run.processed_items = i + 1
-            await db.flush()
+            # Durability boundary (rule 5): everything up to and including
+            # this item — nodes, counters, queued vertex syncs — becomes
+            # permanent now, so a later failure cannot take it back.
+            if checkpoint is not None and (i + 1) % _COMMIT_EVERY == 0:
+                await checkpoint(db)
+            else:
+                await db.flush()
             if progress_callback:
                 await progress_callback(i + 1, len(items))
 
@@ -1212,11 +1353,18 @@ async def _ingest_md_impl(
 
         run.status = RunStatus.done
         run.finished_at = datetime.now(UTC)
-        await db.flush()
+        # Final checkpoint: the tail batch, the resolved edges and the done
+        # status must be durable and drained BEFORE the session closes.
+        if checkpoint is not None:
+            await checkpoint(db)
+        else:
+            await db.flush()
 
     except Exception as exc:
-        # In-transaction best effort only: under task_session the re-raise
-        # rolls this back too — _run_ingest re-marks the run in a fresh tx.
+        # Best effort for callers running everything in one transaction (unit
+        # tests). Under _run_ingest this uncommitted write is discarded on
+        # close and _mark_run_failed re-marks the run in a fresh session —
+        # KEEPING the counters committed by earlier checkpoints.
         run.status = RunStatus.failed
         run.error_log = str(exc)
         run.finished_at = datetime.now(UTC)
@@ -1226,7 +1374,9 @@ async def _ingest_md_impl(
 
 async def _mark_run_failed(db: AsyncSession, run_id: uuid.UUID, error: str) -> None:
     """[plan-fix] persist the failure OUTSIDE the rolled-back ingest transaction,
-    so Celery retries and Task 5 status readers see status=failed."""
+    so Celery retries and Task 5 status readers see status=failed. Touches
+    status/error/finished_at ONLY: processed_items keeps the counts accumulated
+    by the committed batches ([review-fix 4.R] — 'failed after N of M')."""
     run = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
     if run is None:
         return
@@ -1237,19 +1387,21 @@ async def _mark_run_failed(db: AsyncSession, run_id: uuid.UUID, error: str) -> N
 
 
 async def _run_ingest(run_id: uuid.UUID, zip_bytes: bytes, viewer: Viewer) -> None:
-    """Session orchestration for the task: impl inside task_session (commits on
-    exit), then drain the queued Neo4j ops POST-commit (ADR-011, [plan-fix] —
-    the plan block never drained them). On failure nothing is drained (the ops
-    belong to a rolled-back transaction) and the run is marked failed in a
-    fresh transaction before the error propagates for retry."""
+    """Session orchestration for the task. The impl checkpoints (commit + drain)
+    batch-by-batch INSIDE the open task_session — nothing graph-related runs
+    after the session closes ([review-fix 4.R]: the first cut drained once
+    after the context exited, which lumped every graph op at the end and only
+    worked because expire_on_commit=False left the closed session readable).
+    On failure the current batch rolls back with the session, committed batches
+    (nodes + counters) persist, and the run is re-marked failed in a fresh
+    session before the error propagates for retry."""
     try:
         async with task_session() as db:
-            await _ingest_md_impl(db, run_id, zip_bytes, viewer)
+            await _ingest_md_impl(db, run_id, zip_bytes, viewer, checkpoint=_checkpoint)
     except Exception as exc:
         async with task_session() as fail_db:
             await _mark_run_failed(fail_db, run_id, str(exc))
         raise
-    await ns.run_pending_graph_ops(db)
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
@@ -1281,8 +1433,9 @@ def ingest_md(
 
 - [x] **4.3** Run tests:
 ```bash
-cd backend && pytest tests/workers/test_ingest_md.py -v
-# Expected: 10 passed (including idempotency and the post-commit drain recorder tests)
+cd backend && pytest tests/workers/test_ingest_md.py tests/workers/test_celery_app.py -v
+# Expected: 15 passed — 11 in test_ingest_md.py (idempotency, batch-drain and
+# mid-zip durability recorder tests) + 4 in test_celery_app.py
 ```
 
 - [x] **4.4** Commit:
@@ -1290,9 +1443,62 @@ cd backend && pytest tests/workers/test_ingest_md.py -v
 feat(workers): ingest_md Celery task — idempotent zip ingestion with IngestionRun tracking
 ```
 
+### 4.R Review fixes (on commit 778ca42)
+
+- [x] **4.R.1 CRITICAL — per-item durability (kb-celery-jobs rule 5).** The first
+  cut ran the whole zip in ONE transaction: a mid-zip failure rolled back every
+  node upsert AND the processed_items counters, `_mark_run_failed` wrote status
+  only — so "failed with counts so far" was false and nothing was resumable.
+  Fixed: `_ingest_md_impl` takes a `checkpoint` (commit + post-commit graph-op
+  drain) injected by `_run_ingest` and invokes it every `_COMMIT_EVERY = 1`
+  items and after edge resolution. Per-item (N=1) because items are whole
+  Markdown files and the Task 5 WS reader polls `processed_items` — larger
+  batches would freeze visible progress. Committed batches survive failure;
+  `_mark_run_failed` keeps the accumulated counters; re-runs converge via the
+  content-hash skip (test: `test_run_ingest_failure_mid_zip_keeps_committed_progress`).
+  This required `task_session` to stop wrapping the block in `session.begin()`
+  (a mid-block commit closed the enclosing transaction; the next statement
+  raised InvalidRequestError — verified RED by
+  `test_task_session_supports_mid_block_batch_commit`). New shape, identical
+  commit-on-clean-exit / rollback-on-error semantics for existing tasks:
+
+```python
+# backend/app/workers/celery_app.py
+@asynccontextmanager
+async def task_session() -> AsyncIterator[AsyncSession]:
+    from app.core.db import SessionLocal
+
+    async with SessionLocal() as session:
+        yield session
+        await session.commit()
+```
+
+- [x] **4.R.2 IMPORTANT — drain graph ops while the session is open.** The first
+  cut called `ns.run_pending_graph_ops(db)` AFTER the `task_session` context
+  closed — it only worked because `expire_on_commit=False` left the closed
+  session readable, and it lumped every graph op at the end. Fixed: the
+  checkpoint drains right after each batch commit inside the open session
+  (graph ops flow batch-by-batch). The recorder fake `_fake_task_session` was
+  rewritten to exercise REAL close semantics (separate `AsyncSession` on the
+  test connection with `join_transaction_mode="create_savepoint"`, logged
+  commits, actual close); the drain test asserts ops land after a commit and
+  strictly before the ("close",) marker.
+
+- [x] **4.R.3 NIT — plan note (no code change).** The zip travels base64 through
+  the Redis broker; at the Task 5 cap of 100 MB that is ~133 MB per message
+  held in broker memory (and re-delivered on every retry). Acceptable for the
+  self-hosted single-team scale now, but flagged as a **Phase 7 hardening
+  candidate**: upload the zip to MinIO first (`app/services/storage.py` already
+  exists from Task 1) and pass only the object path as the task arg.
+
 ---
 
 ## Task 5 — Upload API endpoint + WebSocket progress
+
+> [plan-note, from 4.R.3] `ingest_md.delay(..., base64(zip))` pushes up to
+> ~133 MB per message through Redis at the 100 MB cap. Phase 7 hardening
+> candidate: store the upload in MinIO (Task 1's `storage.upload_file`) and
+> pass the object path instead of the base64 payload.
 
 **Files:**
 - Create: `backend/app/api/v1/uploads.py`

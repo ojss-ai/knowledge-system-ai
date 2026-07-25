@@ -34,9 +34,16 @@ async def task_session() -> AsyncIterator[AsyncSession]:
     """
     Provide a dedicated AsyncSession for use inside Celery tasks.
     Separate from the API session — never share sessions across boundaries.
+
+    Commits on clean exit; on exception the commit is skipped and close()
+    rolls the open transaction back. Deliberately NOT wrapped in
+    session.begin() ([review-fix 4.R]): long batch tasks commit mid-block
+    every N items for resumable progress (kb-celery-jobs rule 5), and a
+    single enclosing transaction forbids that (the first inner commit closes
+    it and the next statement raises InvalidRequestError).
     """
     from app.core.db import SessionLocal
 
     async with SessionLocal() as session:
-        async with session.begin():
-            yield session
+        yield session
+        await session.commit()

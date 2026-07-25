@@ -2,12 +2,18 @@
 
 [plan-fix] vs the Task 4 plan block (carried over from Task 2):
 - The ingest contract QUEUES all graph ops on the session (PG-first, ADR-011);
-  the plan block never drained them. `_run_ingest` (worker orchestration) runs
-  `ns.run_pending_graph_ops(db)` AFTER task_session commits — recorder tests
-  below prove vertices/edges only flow post-commit.
+  the plan block never drained them. Recorder tests below prove vertices/edges
+  only flow post-commit.
 - Under the real task_session, an exception rolls back the impl's in-transaction
   `status=failed` write; `_run_ingest` re-marks the run failed in a fresh
   transaction so retries/Task-5 status readers see it.
+
+[review-fix 4.R]:
+- Per-item durability (kb-celery-jobs rule 5): `_run_ingest` checkpoints
+  (commit + drain) every item, so a mid-zip failure keeps the nodes AND the
+  processed_items counter committed so far — resumable via content-hash skip.
+- Graph ops drain batch-by-batch INSIDE the open task_session, never after it
+  closed; the fake task_session now exercises real close semantics.
 """
 
 import io
@@ -17,11 +23,13 @@ from contextlib import asynccontextmanager
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ingest import IngestionRun, RunStatus
 from app.models.knowledge import KnowledgeNode
 from app.models.user import Role
 from app.services import node_service as ns
+from app.services.ingest.base import KnowledgeIngestor
 from app.services.visibility import Viewer
 from app.workers.tasks import ingest_md as ingest_md_module
 from app.workers.tasks.ingest_md import (
@@ -158,15 +166,36 @@ def _graph_recorder(monkeypatch, log: list[tuple[str, ...]]) -> None:
 
 
 def _fake_task_session(db, log: list[tuple[str, ...]]):
-    """Mimic task_session on the test session: savepoint (rolled back on error,
-    released on success), then a 'commit' marker — so the log shows whether
-    graph ops ran before or after the commit boundary."""
+    """[review-fix 4.R] Mirror REAL task_session semantics on the test
+    connection: a SEPARATE AsyncSession whose commits release savepoints on the
+    test's outer transaction (join_transaction_mode="create_savepoint", so
+    'durable' work still rolls back with the test), a logged ("commit",) marker
+    per commit, commit-on-clean-exit, and a REAL close (("close",) marker).
+
+    The previous fake yielded the long-lived test session inside one savepoint:
+    it could not represent mid-block batch commits and kept the session
+    artificially open after the context exited — hiding that the worker drained
+    graph ops on an already-closed session."""
 
     @asynccontextmanager
     async def fake():
-        async with db.begin_nested():
-            yield db
-        log.append(("commit",))
+        conn = await db.connection()
+        inner = AsyncSession(
+            bind=conn, expire_on_commit=False, join_transaction_mode="create_savepoint"
+        )
+        real_commit = inner.commit
+
+        async def logged_commit() -> None:
+            await real_commit()
+            log.append(("commit",))
+
+        inner.commit = logged_commit  # type: ignore[method-assign]
+        try:
+            yield inner
+            await inner.commit()  # the real task_session commits on clean exit
+        finally:
+            await inner.close()
+            log.append(("close",))
 
     return fake
 
@@ -194,7 +223,8 @@ async def test_impl_queues_graph_ops_without_running_them(db, make_user, monkeyp
 
 
 async def test_run_ingest_drains_graph_ops_post_commit(db, make_user, monkeypatch):
-    """[plan-fix] worker orchestration: vertices/edges flow only AFTER commit."""
+    """[review-fix 4.R] worker orchestration: graph ops flow batch-by-batch —
+    each drain AFTER its batch's commit and BEFORE the task session closes."""
     log: list[tuple[str, ...]] = []
     _graph_recorder(monkeypatch, log)
     monkeypatch.setattr(ingest_md_module, "task_session", _fake_task_session(db, log))
@@ -211,11 +241,18 @@ async def test_run_ingest_drains_graph_ops_post_commit(db, make_user, monkeypatc
     )
     await _run_ingest(run.id, zip_bytes, viewer)
 
-    commit_idx = log.index(("commit",))
+    commit_idxs = [i for i, e in enumerate(log) if e == ("commit",)]
+    close_idx = log.index(("close",))
     graph_idxs = [i for i, e in enumerate(log) if e[0] in ("vertex", "edge")]
     assert graph_idxs, "the worker must drain the queued graph ops"
-    assert all(i > commit_idx for i in graph_idxs), (
-        "graph ops ran before the commit boundary (ADR-011 violation)"
+    assert all(i > min(commit_idxs) for i in graph_idxs), (
+        "graph ops ran before the first commit boundary (ADR-011 violation)"
+    )
+    assert all(i < close_idx for i in graph_idxs), (
+        "graph ops must drain while the task session is still open, not after close"
+    )
+    assert any(i < max(commit_idxs) for i in graph_idxs), (
+        "graph ops must flow batch-by-batch, not lumped after the final commit"
     )
     assert any(log[i][0] == "edge" for i in graph_idxs), "wikilink edge must be merged"
 
@@ -229,17 +266,87 @@ async def test_run_ingest_marks_run_failed_in_fresh_tx(db, make_user, monkeypatc
 
     owner = await make_user(email="imd_failtx@test.com")
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
-    run = await _make_run(db, owner)
+    run_id = (await _make_run(db, owner)).id
 
     with pytest.raises(zipfile.BadZipFile):
-        await _run_ingest(run.id, b"not a zip", viewer)
+        await _run_ingest(run_id, b"not a zip", viewer)
 
-    run_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run.id))
+    db.expire_all()  # the fake task session updated the row behind this session
+    run_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
     assert run_result.status == RunStatus.failed
     assert run_result.error_log
     assert all(e[0] not in ("vertex", "edge") for e in log), (
         "graph ops from a rolled-back transaction must never run"
     )
+
+
+async def test_run_ingest_failure_mid_zip_keeps_committed_progress(db, make_user, monkeypatch):
+    """[review-fix 4.R, kb-celery-jobs rule 5] per-item durability: items
+    committed before a mid-zip failure persist — their nodes AND the
+    processed_items counter — and the run is marked failed WITH the accumulated
+    counts. A re-run of the same zip then converges idempotently (content-hash
+    skip), making the job resumable."""
+    log: list[tuple[str, ...]] = []
+    _graph_recorder(monkeypatch, log)
+    monkeypatch.setattr(ingest_md_module, "task_session", _fake_task_session(db, log))
+
+    real_upsert = KnowledgeIngestor.upsert
+
+    async def flaky_upsert(self, item):
+        if item.source_ref == "b.md":
+            raise RuntimeError("injected failure on item 2")
+        return await real_upsert(self, item)
+
+    monkeypatch.setattr(KnowledgeIngestor, "upsert", flaky_upsert)
+
+    owner = await make_user(email="imd_midzip@test.com")
+    owner_id = owner.id  # captured: expire_all() below makes attribute access lazy-load
+    viewer = Viewer(user_id=owner_id, role=Role.user, group_ids=frozenset())
+    run_id = (await _make_run(db, owner)).id
+
+    zip_bytes = make_zip(
+        {
+            "a.md": "# A\n\nfirst",
+            "b.md": "# B\n\nsecond",
+            "c.md": "# C\n\nthird",
+        }
+    )
+    with pytest.raises(RuntimeError, match="injected failure"):
+        await _run_ingest(run_id, zip_bytes, viewer)
+
+    db.expire_all()
+    run_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
+    assert run_result.status == RunStatus.failed
+    assert run_result.error_log
+    assert run_result.processed_items == 1, (
+        "counters committed before the failure must survive it (rule 5)"
+    )
+
+    titles = (
+        await db.scalars(
+            select(KnowledgeNode.title).where(
+                KnowledgeNode.owner_id == owner_id, KnowledgeNode.source == "md_upload"
+            )
+        )
+    ).all()
+    assert titles == ["A"], "nodes committed before the failure must persist"
+
+    # Resumable: re-running the (now healthy) zip converges without duplicates.
+    monkeypatch.setattr(KnowledgeIngestor, "upsert", real_upsert)
+    await db.refresh(owner)  # expired above; _make_run reads owner.id
+    run2_id = (await _make_run(db, owner)).id
+    await _run_ingest(run2_id, zip_bytes, viewer)
+
+    db.expire_all()
+    count = await db.scalar(
+        select(func.count())
+        .select_from(KnowledgeNode)
+        .where(KnowledgeNode.owner_id == owner_id, KnowledgeNode.source == "md_upload")
+    )
+    assert count == 3, "re-run must converge: A skipped by content hash, B and C created"
+    run2_result = await db.scalar(select(IngestionRun).where(IngestionRun.id == run2_id))
+    assert run2_result.status == RunStatus.done
+    assert run2_result.processed_items == 3
 
 
 async def test_mark_run_failed(db, make_user):

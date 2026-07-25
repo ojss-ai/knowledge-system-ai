@@ -1,8 +1,13 @@
 """Celery task: idempotent Markdown zip ingestion with IngestionRun tracking.
 
-PG first, Neo4j second (ADR-011): _ingest_md_impl runs inside the caller's
-transaction and only QUEUES graph ops (via KnowledgeIngestor / node_service);
-_run_ingest drains them with run_pending_graph_ops AFTER task_session commits.
+PG first, Neo4j second (ADR-011): _ingest_md_impl only QUEUES graph ops (via
+KnowledgeIngestor / node_service); the per-batch checkpoint drains them with
+run_pending_graph_ops right AFTER each commit, while the session is still open.
+
+Durability ([review-fix 4.R], kb-celery-jobs rule 5): the run commits every
+_COMMIT_EVERY items, so nodes and the processed_items counter survive a
+mid-zip failure — the counts Task 5 status readers see are real, and a re-run
+converges from where the last commit left off (content-hash skip): resumable.
 
 Idempotency (kb-celery-jobs rule 1): KnowledgeIngestor.upsert is keyed on
 (owner_id, source, source_ref) with a content-hash short-circuit, so re-running
@@ -33,6 +38,25 @@ from app.workers.celery_app import celery_app, task_session
 # channel run:{ingestion_run_id} (kb-celery-jobs rule 8).
 ProgressCallback = Callable[[int, int], Awaitable[None]]
 
+# Durability checkpoint: commit accumulated work, then drain queued graph ops.
+Checkpoint = Callable[[AsyncSession], Awaitable[None]]
+
+# Items per durability commit (kb-celery-jobs rule 5). 1 because items are
+# whole Markdown files (coarse units) and the Task 5 WS reader polls
+# processed_items — a bigger batch would freeze visible progress and lose more
+# work on a crash. Raise only with evidence that commit overhead matters.
+_COMMIT_EVERY = 1
+
+
+async def _checkpoint(db: AsyncSession) -> None:
+    """[review-fix 4.R] Durability boundary: commit the accumulated batch, then
+    drain the queued graph ops POST-commit while the session is still open
+    (ADR-011 + kb-celery-jobs rule 5). Neo4j stays best-effort — each op is
+    wrapped in _graph_sync, so a graph failure never undoes the committed
+    batch (a Celery retry re-converges the graph)."""
+    await db.commit()
+    await ns.run_pending_graph_ops(db)
+
 
 async def _ingest_md_impl(
     db: AsyncSession,
@@ -40,9 +64,13 @@ async def _ingest_md_impl(
     zip_bytes: bytes,
     viewer: Viewer,
     progress_callback: ProgressCallback | None = None,
+    checkpoint: Checkpoint | None = None,
 ) -> None:
-    """Core logic, testable without a broker. Runs INSIDE the caller's
-    transaction: graph ops are only queued here, never awaited (ADR-011)."""
+    """Core logic, testable without a broker. Graph ops are only queued here,
+    never awaited (ADR-011). `checkpoint` (commit + post-commit drain, provided
+    by _run_ingest) runs every _COMMIT_EVERY items and once after edge
+    resolution; without one (in-transaction unit tests) work is only flushed
+    and stays inside the caller's transaction."""
     run = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
     if run is None:
         return
@@ -63,7 +91,13 @@ async def _ingest_md_impl(
                 if spec.source_ref == item.source_ref:
                     ingestor.add_edge_spec(spec)
             run.processed_items = i + 1
-            await db.flush()
+            # Durability boundary (rule 5): everything up to and including
+            # this item — nodes, counters, queued vertex syncs — becomes
+            # permanent now, so a later failure cannot take it back.
+            if checkpoint is not None and (i + 1) % _COMMIT_EVERY == 0:
+                await checkpoint(db)
+            else:
+                await db.flush()
             if progress_callback:
                 await progress_callback(i + 1, len(items))
 
@@ -71,11 +105,18 @@ async def _ingest_md_impl(
 
         run.status = RunStatus.done
         run.finished_at = datetime.now(UTC)
-        await db.flush()
+        # Final checkpoint: the tail batch, the resolved edges and the done
+        # status must be durable and drained BEFORE the session closes.
+        if checkpoint is not None:
+            await checkpoint(db)
+        else:
+            await db.flush()
 
     except Exception as exc:
-        # In-transaction best effort only: under task_session the re-raise
-        # rolls this back too — _run_ingest re-marks the run in a fresh tx.
+        # Best effort for callers running everything in one transaction (unit
+        # tests). Under _run_ingest this uncommitted write is discarded on
+        # close and _mark_run_failed re-marks the run in a fresh session —
+        # KEEPING the counters committed by earlier checkpoints.
         run.status = RunStatus.failed
         run.error_log = str(exc)
         run.finished_at = datetime.now(UTC)
@@ -85,7 +126,9 @@ async def _ingest_md_impl(
 
 async def _mark_run_failed(db: AsyncSession, run_id: uuid.UUID, error: str) -> None:
     """[plan-fix] persist the failure OUTSIDE the rolled-back ingest transaction,
-    so Celery retries and Task 5 status readers see status=failed."""
+    so Celery retries and Task 5 status readers see status=failed. Touches
+    status/error/finished_at ONLY: processed_items keeps the counts accumulated
+    by the committed batches ([review-fix 4.R] — 'failed after N of M')."""
     run = await db.scalar(select(IngestionRun).where(IngestionRun.id == run_id))
     if run is None:
         return
@@ -96,19 +139,21 @@ async def _mark_run_failed(db: AsyncSession, run_id: uuid.UUID, error: str) -> N
 
 
 async def _run_ingest(run_id: uuid.UUID, zip_bytes: bytes, viewer: Viewer) -> None:
-    """Session orchestration for the task: impl inside task_session (commits on
-    exit), then drain the queued Neo4j ops POST-commit (ADR-011, [plan-fix] —
-    the plan block never drained them). On failure nothing is drained (the ops
-    belong to a rolled-back transaction) and the run is marked failed in a
-    fresh transaction before the error propagates for retry."""
+    """Session orchestration for the task. The impl checkpoints (commit + drain)
+    batch-by-batch INSIDE the open task_session — nothing graph-related runs
+    after the session closes ([review-fix 4.R]: the first cut drained once
+    after the context exited, which lumped every graph op at the end and only
+    worked because expire_on_commit=False left the closed session readable).
+    On failure the current batch rolls back with the session, committed batches
+    (nodes + counters) persist, and the run is re-marked failed in a fresh
+    session before the error propagates for retry."""
     try:
         async with task_session() as db:
-            await _ingest_md_impl(db, run_id, zip_bytes, viewer)
+            await _ingest_md_impl(db, run_id, zip_bytes, viewer, checkpoint=_checkpoint)
     except Exception as exc:
         async with task_session() as fail_db:
             await _mark_run_failed(fail_db, run_id, str(exc))
         raise
-    await ns.run_pending_graph_ops(db)
 
 
 @celery_app.task(  # type: ignore[untyped-decorator]  # celery is untyped (ignore_missing_imports)
