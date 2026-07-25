@@ -250,47 +250,56 @@ feat(tools): ConfluenceClient — list_pages, get_page, Basic/Bearer auth, pagin
 
 ### Steps
 
-- [ ] **2.1** Write the failing tests:
+- [x] **2.1** Write the failing tests:
+
+> [plan-fix] Tests annotated (`-> None`) and long macro literals split for `mypy --strict` /
+> `ruff` line-length; behavior identical to the original block below.
 
 ```python
 # tools/kb-confluence-sync/tests/test_xhtml_to_md.py
 from xhtml_to_md import convert_storage_to_md
 
 
-def test_basic_paragraph():
+def test_basic_paragraph() -> None:
     html = "<p>Hello <strong>world</strong></p>"
     md = convert_storage_to_md(html)
     assert "Hello" in md
     assert "**world**" in md
 
 
-def test_heading_conversion():
+def test_heading_conversion() -> None:
     html = "<h1>Title</h1><h2>Sub</h2>"
     md = convert_storage_to_md(html)
     assert "# Title" in md
     assert "## Sub" in md
 
 
-def test_code_block():
-    html = '<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[print("hi")]]></ac:plain-text-body></ac:structured-macro>'
+def test_code_block() -> None:
+    html = (
+        '<ac:structured-macro ac:name="code"><ac:plain-text-body>'
+        '<![CDATA[print("hi")]]></ac:plain-text-body></ac:structured-macro>'
+    )
     md = convert_storage_to_md(html)
     assert "```" in md
     assert 'print("hi")' in md
 
 
-def test_unknown_macro_becomes_named_fence():
-    html = '<ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">KB-1</ac:parameter></ac:structured-macro>'
+def test_unknown_macro_becomes_named_fence() -> None:
+    html = (
+        '<ac:structured-macro ac:name="jira">'
+        '<ac:parameter ac:name="key">KB-1</ac:parameter></ac:structured-macro>'
+    )
     md = convert_storage_to_md(html)
     assert "```confluence-macro-jira" in md
 
 
-def test_link_conversion():
+def test_link_conversion() -> None:
     html = '<a href="https://example.com">click</a>'
     md = convert_storage_to_md(html)
     assert "[click](https://example.com)" in md
 
 
-def test_table_conversion():
+def test_table_conversion() -> None:
     html = """
     <table><tbody>
       <tr><th>Name</th><th>Value</th></tr>
@@ -302,26 +311,51 @@ def test_table_conversion():
     assert "| A |" in md
 
 
-def test_unknown_macro_captured_in_meta():
-    html = '<ac:structured-macro ac:name="widget"><ac:parameter ac:name="url">https://x.com</ac:parameter></ac:structured-macro>'
+def test_unknown_macro_captured_in_meta() -> None:
+    html = (
+        '<ac:structured-macro ac:name="widget">'
+        '<ac:parameter ac:name="url">https://x.com</ac:parameter></ac:structured-macro>'
+    )
     md, meta = convert_storage_to_md(html, return_meta=True)
     assert "widget" in meta.get("raw_macros", [{}])[0].get("name", "")
 ```
 
-- [ ] **2.2** Implement (using `beautifulsoup4` + `html2text` + custom macro handling):
+- [x] **2.2** Implement (using `beautifulsoup4` + `html2text` + custom macro handling):
+
+> [plan-fix] Three deviations from the block below, all forced by the plan's own tests/gates:
+> 1. `@overload` on `convert_storage_to_md` (`Literal[True/False]` for `return_meta`) so the
+>    tuple unpacking in `test_unknown_macro_captured_in_meta` passes `mypy --strict`.
+> 2. bs4 4.15 native typing: attribute reads narrowed with `isinstance(..., str)` /
+>    `isinstance(href_tag, Tag)`; unused `Generator`-style imports dropped; dead `else: pass` removed.
+> 3. Tables are converted to GFM pipe tables directly via bs4 and re-inserted through
+>    placeholders after `html2text` — html2text cannot emit unpadded GFM tables (compact mode
+>    drops leading pipes; `pad_tables` pads cell widths), which fails `assert "| A |" in md`.
+> Canonical source: `tools/kb-confluence-sync/xhtml_to_md.py`.
 
 ```python
 # tools/kb-confluence-sync/xhtml_to_md.py
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal, overload
 
 try:
-    from bs4 import BeautifulSoup, Tag
     import html2text
+    from bs4 import BeautifulSoup, Tag
 except ImportError as e:
-    raise ImportError("Install beautifulsoup4 and html2text: pip install beautifulsoup4 html2text") from e
+    raise ImportError(
+        "Install beautifulsoup4 and html2text: pip install beautifulsoup4 html2text"
+    ) from e
+
+
+@overload
+def convert_storage_to_md(xhtml: str, return_meta: Literal[False] = False) -> str: ...
+
+
+@overload
+def convert_storage_to_md(
+    xhtml: str, return_meta: Literal[True]
+) -> tuple[str, dict[str, Any]]: ...
 
 
 def convert_storage_to_md(
@@ -343,7 +377,8 @@ def convert_storage_to_md(
 
     # Process structured macros
     for macro in soup.find_all("ac:structured-macro"):
-        name = macro.get("ac:name", "unknown")
+        name_attr = macro.get("ac:name")
+        name = name_attr if isinstance(name_attr, str) else "unknown"
 
         if name == "code":
             # Extract language parameter
@@ -360,7 +395,10 @@ def convert_storage_to_md(
             body_tag = macro.find("ac:rich-text-body") or macro.find("ac:plain-text-body")
             body = body_tag.get_text(strip=True) if body_tag else ""
             macro.replace_with(
-                BeautifulSoup(f"<blockquote><strong>{title}:</strong> {body}</blockquote>", "html.parser")
+                BeautifulSoup(
+                    f"<blockquote><strong>{title}:</strong> {body}</blockquote>",
+                    "html.parser",
+                )
             )
 
         else:
@@ -374,12 +412,32 @@ def convert_storage_to_md(
     for link in soup.find_all("ac:link"):
         href_tag = link.find("ri:url")
         anchor = link.find("ac:plain-text-link-body") or link.find("ac:link-body")
-        if href_tag:
-            url = href_tag.get("ri:value", "#")
+        if isinstance(href_tag, Tag):
+            url_attr = href_tag.get("ri:value")
+            url = url_attr if isinstance(url_attr, str) else "#"
             text = anchor.get_text(strip=True) if anchor else url
             link.replace_with(BeautifulSoup(f'<a href="{url}">{text}</a>', "html.parser"))
         else:
             link.replace_with(anchor.get_text(strip=True) if anchor else "")
+
+    # Tables → GFM pipe tables. html2text cannot produce them (compact mode drops
+    # the leading/trailing pipes, pad_tables pads cell widths), so convert directly
+    # and re-insert after html2text via placeholders.
+    table_blocks: list[str] = []
+    for idx, table in enumerate(soup.find_all("table")):
+        rows: list[list[str]] = []
+        for tr in table.find_all("tr"):
+            cells = [cell.get_text(strip=True) for cell in tr.find_all(["th", "td"])]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            table.decompose()
+            continue
+        lines = ["| " + " | ".join(rows[0]) + " |"]
+        lines.append("|" + "|".join(" --- " for _ in rows[0]) + "|")
+        lines.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+        table_blocks.append("\n".join(lines))
+        table.replace_with(f"kbtableplaceholder{idx}")
 
     # Convert remaining tags with html2text
     h = html2text.HTML2Text()
@@ -391,28 +449,31 @@ def convert_storage_to_md(
 
     md = h.handle(str(soup))
 
+    for idx, block in enumerate(table_blocks):
+        md = md.replace(f"kbtableplaceholder{idx}", f"\n{block}\n")
+
     # Clean up html2text pre-block artefacts
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
 
     if not meta["raw_macros"]:
         del meta["raw_macros"]
-    else:
-        pass  # keep for caller
 
     if return_meta:
         return md, meta
     return md
 ```
 
-- [ ] **2.3** Create `tools/kb-confluence-sync/requirements.txt`:
+- [x] **2.3** Create `tools/kb-confluence-sync/requirements.txt`:
 ```
 requests>=2.31
 beautifulsoup4>=4.12
 html2text>=2020.1
 lxml>=4.9
+# lint/type-check only
+types-requests
 ```
 
-- [ ] **2.4** Run tests:
+- [x] **2.4** Run tests:
 ```bash
 cd tools/kb-confluence-sync
 pip install -r requirements.txt --break-system-packages
@@ -420,7 +481,7 @@ python -m pytest tests/test_xhtml_to_md.py -v
 # Expected: 7 passed
 ```
 
-- [ ] **2.5** Commit:
+- [x] **2.5** Commit:
 ```
 feat(tools): XHTML→Markdown converter with Confluence macro handling
 ```
