@@ -48,7 +48,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import Viewer, get_scoped_viewer
+from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer
 from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
 from app.workers.tasks.ingest_md import ingest_md
@@ -57,6 +57,9 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 _WS_POLL_SECONDS = 0.5
+# Application close code for "run invisible OR nonexistent" — one code for
+# both, like get_run's generic 404 (a distinct code would confirm the id).
+_WS_4404_NOT_FOUND = 4404
 
 
 class RunOut(BaseModel):
@@ -144,15 +147,29 @@ async def run_progress_ws(
     websocket: WebSocket,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Stream progress events for an ingestion run.
+    """Stream progress events for an ingestion run (owner only).
 
     Client receives JSON: {"processed": N, "total": M, "status": "..."}.
     Polls the DB every 500 ms (the worker checkpoints processed_items per item)
-    until the run is done or failed. Exposes counters and status only — no
-    auth per the plan; the run id is an unguessable UUID.
+    until the run is done or failed.
+
+    [review-fix 5.R.1] The handshake is authenticated (`?token=` or the BFF's
+    `access_token` cookie — see get_ws_viewer) and ownership is enforced
+    BEFORE any frame is sent: no/bad credentials → 1008 policy violation;
+    another user's run or an unknown id → generic 4404 close.
+
+    [review-fix 5.R.2, documented deviation] kb-celery-jobs rule 8 prescribes a
+    Redis pub/sub relay (`run:{id}` WsEvent channel); this endpoint polls PG
+    instead — correct because the worker checkpoint-commits per item, and one
+    less moving part. The pub/sub relay is the Phase 7 hardening upgrade path,
+    alongside the MinIO payload offload (4.R.3).
     """
     await websocket.accept()
     try:
+        viewer = await get_ws_viewer(websocket, db)
+        if viewer is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
         while True:
             run = await db.scalar(
                 select(IngestionRun)
@@ -161,9 +178,11 @@ async def run_progress_ws(
                 # or the loop would replay the first read forever [plan-fix].
                 .execution_options(populate_existing=True)
             )
-            if run is None:
-                await websocket.send_json({"error": "Run not found"})
-                break
+            # Ownership re-checked every poll: covers the handshake AND a run
+            # deleted mid-stream, with the same generic close either way.
+            if run is None or run.owner_id != viewer.user_id:
+                await websocket.close(code=_WS_4404_NOT_FOUND)
+                return
             await websocket.send_json(
                 {
                     "processed": run.processed_items,

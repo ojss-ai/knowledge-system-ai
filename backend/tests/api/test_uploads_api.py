@@ -12,24 +12,32 @@
   events confirmed via … integration test"). httpx ASGITransport (the `client`
   fixture) cannot speak WebSocket, so these use starlette's TestClient against
   the real `get_db` — rows are committed to the live PG and cleaned up.
+- [review-fix 5.R.1] The WS handshake now authenticates (`?token=` query param
+  or the BFF's `access_token` cookie) and enforces run ownership: bad/missing
+  token → 1008 policy violation; another user's or an unknown run → generic
+  4404 close with no progress frame leaked.
 """
 
 import asyncio
 import base64
 import concurrent.futures
+import contextlib
 import io
 import uuid
 import zipfile
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import anyio
 import pytest
+from fastapi import WebSocketDisconnect
 from httpx import AsyncClient
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.core.security import make_access_token
 from app.models.ingest import IngestionRun, RunStatus
 from app.models.user import Role, User
 
@@ -180,14 +188,61 @@ def _run_db(fn: Callable[[AsyncSession], Awaitable[None]]) -> None:
     asyncio.run(_go())
 
 
+def _expect_ws_close(ws, expected_code: int) -> None:
+    """The server must close (with expected_code) WITHOUT sending any frame —
+    a data frame before the close means progress leaked and fails here too."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        _recv_json(ws)
+    assert exc_info.value.code == expected_code
+
+
+def _ws_app():
+    """create_app for WS tests, with get_db overridden to a NullPool engine.
+
+    The real get_db uses the module-global engine: its pool would hand a
+    second WS test an asyncpg connection bound to the FIRST test's (dead)
+    event loop — TestClient spins a fresh loop per instance → "attached to a
+    different loop". NullPool opens/closes per request inside the live loop.
+    """
+    from app.core.db import get_db
+    from app.main import create_app
+
+    app = create_app()
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+
+    async def _get_db():
+        async with AsyncSession(engine) as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _get_db
+    return app
+
+
+@contextlib.contextmanager
+def _ws_connect(tc, url: str, **kwargs):
+    """websocket_connect whose teardown tolerates a SERVER-initiated close:
+    starlette's WebSocketTestSession.__exit__ races the server task and can
+    raise ClosedResourceError sending its own disconnect — benign here."""
+    cm = tc.websocket_connect(url, **kwargs)
+    ws = cm.__enter__()
+    try:
+        yield ws
+    finally:
+        with contextlib.suppress(anyio.ClosedResourceError):
+            cm.__exit__(None, None, None)
+
+
 # fastapi re-exports starlette.testclient, which warns about httpx2 at import;
 # environmental noise, not ours to fix here.
 @pytest.mark.filterwarnings("ignore:Using `httpx` with `starlette.testclient`")
 def test_ws_progress_streams_until_done():
-    """Progress events flow over the WS while the run advances, ending at done."""
-    from fastapi.testclient import TestClient
+    """Progress events flow over the WS while the run advances, ending at done.
 
-    from app.main import create_app
+    [review-fix 5.R.1] The owner authenticates the handshake — via `?token=`
+    for the streaming connection and via the `access_token` cookie (the BFF
+    same-origin path, ADR-008) for the re-check; an unknown run id now yields
+    a generic 4404 close instead of an error frame."""
+    from fastapi.testclient import TestClient
 
     user_id, run_id = uuid.uuid4(), uuid.uuid4()
 
@@ -223,9 +278,11 @@ def test_ws_progress_streams_until_done():
         await s.execute(delete(User).where(User.id == user_id))
 
     _run_db(_setup)
+    token = make_access_token(user_id, "user")
+    url = f"/api/v1/uploads/runs/{run_id}/progress"
     try:
-        with TestClient(create_app()) as tc:
-            with tc.websocket_connect(f"/api/v1/uploads/runs/{run_id}/progress") as ws:
+        with TestClient(_ws_app()) as tc:
+            with _ws_connect(tc, f"{url}?token={token}") as ws:
                 first = _recv_json(ws)
                 assert first == {"processed": 1, "total": 3, "status": "running"}
 
@@ -236,8 +293,82 @@ def test_ws_progress_streams_until_done():
                     evt = _recv_json(ws)
                 assert evt == {"processed": 3, "total": 3, "status": "done"}
 
-            # unknown run: one error frame, then the server closes
-            with tc.websocket_connect(f"/api/v1/uploads/runs/{uuid.uuid4()}/progress") as ws:
-                assert _recv_json(ws) == {"error": "Run not found"}
+            # cookie-auth handshake (browser through the Next.js BFF: cookies
+            # flow on the same-origin WS upgrade): run is done → final frame
+            with _ws_connect(tc, url, headers={"cookie": f"access_token={token}"}) as ws:
+                assert _recv_json(ws)["status"] == "done"
+
+            # unknown run (authenticated): generic 4404 close, no frame —
+            # indistinguishable from someone else's run
+            with _ws_connect(
+                tc, f"/api/v1/uploads/runs/{uuid.uuid4()}/progress?token={token}"
+            ) as ws:
+                _expect_ws_close(ws, 4404)
+    finally:
+        _run_db(_cleanup)
+
+
+@pytest.mark.filterwarnings("ignore:Using `httpx` with `starlette.testclient`")
+def test_ws_progress_auth_required_and_ownership_enforced():
+    """[review-fix 5.R.1] The WS handshake authenticates and enforces
+    ownership: missing/bad token → 1008 policy violation; a valid token for
+    ANOTHER user → generic 4404 (invisible == nonexistent) with no progress
+    frame leaked before the close."""
+    from fastapi.testclient import TestClient
+
+    owner_id, intruder_id, run_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def _setup(s: AsyncSession) -> None:
+        s.add(
+            User(
+                id=owner_id,
+                email=f"wsa-{uuid.uuid4().hex[:8]}@test.com",
+                password_hash="x",
+                display_name="ws-owner",
+                role=Role.user,
+            )
+        )
+        s.add(
+            User(
+                id=intruder_id,
+                email=f"wsb-{uuid.uuid4().hex[:8]}@test.com",
+                password_hash="x",
+                display_name="ws-intruder",
+                role=Role.user,
+            )
+        )
+        await s.flush()
+        s.add(
+            IngestionRun(
+                id=run_id,
+                owner_id=owner_id,
+                source="md_upload",
+                status=RunStatus.running,
+                total_items=3,
+                processed_items=1,
+            )
+        )
+
+    async def _cleanup(s: AsyncSession) -> None:
+        await s.execute(delete(IngestionRun).where(IngestionRun.id == run_id))
+        await s.execute(delete(User).where(User.id.in_([owner_id, intruder_id])))
+
+    url = f"/api/v1/uploads/runs/{run_id}/progress"
+    _run_db(_setup)
+    try:
+        with TestClient(_ws_app()) as tc:
+            # no credentials at all
+            with _ws_connect(tc, url) as ws:
+                _expect_ws_close(ws, 1008)
+
+            # garbage token
+            with _ws_connect(tc, f"{url}?token=not-a-jwt") as ws:
+                _expect_ws_close(ws, 1008)
+
+            # valid token, but NOT the run's owner: denied exactly like a
+            # missing run — a distinct code would confirm the run id exists
+            intruder_token = make_access_token(intruder_id, "user")
+            with _ws_connect(tc, f"{url}?token={intruder_token}") as ws:
+                _expect_ws_close(ws, 4404)
     finally:
         _run_db(_cleanup)

@@ -1728,10 +1728,15 @@ def test_ws_progress_streams_until_done():
         await s.execute(delete(IngestionRun).where(IngestionRun.id == run_id))
         await s.execute(delete(User).where(User.id == user_id))
 
+    # [review-fix 5.R.1] the owner now authenticates the handshake; TestClient
+    # apps get a NullPool get_db override (_ws_app) because asyncpg connections
+    # are event-loop-bound; _ws_connect tolerates server-initiated closes.
     _run_db(_setup)
+    token = make_access_token(user_id, "user")
+    url = f"/api/v1/uploads/runs/{run_id}/progress"
     try:
-        with TestClient(create_app()) as tc:
-            with tc.websocket_connect(f"/api/v1/uploads/runs/{run_id}/progress") as ws:
+        with TestClient(_ws_app()) as tc:
+            with _ws_connect(tc, f"{url}?token={token}") as ws:
                 first = _recv_json(ws)
                 assert first == {"processed": 1, "total": 3, "status": "running"}
 
@@ -1742,11 +1747,24 @@ def test_ws_progress_streams_until_done():
                     evt = _recv_json(ws)
                 assert evt == {"processed": 3, "total": 3, "status": "done"}
 
-            # unknown run: one error frame, then the server closes
-            with tc.websocket_connect(f"/api/v1/uploads/runs/{uuid.uuid4()}/progress") as ws:
-                assert _recv_json(ws) == {"error": "Run not found"}
+            # cookie-auth handshake (browser through the Next.js BFF: cookies
+            # flow on the same-origin WS upgrade): run is done → final frame
+            with _ws_connect(tc, url, headers={"cookie": f"access_token={token}"}) as ws:
+                assert _recv_json(ws)["status"] == "done"
+
+            # unknown run (authenticated): generic 4404 close, no frame —
+            # indistinguishable from someone else's run
+            with _ws_connect(
+                tc, f"/api/v1/uploads/runs/{uuid.uuid4()}/progress?token={token}"
+            ) as ws:
+                _expect_ws_close(ws, 4404)
     finally:
         _run_db(_cleanup)
+
+
+# [review-fix 5.R.1] plus test_ws_progress_auth_required_and_ownership_enforced
+# (see the file): no/garbage token → close 1008 (policy violation); a VALID
+# token for another user → generic close 4404 with no progress frame leaked.
 ```
 
 - [x] **5.2** Create the router ([plan-fix] vs the original block — details in the
@@ -1801,7 +1819,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import Viewer, get_scoped_viewer
+from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer
 from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
 from app.workers.tasks.ingest_md import ingest_md
@@ -1810,6 +1828,9 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 _WS_POLL_SECONDS = 0.5
+# Application close code for "run invisible OR nonexistent" — one code for
+# both, like get_run's generic 404 (a distinct code would confirm the id).
+_WS_4404_NOT_FOUND = 4404
 
 
 class RunOut(BaseModel):
@@ -1897,15 +1918,29 @@ async def run_progress_ws(
     websocket: WebSocket,
     db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Stream progress events for an ingestion run.
+    """Stream progress events for an ingestion run (owner only).
 
     Client receives JSON: {"processed": N, "total": M, "status": "..."}.
     Polls the DB every 500 ms (the worker checkpoints processed_items per item)
-    until the run is done or failed. Exposes counters and status only — no
-    auth per the plan; the run id is an unguessable UUID.
+    until the run is done or failed.
+
+    [review-fix 5.R.1] The handshake is authenticated (`?token=` or the BFF's
+    `access_token` cookie — see get_ws_viewer) and ownership is enforced
+    BEFORE any frame is sent: no/bad credentials → 1008 policy violation;
+    another user's run or an unknown id → generic 4404 close.
+
+    [review-fix 5.R.2, documented deviation] kb-celery-jobs rule 8 prescribes a
+    Redis pub/sub relay (`run:{id}` WsEvent channel); this endpoint polls PG
+    instead — correct because the worker checkpoint-commits per item, and one
+    less moving part. The pub/sub relay is the Phase 7 hardening upgrade path,
+    alongside the MinIO payload offload (4.R.3).
     """
     await websocket.accept()
     try:
+        viewer = await get_ws_viewer(websocket, db)
+        if viewer is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
         while True:
             run = await db.scalar(
                 select(IngestionRun)
@@ -1914,9 +1949,11 @@ async def run_progress_ws(
                 # or the loop would replay the first read forever [plan-fix].
                 .execution_options(populate_existing=True)
             )
-            if run is None:
-                await websocket.send_json({"error": "Run not found"})
-                break
+            # Ownership re-checked every poll: covers the handshake AND a run
+            # deleted mid-stream, with the same generic close either way.
+            if run is None or run.owner_id != viewer.user_id:
+                await websocket.close(code=_WS_4404_NOT_FOUND)
+                return
             await websocket.send_json(
                 {
                     "processed": run.processed_items,
@@ -1991,6 +2028,45 @@ curl -s http://localhost:8000/api/v1/uploads/runs/a7fff7c7-2000-43c4-bbbc-88d2f9
 ```
 feat(api): POST /api/v1/uploads/markdown (202 + Celery), GET /runs/:id, WS progress
 ```
+
+### 5.R Review fixes (on commit 67ed384)
+
+- [x] **5.R.1 CRITICAL — WS endpoint was unauthenticated with no ownership
+  check.** Anyone with a run id could stream another user's ingestion progress
+  ("unguessable UUID" is not authorization). WebSockets cannot use the
+  HTTPBearer dependency (browsers can't set Authorization on the WS upgrade),
+  so `deps.get_ws_viewer` authenticates the handshake from either a `?token=`
+  query param or the `access_token` httpOnly cookie — the browser connects
+  through the Next.js BFF (ADR-008) and cookies flow on the same-origin WS
+  handshake. It reuses the extracted `_viewer_from_token` (same code path as
+  `get_current_viewer`) and scopes admins down like `get_scoped_viewer`.
+  The endpoint accepts, authenticates, then enforces
+  `run.owner_id == viewer.user_id` BEFORE streaming: missing/invalid token →
+  close 1008 (policy violation); another user's run or an unknown id → the
+  same generic close 4404 (invisible == nonexistent, get_run standard),
+  re-checked every poll. RED first:
+  `test_ws_progress_auth_required_and_ownership_enforced` + the updated
+  happy-path test failed against the open endpoint. Test infra fallout fixed
+  alongside: WS TestClient apps override `get_db` with a NullPool engine
+  (asyncpg connections are loop-bound; the global engine's pool poisoned the
+  second TestClient's fresh event loop) and `_ws_connect` tolerates the
+  starlette teardown race on server-initiated closes (ClosedResourceError).
+
+- [x] **5.R.2 IMPORTANT — undisclosed deviation from kb-celery-jobs rule 8,
+  now documented (no code change; orchestrator-approved).** Rule 8 says worker
+  progress reaches users via a `WsEvent` published to Redis pub/sub channel
+  `run:{ingestion_run_id}` with the WS gateway relaying. Task 5 shipped DB
+  polling (500 ms, `populate_existing=True`) without flagging the conflict.
+  Decision: KEEP polling for now — the worker checkpoint-commits per item
+  (4.R.1) so polling is correct, and it is one less moving part at
+  single-team scale. The rule-8 pub/sub relay becomes the **Phase 7 hardening
+  upgrade path**, alongside the MinIO payload offload (4.R.3): move the
+  payload to MinIO and the progress events to `run:{id}` in the same pass.
+  Documented in the WS handler docstring and here.
+
+- [ ] **5.R.3 IMPORTANT — zip-bomb guard in `md_importer.parse_zip`.**
+
+- [ ] **5.R.4 IMPORTANT — enqueue-then-crash leaves the run pending forever.**
 
 ---
 
