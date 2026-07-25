@@ -12,6 +12,8 @@ Token format is `kb_<token-id-hex>.<secret>` so the ApiToken row is found by
 primary key (argon2 hashes are salted — they cannot be looked up by value).
 """
 
+import uuid
+
 from httpx import AsyncClient
 
 INGEST_PAYLOAD = {
@@ -24,10 +26,14 @@ INGEST_PAYLOAD = {
 }
 
 
-async def _create_raw_token(client: AsyncClient, auth_headers: dict[str, str]) -> tuple[str, str]:
+async def _create_raw_token(
+    client: AsyncClient,
+    auth_headers: dict[str, str],
+    scopes: list[str] | None = None,
+) -> tuple[str, str]:
     r = await client.post(
         "/api/v1/tokens",
-        json={"name": "cli", "scopes": ["ingest"]},
+        json={"name": "cli", "scopes": scopes if scopes is not None else ["ingest"]},
         headers=auth_headers,
     )
     assert r.status_code == 201
@@ -89,5 +95,89 @@ async def test_unknown_service_token_id_is_401(client: AsyncClient):
         "/api/v1/uploads/ingest-item",
         json=INGEST_PAYLOAD,
         headers={"Authorization": f"Bearer {fake}"},
+    )
+    assert r.status_code == 401
+
+
+# --- 5.R.1: scope enforcement ------------------------------------------------
+
+
+async def test_service_token_without_ingest_scope_is_403(client: AsyncClient, auth_headers):
+    """A valid token whose scopes lack "ingest" authenticates but is refused."""
+    _, raw = await _create_raw_token(client, auth_headers, scopes=["read"])
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json=INGEST_PAYLOAD,
+        headers={"Authorization": f"Bearer {raw}"},
+    )
+    assert r.status_code == 403, r.text
+
+
+async def test_service_token_with_ingest_scope_is_allowed(client: AsyncClient, auth_headers):
+    _, raw = await _create_raw_token(client, auth_headers, scopes=["ingest"])
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json=INGEST_PAYLOAD,
+        headers={"Authorization": f"Bearer {raw}"},
+    )
+    assert r.status_code in (200, 201), r.text
+
+
+async def test_jwt_user_ingests_without_any_scopes(client: AsyncClient, auth_headers):
+    """Regression pin: JWT viewers carry scopes=None (all scopes implicitly) —
+    scope enforcement must never lock out interactive users."""
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json=INGEST_PAYLOAD,
+        headers=auth_headers,
+    )
+    assert r.status_code in (200, 201), r.text
+
+
+# --- 5.R.2: timing side-channel ----------------------------------------------
+
+
+async def test_unknown_token_id_still_pays_argon2_cost(client: AsyncClient, monkeypatch):
+    """The not-found branch must run a dummy argon2 verify, so an attacker
+    cannot enumerate token ids by timing the 401."""
+    from app.core import deps
+
+    class SpyHasher:
+        def __init__(self, real):
+            self.real = real
+            self.verify_calls = 0
+
+        def verify(self, hash_, token):
+            self.verify_calls += 1
+            return self.real.verify(hash_, token)
+
+    spy = SpyHasher(deps._hasher)
+    monkeypatch.setattr(deps, "_hasher", spy)
+    fake = f"kb_{'0' * 32}.{'a' * 43}"
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json=INGEST_PAYLOAD,
+        headers={"Authorization": f"Bearer {fake}"},
+    )
+    assert r.status_code == 401
+    assert spy.verify_calls == 1, "not-found branch skipped the dummy argon2 verify"
+
+
+# --- 5.R.3: corrupt stored hash is a bad credential, not a server error -------
+
+
+async def test_corrupt_token_hash_is_401_not_500(client: AsyncClient, auth_headers, db):
+    """argon2 raises InvalidHashError (not VerificationError) on a malformed
+    stored hash — it must map to 401, never a 500."""
+    from app.models.ingest import ApiToken
+
+    token_id, raw = await _create_raw_token(client, auth_headers)
+    row = await db.get(ApiToken, uuid.UUID(token_id))
+    row.token_hash = "not-an-argon2-hash"
+    await db.flush()
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json=INGEST_PAYLOAD,
+        headers={"Authorization": f"Bearer {raw}"},
     )
     assert r.status_code == 401

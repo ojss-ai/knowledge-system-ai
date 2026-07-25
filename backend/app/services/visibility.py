@@ -22,6 +22,14 @@ class Viewer:
     user_id: uuid.UUID
     role: Role
     group_ids: frozenset[uuid.UUID]
+    scopes: frozenset[str] | None = None
+    """Capability scopes carried by service-token viewers ([review-fix 5.R.1]).
+
+    None means "full-access principal" — JWT users (and SYSTEM_VIEWER) hold all
+    scopes implicitly. Service-token auth sets the token row's scopes, and
+    deps.require_scope() gates scoped endpoints on membership. An empty set is
+    a token with no capabilities, NOT a full-access one — never collapse the
+    two."""
 
 
 SYSTEM_VIEWER = Viewer(

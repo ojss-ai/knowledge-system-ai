@@ -60,7 +60,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer
+from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer, require_scope
 from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
 from app.schemas.node import NodeCreate, NodeOut
@@ -72,6 +72,9 @@ from app.workers.tasks.ingest_md import ingest_md
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+# [review-fix 5.R.1] module-level singleton (ruff B008 forbids the factory call
+# inline in the Depends default): ingest-item demands the "ingest" scope.
+_require_ingest_scope = require_scope("ingest")
 _WS_POLL_SECONDS = 0.5
 # Application close code for "run invisible OR nonexistent" — one code for
 # both, like get_run's generic 404 (a distinct code would confirm the id).
@@ -172,7 +175,9 @@ async def upload_markdown(
 )
 async def ingest_single_item(
     payload: IngestItemIn,
-    viewer: Viewer = Depends(get_scoped_viewer),
+    # [review-fix 5.R.1] service tokens must hold the "ingest" scope; JWT users
+    # (scopes=None) pass implicitly. ApiToken.scopes was stored but never read.
+    viewer: Viewer = Depends(_require_ingest_scope),
     db: AsyncSession = Depends(get_db),
 ) -> NodeOut:
     """Upsert a single knowledge node from an external source (Confluence CLI,
