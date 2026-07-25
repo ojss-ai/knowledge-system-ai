@@ -965,7 +965,7 @@ feat(auth): JWT refresh token revocation via Redis JTI blocklist
 
 ### Steps
 
-- [ ] **5.1** Write failing test:
+- [x] **5.1** Write failing test:
 
 ```python
 # backend/tests/api/test_rate_limit.py
@@ -987,7 +987,13 @@ async def test_rate_limit_on_ask_endpoint(client: AsyncClient, auth_headers):
     assert 429 in responses, "Rate limiting must return 429 after burst"
 ```
 
-- [ ] **5.2** Implement sliding-window rate limiter using Redis:
+- [x] **5.2** Implement sliding-window rate limiter using Redis: *([plan-fix]: the
+  original block raised `HTTPException` inside the middleware, but
+  `BaseHTTPMiddleware` runs OUTSIDE FastAPI's `ExceptionMiddleware`, so the
+  exception is never converted to a 429 — it surfaces as a server error.
+  Return a `JSONResponse` directly instead; on Redis failure, fail open.
+  Also hoisted the inline `hashlib`/`_get_redis` imports to module top and
+  typed `call_next` for mypy.)*
 
 ```python
 # backend/app/core/rate_limit.py
@@ -995,19 +1001,27 @@ async def test_rate_limit_on_ask_endpoint(client: AsyncClient, auth_headers):
 Redis sliding-window rate limiter.
 Applied per user_id to expensive endpoints (/ask, /search).
 """
+
 from __future__ import annotations
 
+import hashlib
 import time
+from collections.abc import Awaitable, Callable
 
-from fastapi import HTTPException, Request, status
+from fastapi import Request, Response, status
+from fastapi.responses import JSONResponse
+
+from app.core.security import _get_redis
 
 _LIMITS: dict[str, tuple[int, int]] = {
-    "/api/v1/ask": (20, 60),      # 20 requests per 60 seconds
-    "/api/v1/search": (60, 60),   # 60 requests per 60 seconds
+    "/api/v1/ask": (20, 60),  # 20 requests per 60 seconds
+    "/api/v1/search": (60, 60),  # 60 requests per 60 seconds
 }
 
 
-async def rate_limit_middleware(request: Request, call_next):
+async def rate_limit_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
     path = request.url.path
     limit_config = None
     for pattern, config in _LIMITS.items():
@@ -1025,12 +1039,10 @@ async def rate_limit_middleware(request: Request, call_next):
     if not auth.startswith("Bearer "):
         return await call_next(request)
 
-    import hashlib
     user_key = hashlib.sha256(auth.encode()).hexdigest()[:16]
     redis_key = f"rate:{path}:{user_key}"
 
     try:
-        from app.core.security import _get_redis
         r = await _get_redis()
         now = time.time()
         window_start = now - window_seconds
@@ -1042,24 +1054,30 @@ async def rate_limit_middleware(request: Request, call_next):
         pipe.zcard(redis_key)
         pipe.expire(redis_key, window_seconds + 1)
         results = await pipe.execute()
-        count = results[2]
-
-        if count > max_requests:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Rate limit exceeded: {max_requests} requests per {window_seconds}s",
-                headers={"Retry-After": str(window_seconds)},
-            )
-    except HTTPException:
-        raise
+        count: int = results[2]
     except Exception:
         # Redis unavailable — fail open (don't block legitimate requests)
-        pass
+        return await call_next(request)
+
+    if count > max_requests:
+        # [plan-fix]: the plan raised HTTPException here, but BaseHTTPMiddleware
+        # runs OUTSIDE FastAPI's ExceptionMiddleware, so the exception would
+        # never be converted to a 429 response (it surfaces as a server error).
+        # Return the JSON response directly instead.
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "detail": f"Rate limit exceeded: {max_requests} requests per {window_seconds}s"
+            },
+            headers={"Retry-After": str(window_seconds)},
+        )
 
     return await call_next(request)
 ```
 
-- [ ] **5.3** Register middleware in `main.py`:
+- [x] **5.3** Register middleware in `main.py` (imports at module top per
+  project style; only `_LIMITS` paths are limited, so `/healthz` is exempt,
+  and `BaseHTTPMiddleware` ignores non-http scopes so WebSockets pass through):
 
 ```python
 # backend/app/main.py (add in create_app)
@@ -1068,13 +1086,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 app.add_middleware(BaseHTTPMiddleware, dispatch=rate_limit_middleware)
 ```
 
-- [ ] **5.4** Run tests:
+- [x] **5.4** Run tests:
 ```bash
 cd backend && pytest tests/api/test_rate_limit.py -v
 # Expected: 1 passed
 ```
 
-- [ ] **5.5** Commit:
+- [x] **5.5** Commit:
 ```
 feat(api): Redis sliding-window rate limiting on /ask and /search (20/60s, 60/60s)
 ```

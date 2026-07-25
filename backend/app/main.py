@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.v1.admin import router as admin_router
 from app.api.v1.ask import router as ask_router
@@ -17,6 +18,7 @@ from app.api.v1.uploads import router as uploads_router
 from app.api.v1.users import router as users_router
 from app.core.errors import register_error_handlers
 from app.core.neo4j import close_driver, ensure_constraints
+from app.core.rate_limit import rate_limit_middleware
 
 logger = structlog.get_logger(__name__)
 
@@ -34,6 +36,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(title="Knowledge Base API", version="0.1.0", lifespan=lifespan)
     register_error_handlers(app)
+    # Only paths listed in rate_limit._LIMITS are limited; everything else
+    # (incl. /healthz) passes through. BaseHTTPMiddleware ignores non-"http"
+    # scopes, so WebSocket connections are unaffected.
+    app.add_middleware(BaseHTTPMiddleware, dispatch=rate_limit_middleware)
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(nodes_router, prefix="/api/v1")
