@@ -895,15 +895,16 @@ async def _get_redis() -> aioredis.Redis:
     return _redis
 
 
-async def revoke_jti(jti: str, ttl_seconds: int) -> None:
-    """Add a JTI to the revocation set in Redis (ADR-008)."""
-    r = await _get_redis()
-    await r.set(f"revoked_jti:{jti}", "1", ex=ttl_seconds)
+async def claim_jti_once(jti: str, ttl_seconds: int) -> bool:
+    """Atomically claim a refresh JTI (ADR-008: single-use tokens).
 
-
-async def is_jti_revoked(jti: str) -> bool:
+    [4.R.1] Single SET NX EX — Redis serializes concurrent claims, so exactly
+    one caller gets True; every other caller (token reuse, incl. races) gets
+    False. Replaces the non-atomic is_jti_revoked/revoke_jti check-then-set.
+    TTL is clamped to >= 1s so a token in its final second still burns its JTI.
+    """
     r = await _get_redis()
-    return bool(await r.exists(f"revoked_jti:{jti}") == 1)
+    return bool(await r.set(f"revoked_jti:{jti}", "1", nx=True, ex=max(ttl_seconds, 1)))
 ```
 
 - [x] **4.3** Update refresh endpoint in `auth.py` to revoke old JTI on use: *([plan-fix]: canonical names — existing endpoint is `refresh` with `RefreshIn` / `make_access_token(user_id, role)` / `make_refresh_token`, not `RefreshRequest`/`create_*`; raw `db.scalar(select(User)...)` in the router violates kb-api-conventions "no DB queries in routers" → moved to new `auth_service.get_active_user(db, user_id)`; catch `pyjwt.PyJWTError`, not bare `Exception`)*
@@ -920,13 +921,18 @@ async def refresh(payload: RefreshIn, db: AsyncSession = Depends(get_db)) -> Tok
         raise HTTPException(status_code=401, detail="invalid refresh token") from exc
 
     # ADR-008: rotation + revocation — a refresh token is single-use.
+    # [4.R.1] Single atomic claim (SET NX EX); [4.R.2] Redis down → 503 fail closed.
     jti = claims.get("jti")
-    if jti and await is_jti_revoked(jti):
-        raise HTTPException(status_code=401, detail="refresh token already used")
     if jti:
-        remaining = int(claims["exp"] - time.time())
-        if remaining > 0:
-            await revoke_jti(jti, remaining)
+        remaining = max(int(claims["exp"] - time.time()), 1)
+        try:
+            claimed = await claim_jti_once(jti, remaining)
+        except (RedisError, OSError) as exc:
+            raise HTTPException(
+                status_code=503, detail="service temporarily unavailable"
+            ) from exc
+        if not claimed:
+            raise HTTPException(status_code=401, detail="refresh token reused")
 
     user = await auth_service.get_active_user(db, uuid.UUID(claims["sub"]))
     if user is None:
@@ -948,6 +954,22 @@ cd backend && pytest tests/api/test_token_revocation.py -v
 ```
 feat(auth): JWT refresh token revocation via Redis JTI blocklist
 ```
+
+### 4.R Review fixes (post-commit ea2d459)
+
+- [x] **4.R.1** (CRITICAL) Refresh rotation race: `is_jti_revoked` + `revoke_jti` was a
+  non-atomic check-then-set — two concurrent refreshes with the same token could both
+  pass the check and both rotate. Replaced with a single atomic claim,
+  `claim_jti_once(jti, ttl)` = Redis `SET revoked_jti:{jti} 1 NX EX <ttl>` (ttl =
+  remaining refresh lifetime from `exp`, clamped >= 1s); NX failure → 401
+  "refresh token reused". Old helpers deleted (no other callers). Tests: a
+  deterministic race (barrier proxy holds `exists` until both racers have read —
+  correct NX code never calls `exists`) asserts exactly one 200 + one 401, and a
+  pre-claimed-key test documents the NX semantics.
+- [x] **4.R.2** (IMPORTANT) Redis-down behavior on refresh is now explicit: `RedisError`/
+  `OSError` from the claim → 503 with generic detail "service temporarily unavailable"
+  (fail CLOSED — rotating tokens without enforcing single-use would reopen replay).
+  Tested via a monkeypatched redis client whose commands raise `ConnectionError`.
 
 > **Known gap (carried from phase-3 `## Blockers`):** the frontend BFF still has no
 > `/api/auth/refresh` route handler, so the browser never exercises this endpoint —

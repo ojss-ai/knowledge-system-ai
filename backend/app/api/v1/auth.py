@@ -3,15 +3,15 @@ import uuid
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
 from app.core.security import (
+    claim_jti_once,
     decode_token,
-    is_jti_revoked,
     make_access_token,
     make_refresh_token,
-    revoke_jti,
 )
 from app.schemas.auth import LoginIn, RefreshIn, TokensOut
 from app.services import auth_service
@@ -42,13 +42,23 @@ async def refresh(payload: RefreshIn, db: AsyncSession = Depends(get_db)) -> Tok
         raise HTTPException(status_code=401, detail="invalid refresh token") from exc
 
     # ADR-008: rotation + revocation — a refresh token is single-use.
+    # [4.R.1] Single atomic claim (SET NX EX): the old check-then-set pair let two
+    # concurrent refreshes with the same token both succeed. Exactly one caller
+    # may claim the JTI; everyone else is a reuse.
     jti = claims.get("jti")
-    if jti and await is_jti_revoked(jti):
-        raise HTTPException(status_code=401, detail="refresh token already used")
     if jti:
-        remaining = int(claims["exp"] - time.time())
-        if remaining > 0:
-            await revoke_jti(jti, remaining)
+        remaining = max(int(claims["exp"] - time.time()), 1)
+        try:
+            claimed = await claim_jti_once(jti, remaining)
+        except (RedisError, OSError) as exc:
+            # [4.R.2] Fail CLOSED: without Redis, single-use cannot be enforced,
+            # so rotating tokens blind would reopen the replay hole. Generic
+            # detail — no internals leak across the auth boundary.
+            raise HTTPException(
+                status_code=503, detail="service temporarily unavailable"
+            ) from exc
+        if not claimed:
+            raise HTTPException(status_code=401, detail="refresh token reused")
 
     user = await auth_service.get_active_user(db, uuid.UUID(claims["sub"]))
     if user is None:
