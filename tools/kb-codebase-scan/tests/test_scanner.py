@@ -95,9 +95,29 @@ def test_run_posts_batches_to_ingest_batch() -> None:
         result = scanner.run()
     urls = [c.args[0] for c in mock_post.call_args_list]
     assert urls and all(u == "http://kb.local/api/v1/uploads/ingest-batch" for u in urls)
-    first_payload: dict[str, Any] = mock_post.call_args_list[0].kwargs["json"]
-    assert set(first_payload) == {"items", "edges"}
+    payloads: list[dict[str, Any]] = [c.kwargs["json"] for c in mock_post.call_args_list]
+    assert set(payloads[0]) == {"items", "edges", "fallback_source"}
+    # [4.R.1] edge-only batches have no items to derive a source from — every
+    # payload pins the DB-fallback scope explicitly.
+    assert all(p["fallback_source"] == "codebase" for p in payloads)
     assert result.new_items == 3 and result.failed_batches == 0
+
+
+def test_run_stops_posting_after_first_failed_batch() -> None:
+    """[4.R.2] One failed POST aborts the run — no requests wasted on batches
+    that will be re-sent next run anyway (cache is not saved on failure)."""
+    repo = make_temp_repo({"a.py": "def a(): pass", "b.py": "def b(): pass"})
+    config = ScanConfig(
+        repo_path=repo, languages=["python"], kb_token="tok", kb_api_url="http://kb.local"
+    )
+    scanner = CodebaseScanner(config)
+    with (
+        patch("scanner._BATCH_ITEMS", 1),
+        patch("requests.Session.post", side_effect=RuntimeError("boom")) as mock_post,
+    ):
+        result = scanner.run()
+    assert mock_post.call_count == 1  # 4 items + 1 edge batch without the early abort
+    assert result.failed_batches == 1 and result.failed_files == 1
 
 
 def test_changed_caller_still_links_to_unchanged_callee() -> None:

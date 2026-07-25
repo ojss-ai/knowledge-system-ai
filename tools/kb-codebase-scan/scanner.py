@@ -176,7 +176,15 @@ class CodebaseScanner:
     ) -> None:
         r = self._kb_session.post(
             f"{self._config.kb_api_url}/api/v1/uploads/ingest-batch",
-            json={"items": [asdict(i) for i in items], "edges": [asdict(e) for e in edges]},
+            json={
+                "items": [asdict(i) for i in items],
+                "edges": [asdict(e) for e in edges],
+                # [4.R.1] source_ref is only unique WITHIN a source: pin the
+                # server's DB-fallback edge resolution to this scanner's source.
+                # Edge-only batches carry no items to derive it from — without
+                # the pin the server skips the fallback and every edge dangles.
+                "fallback_source": "codebase",
+            },
             timeout=_TIMEOUT_S,
         )
         result.api_calls += 1
@@ -201,6 +209,9 @@ class CodebaseScanner:
             failed = False
             # Items first (all batches), edges after: every ref is committed
             # before any edge resolution — dangling only for genuinely absent refs.
+            # [4.R.2] first failure aborts both loops: the cache is not saved on
+            # failure, so every remaining batch is re-sent next run anyway —
+            # keep the requests.
             for start in range(0, len(items), _BATCH_ITEMS):
                 try:
                     self._post_batch(items[start : start + _BATCH_ITEMS], [], result)
@@ -208,13 +219,16 @@ class CodebaseScanner:
                     logger.error(f"Batch upsert failed: {exc}")
                     result.failed_batches += 1
                     failed = True
-            for start in range(0, len(edges), _BATCH_EDGES):
-                try:
-                    self._post_batch([], edges[start : start + _BATCH_EDGES], result)
-                except Exception as exc:
-                    logger.error(f"Edge batch failed: {exc}")
-                    result.failed_batches += 1
-                    failed = True
+                    break
+            if not failed:
+                for start in range(0, len(edges), _BATCH_EDGES):
+                    try:
+                        self._post_batch([], edges[start : start + _BATCH_EDGES], result)
+                    except Exception as exc:
+                        logger.error(f"Edge batch failed: {exc}")
+                        result.failed_batches += 1
+                        failed = True
+                        break
             if failed:
                 result.failed_files = result.failed_batches  # Task 5 exit-code signal
                 return result  # cache NOT saved → next run re-sends (idempotent upserts)
