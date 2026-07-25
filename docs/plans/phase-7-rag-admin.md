@@ -214,16 +214,15 @@ feat(llm): LLMAdapter protocol, FakeLLM, OllamaLLM, get_llm() with LLM_ALLOW_EXT
 
 ### Steps
 
-- [ ] **2.1** Write failing tests for RAG service:
+- [x] **2.1** Write failing tests for RAG service ([plan-fix]: dropped unused `FakeEmbedder` import (ruff F401); added answer-content leak assertions — kb-visibility-filter's mandatory test covers content AND existence):
 
 ```python
 # backend/tests/services/test_rag_service.py
 import pytest
-from app.models.user import Visibility, Role
-from app.services.visibility import Viewer
-from app.services.embedding_service import FakeEmbedder
-from app.services.llm_service import FakeLLM
+from app.models.user import Role, Visibility
 from app.services import rag_service as rag
+from app.services.llm_service import FakeLLM
+from app.services.visibility import Viewer
 from app.workers.tasks.embed_node import _embed_node_impl
 
 pytestmark = pytest.mark.asyncio
@@ -264,9 +263,13 @@ async def test_rag_respects_visibility(db, make_user, make_node, fake_embedder):
     )
     source_ids = [s["id"] for s in result.sources]
     assert str(node.id) not in source_ids, "Private node must not appear in RAG context"
+    # [plan-fix] content leak check: FakeLLM echoes its prompt, so a leaked
+    # context would surface the private body/title in the answer.
+    assert "Top secret" not in result.answer
+    assert "Secret" not in result.answer
 ```
 
-- [ ] **2.2** Implement RAG service:
+- [x] **2.2** Implement RAG service ([plan-fix]: hoisted the loop-body imports to module top (ruff I001/style); extracted `_NO_CONTEXT_ANSWER` constant; system prompt reformatted for the 100-col limit — logic unchanged):
 
 ```python
 # backend/app/services/rag_service.py
@@ -278,22 +281,30 @@ in context, even if the LLM would not directly reveal them (ADR-004).
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.knowledge import KnowledgeNode
 from app.services import search_service as ss
 from app.services.embedding_service import Embedder
 from app.services.llm_service import LLMAdapter
-from app.services.visibility import Viewer
+from app.services.visibility import Viewer, visible_nodes_clause
 
 _CONTEXT_LIMIT = 5
 _CONTEXT_MAX_CHARS = 8000
 
-_SYSTEM_PROMPT = """You are a helpful assistant answering questions from a personal knowledge base.
-Use ONLY the provided context to answer. If the answer is not in the context, say "I don't have enough information in the knowledge base to answer that."
-Be concise and cite the source titles when relevant."""
+_SYSTEM_PROMPT = (
+    "You are a helpful assistant answering questions from a personal knowledge base.\n"
+    "Use ONLY the provided context to answer. If the answer is not in the context, say "
+    '"I don\'t have enough information in the knowledge base to answer that."\n'
+    "Be concise and cite the source titles when relevant."
+)
+
+_NO_CONTEXT_ANSWER = "I don't have enough information in the knowledge base to answer that."
 
 
 @dataclass
@@ -317,26 +328,16 @@ async def ask(
     then call LLM with context to generate an answer.
     """
     # Step 1: hybrid search with visibility filter (same as /search endpoint)
-    results, _ = await ss.hybrid_search(
-        db, query, viewer, limit=limit, fake_embedder=embedder
-    )
+    results, _ = await ss.hybrid_search(db, query, viewer, limit=limit, fake_embedder=embedder)
 
     if not results:
-        return RAGResult(
-            answer="I don't have enough information in the knowledge base to answer that.",
-            sources=[],
-            query=query,
-        )
+        return RAGResult(answer=_NO_CONTEXT_ANSWER, sources=[], query=query)
 
     # Step 2: build context string
     context_parts: list[str] = []
     total_chars = 0
     for result in results:
-        # Fetch body for context
-        from sqlalchemy import select
-        from app.models.knowledge import KnowledgeNode
-        from app.services.visibility import visible_nodes_clause
-        import uuid
+        # Fetch body for context — re-checked through the visibility choke point
         node = await db.scalar(
             select(KnowledgeNode).where(
                 KnowledgeNode.id == uuid.UUID(result["id"]),
@@ -353,11 +354,7 @@ async def ask(
         total_chars += len(chunk)
 
     if not context_parts:
-        return RAGResult(
-            answer="I don't have enough information in the knowledge base to answer that.",
-            sources=[],
-            query=query,
-        )
+        return RAGResult(answer=_NO_CONTEXT_ANSWER, sources=[], query=query)
 
     context = "\n\n---\n\n".join(context_parts)
     prompt = f"Context:\n\n{context}\n\n---\n\nQuestion: {query}"
@@ -372,7 +369,7 @@ async def ask(
     )
 ```
 
-- [ ] **2.3** Write failing API test:
+- [x] **2.3** Write failing API test:
 
 ```python
 # backend/tests/api/test_ask_api.py
@@ -407,17 +404,26 @@ async def test_ask_requires_auth(client: AsyncClient):
     assert r.status_code == 401
 ```
 
-- [ ] **2.4** Create the router:
+- [x] **2.4** Create the router ([plan-fix]: `get_current_viewer` → `get_scoped_viewer` — /ask is not an admin-console route, so the admin visibility bypass must be scoped down (kb-visibility-filter rule 5, matches every other non-admin router); added `summary`/`operation_id` per kb-api-conventions; bounded `query`/`limit` fields for 422 validation; typed signature):
 
 ```python
 # backend/app/api/v1/ask.py
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
+"""RAG /ask router — thin translation layer over rag_service (ADR-005).
+
+Retrieval is visibility-filtered inside rag_service (kb-visibility-filter
+rule 4): citations can only reference nodes the caller can read.
+"""
+
+from __future__ import annotations
+
 from typing import Any
 
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.core.db import get_db
-from app.core.deps import get_current_viewer
+from app.core.deps import Viewer, get_scoped_viewer
 from app.services import rag_service as rag
 from app.services.embedding_service import get_embedder
 from app.services.llm_service import get_llm
@@ -426,8 +432,8 @@ router = APIRouter(prefix="/ask", tags=["rag"])
 
 
 class AskRequest(BaseModel):
-    query: str
-    limit: int = 5
+    query: str = Field(min_length=1, max_length=500)
+    limit: int = Field(5, ge=1, le=20)
 
 
 class AskResponse(BaseModel):
@@ -436,14 +442,21 @@ class AskResponse(BaseModel):
     query: str
 
 
-@router.post("", response_model=AskResponse)
+@router.post(
+    "",
+    response_model=AskResponse,
+    summary="Ask the knowledge base",
+    operation_id="askKnowledgeBase",
+)
 async def ask(
     payload: AskRequest,
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
+) -> AskResponse:
     result = await rag.ask(
-        db, payload.query, viewer,
+        db,
+        payload.query,
+        viewer,
         embedder=get_embedder(),
         llm=get_llm(),
         limit=payload.limit,
@@ -451,19 +464,20 @@ async def ask(
     return AskResponse(answer=result.answer, sources=result.sources, query=result.query)
 ```
 
-- [ ] **2.5** Register in `main.py`:
+- [x] **2.5** Register in `main.py` ([plan-fix]: import style matches the existing `from app.api.v1.<mod> import router as <mod>_router` pattern):
 ```python
-from app.api.v1 import ask as ask_router
-app.include_router(ask_router.router, prefix="/api/v1")
+from app.api.v1.ask import router as ask_router
+app.include_router(ask_router, prefix="/api/v1")
 ```
 
-- [ ] **2.6** Run tests:
+- [x] **2.6** Run tests:
 ```bash
 cd backend && pytest tests/services/test_rag_service.py tests/api/test_ask_api.py -v
 # Expected: 4 passed
+# Actual: 4 passed in 1.17s (full suite: 213 passed, 13 Neo4j-skips)
 ```
 
-- [ ] **2.7** Commit:
+- [x] **2.7** Commit:
 ```
 feat(rag): rag_service with visibility-filtered retrieval + POST /api/v1/ask
 ```

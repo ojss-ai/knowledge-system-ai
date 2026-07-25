@@ -5,6 +5,7 @@ import structlog
 from fastapi import FastAPI
 
 from app.api.v1.admin import router as admin_router
+from app.api.v1.ask import router as ask_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.daily_logs import router as daily_logs_router
 from app.api.v1.edges import router as edges_router
@@ -38,6 +39,7 @@ def create_app() -> FastAPI:
     app.include_router(nodes_router, prefix="/api/v1")
     app.include_router(daily_logs_router, prefix="/api/v1")
     app.include_router(search_router, prefix="/api/v1")
+    app.include_router(ask_router, prefix="/api/v1")
     app.include_router(edges_router, prefix="/api/v1")
     app.include_router(graph_router, prefix="/api/v1")
     app.include_router(uploads_router, prefix="/api/v1")
