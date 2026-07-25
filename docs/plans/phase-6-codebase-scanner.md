@@ -715,6 +715,11 @@ feat(tools): RepoWalker with incremental scan via content-hash cache
 > `DEFINES` (file → symbol). Deliberate scope cuts (Phase 7 candidates): no PARENT_OF hierarchy,
 > no IMPORTS edges, batch endpoint is bounded-synchronous (no run tracking).
 
+> **[plan-fix] block sync (4a.3):** `_resolve_ref`'s DB probe binds a fresh `found` variable instead
+> of reassigning `node` — reassigning the dict.get-inferred variable makes mypy --strict resolve
+> `scalar()`'s overload to Any (`no-any-return`). Committed test file is additionally `ruff format`-ed
+> (edge-dict lines collapsed) — not re-transcribed here.
+
 **Files:**
 - Modify: `backend/app/services/ingest/base.py` (stats counters, `resolve_edges` db fallback)
 - Modify: `backend/app/api/v1/uploads.py` (schemas + endpoint)
@@ -723,7 +728,7 @@ feat(tools): RepoWalker with incremental scan via content-hash cache
 
 ### Steps
 
-- [ ] **4a.1** Write failing service tests — append to `backend/tests/services/ingest/test_ingest_base.py` (reuses its `_graph_recorder`, `db`, `make_user` fixtures; note `_graph_recorder`'s `fake_merge` already accepts `score=None` — extend the tuple it records with `score` so 4a's last test can assert on it: `calls.append(("edge", str(source_id), str(target_id), label, created_by, score))`, and update the existing `("edge", ...)` assertions in this file to compare `c[:5]` or unpack/ignore the extra element):
+- [x] **4a.1** Write failing service tests — append to `backend/tests/services/ingest/test_ingest_base.py` (reuses its `_graph_recorder`, `db`, `make_user` fixtures; note `_graph_recorder`'s `fake_merge` already accepts `score=None` — extend the tuple it records with `score` so 4a's last test can assert on it: `calls.append(("edge", str(source_id), str(target_id), label, created_by, score))`, and update the existing `("edge", ...)` assertions in this file to compare `c[:5]` or unpack/ignore the extra element):
 
 ```python
 async def test_resolve_edges_db_fallback_resolves_committed_ref(db, make_user, monkeypatch):
@@ -783,12 +788,12 @@ async def test_upsert_stats_created_updated_skipped(db, make_user):
     assert ing.stats == {"created": 1, "skipped": 1, "updated": 1}
 ```
 
-- [ ] **4a.2** Run them — MUST fail (`TypeError: unexpected keyword argument 'db_fallback'` / no `stats`):
+- [x] **4a.2** Run them — MUST fail (`TypeError: unexpected keyword argument 'db_fallback'` / no `stats`):
 ```bash
 cd backend && python -m pytest tests/services/ingest/test_ingest_base.py -v   # RED
 ```
 
-- [ ] **4a.3** Amend `backend/app/services/ingest/base.py`. In `__init__`, after `self._edge_specs`:
+- [x] **4a.3** Amend `backend/app/services/ingest/base.py`. In `__init__`, after `self._edge_specs`:
 
 ```python
         # created/updated/skipped counts for this ingestor's lifetime — the
@@ -841,24 +846,27 @@ In `upsert`, add one counter per branch: in the `existing is not None` branch, `
             return node
         # Owner pin for the same reason as upsert's probe: the visibility
         # clause alone would match another owner's public node with this ref.
-        node = await self._db.scalar(
+        # [plan-fix] fresh binding (not `node = ...`): reassigning the
+        # dict.get-inferred variable makes mypy --strict resolve scalar()'s
+        # overload to Any → no-any-return.
+        found = await self._db.scalar(
             select(KnowledgeNode).where(
                 visible_nodes_clause(self._viewer),
                 KnowledgeNode.owner_id == self._viewer.user_id,
                 KnowledgeNode.source_ref == ref,
             )
         )
-        if node is not None:
-            self._ref_to_node[ref] = node  # memoize: CALLS fan-in hits the same target
-        return node
+        if found is not None:
+            self._ref_to_node[ref] = found  # memoize: CALLS fan-in hits the same target
+        return found
 ```
 
-- [ ] **4a.4** Verify GREEN, including the untouched md-worker path:
+- [x] **4a.4** Verify GREEN, including the untouched md-worker path:
 ```bash
 cd backend && python -m pytest tests/services/ingest/ tests/workers/test_ingest_md.py -v
 ```
 
-- [ ] **4a.5** Write failing API tests — create `backend/tests/api/test_ingest_batch_api.py`:
+- [x] **4a.5** Write failing API tests — create `backend/tests/api/test_ingest_batch_api.py`:
 
 ```python
 """ingest-batch API tests (Task 4a). Auth/idempotency mirror test_ingest_item_api."""
@@ -959,7 +967,7 @@ async def test_batch_unauthenticated_is_401(client: AsyncClient):
 cd backend && python -m pytest tests/api/test_ingest_batch_api.py -v   # RED: 404s
 ```
 
-- [ ] **4a.6** Add to `backend/app/api/v1/uploads.py`. Imports: extend the existing `from app.services.ingest.base import ...` line with `EdgeSpec`, add `field_validator` to the pydantic import and `from app.services.graph_service import ALLOWED_EDGE_LABELS`. Below `IngestItemIn`:
+- [x] **4a.6** Add to `backend/app/api/v1/uploads.py`. Imports: extend the existing `from app.services.ingest.base import ...` line with `EdgeSpec`, add `field_validator` to the pydantic import and `from app.services.graph_service import ALLOWED_EDGE_LABELS`. Below `IngestItemIn`:
 
 ```python
 class EdgeSpecIn(BaseModel):
@@ -1044,13 +1052,13 @@ async def ingest_batch(
     )
 ```
 
-- [ ] **4a.7** Full gate:
+- [x] **4a.7** Full gate:
 ```bash
 cd backend && python -m pytest tests/api/test_ingest_batch_api.py tests/services/ingest/ -v  # green
 ruff check app tests && mypy app/services app/schemas
 ```
 
-- [ ] **4a.8** Commit:
+- [x] **4a.8** Commit:
 ```
 feat(api): POST /uploads/ingest-batch — ref-addressed edges with DB-fallback resolution
 ```

@@ -55,7 +55,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,7 +65,8 @@ from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
 from app.schemas.node import NodeCreate, NodeOut
 from app.services import node_service as ns
-from app.services.ingest.base import IngestItem, KnowledgeIngestor
+from app.services.graph_service import ALLOWED_EDGE_LABELS
+from app.services.ingest.base import EdgeSpec, IngestItem, KnowledgeIngestor
 from app.services.ingest.md_importer import check_zip_limits
 from app.workers.tasks.ingest_md import ingest_md
 
@@ -102,6 +103,40 @@ class IngestItemIn(NodeCreate):
     """NodeCreate + `tags` — Confluence labels arrive as tags [plan-fix]."""
 
     tags: list[str] = Field(default_factory=list)
+
+
+class EdgeSpecIn(BaseModel):
+    """Ref-addressed edge for batch ingestion. `confidence` (ADR-009 call edges)
+    maps to merge_edge's score. Label check mirrors EdgeCreate: the label is
+    interpolated into Cypher, only the fixed vocabulary may pass (422)."""
+
+    source_ref: str = Field(..., min_length=1)
+    target_ref: str = Field(..., min_length=1)
+    label: str = "LINKS_TO"
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+    @field_validator("label")
+    @classmethod
+    def _label_allowed(cls, v: str) -> str:
+        if v not in ALLOWED_EDGE_LABELS:
+            raise ValueError("unknown edge label")
+        return v
+
+
+class IngestBatchIn(BaseModel):
+    # Bounded sync upsert (same tradeoff as ingest-item; the run-tracked async
+    # path is the Phase 7 upgrade). Caps keep one request under the kb-api
+    # long-work threshold; clients chunk.
+    items: list[IngestItemIn] = Field(default_factory=list, max_length=200)
+    edges: list[EdgeSpecIn] = Field(default_factory=list, max_length=2000)
+
+
+class IngestBatchOut(BaseModel):
+    created: int
+    updated: int
+    skipped: int
+    edges_queued: int
+    edges_dangling: int
 
 
 @router.post(
@@ -198,6 +233,51 @@ async def ingest_single_item(
     await db.commit()
     await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
     return NodeOut.model_validate(node)
+
+
+@router.post(
+    "/ingest-batch",
+    response_model=IngestBatchOut,
+    summary="Upsert a batch of knowledge nodes and ref-addressed edges",
+    operation_id="ingestBatch",
+)
+async def ingest_batch(
+    payload: IngestBatchIn,
+    viewer: Viewer = Depends(_require_ingest_scope),
+    db: AsyncSession = Depends(get_db),
+) -> IngestBatchOut:
+    """Batch upsert for connectors (codebase scanner). Two-pass edge resolution
+    with DB fallback: refs may point at nodes from earlier batches or scans.
+    Dangling refs are counted, never errors (kb-ingestion-connectors)."""
+    ingestor = KnowledgeIngestor(db, viewer)
+    for item_in in payload.items:
+        await ingestor.upsert(
+            IngestItem(
+                source=item_in.source or "api",
+                source_ref=item_in.source_ref or str(uuid.uuid4()),
+                title=item_in.title,
+                body=item_in.body,
+                node_type=item_in.node_type,
+                visibility=item_in.visibility,
+                tags=item_in.tags,
+                meta=item_in.meta,
+            )
+        )
+    for e in payload.edges:
+        props: dict = {"score": e.confidence} if e.confidence is not None else {}
+        ingestor.add_edge_spec(
+            EdgeSpec(source_ref=e.source_ref, target_ref=e.target_ref, label=e.label, props=props)
+        )
+    dangling = await ingestor.resolve_edges(db_fallback=True)
+    await db.commit()
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
+    return IngestBatchOut(
+        created=ingestor.stats["created"],
+        updated=ingestor.stats["updated"],
+        skipped=ingestor.stats["skipped"],
+        edges_queued=len(payload.edges) - dangling,
+        edges_dangling=dangling,
+    )
 
 
 @router.get(
