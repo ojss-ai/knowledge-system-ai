@@ -11,9 +11,15 @@
 | 4 | [phase-4-md-import.md](phase-4-md-import.md) | Bulk MD upload, two-pass links, WS progress | Done (Neo4j tests pending Docker-stack verification) |
 | 5 | [phase-5-confluence.md](phase-5-confluence.md) | kb-confluence-sync CLI, XHTML→MD, incremental sync | Done |
 | 6 | [phase-6-codebase-scanner.md](phase-6-codebase-scanner.md) | kb-codebase-scan CLI, tree-sitter, code graph | Done |
-| 7 | [phase-7-rag-admin.md](phase-7-rag-admin.md) | /ask RAG, admin dashboards, audit, hardening | Not started |
+| 7 | [phase-7-rag-admin.md](phase-7-rag-admin.md) | /ask RAG, admin dashboards, audit, hardening | Done (load-test full gate + Neo4j tests pending on Docker stack) |
 
-> **Plans written:** All 8 phase plans are complete with atomic TDD tasks, full code, and exit gates. Start with Phase 0 (`/kb-next-task`) and proceed in order.
+> **Plans written:** All 8 phase plans are complete with atomic TDD tasks, full code, and exit gates.
+>
+> **Build status (2026-07-25):** All phases implemented in a Docker-less sandbox. Everything not
+> requiring live Neo4j/MinIO/Ollama is verified green there. Before merging, run on the Docker
+> stack: `make up && cd backend && pytest -q` (13 Neo4j skips become passes), the Playwright
+> suite without E2E_SKIP_NEO4J, and the Phase 7 locust gate (§7.2). Branches: phase-1 … phase-7,
+> stacked in order.
 
 Update the Status column (Not started / In progress / Done) as part of phase work. Add `## Blockers` sections inside plan files, not here.
 

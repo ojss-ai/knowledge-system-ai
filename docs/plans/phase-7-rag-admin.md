@@ -12,13 +12,20 @@
 - `kb-celery-jobs` (auto-tag is async)
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `pytest -x backend/tests/` green
-- [ ] `ruff check backend/` clean
-- [ ] `mypy --strict backend/app/services/ backend/app/schemas/` clean
-- [ ] `/kb-verify` passes full gate
-- [ ] Load test: `locust` or `k6` at 50 RPS for 60s with p95 latency < 500ms
-- [ ] LLM_ALLOW_EXTERNAL=false graceful degradation tested
+- [x] All tasks checked
+- [x] `pytest backend/tests/` green — `237 passed, 13 skipped` (Neo4j-unreachable
+  sandbox skips; convert to passes on the Docker stack); services coverage 81% (>80%)
+- [x] `ruff check backend/` + format clean
+- [x] `mypy --strict app/services app/schemas` clean (21 files); api/workers/core also clean
+- [x] `/kb-verify` full gate — visibility audits (static+dynamic 26 passed) clean; zero
+  Cypher outside graph_service/core.neo4j; `alembic downgrade base && upgrade head`
+  cycle proven (after 0001 enum-drop fix); frontend build+lint+vitest+tsc green;
+  both CLI tool suites green (20 + 26)
+- [ ] Load test full gate: **run on the Docker stack** — sandbox smoke (15s, 50u,
+  fake backends) was 0 failures / medians 2–5ms, but the 50 RPS × 60s p95<500ms
+  criterion needs real hardware: see §7.2 for the exact locust command
+- [x] LLM_ALLOW_EXTERNAL=false + graceful degradation tested (unit: adapter gate,
+  /ask returns 200 + sources + answer:null + degraded:true, no exception leakage)
 
 ---
 
@@ -1607,21 +1614,21 @@ test(load): Locust load test at 50 RPS targeting p95 < 500ms
 
 ### Steps
 
-- [ ] **8.1** Run full backend test suite:
+- [x] **8.1** Run full backend test suite:
 ```bash
 cd backend
 pytest tests/ -v --tb=short --cov=app --cov-report=term-missing
 # Expected: all pass, coverage > 80% on app/services/
 ```
 
-- [ ] **8.2** Run lint + type check:
+- [x] **8.2** Run lint + type check:
 ```bash
 cd backend
 ruff check .
 mypy --strict app/services/ app/schemas/
 ```
 
-- [ ] **8.3** Run visibility audit:
+- [x] **8.3** Run visibility audit:
 ```bash
 # Must return 0 raw queries on knowledge_nodes outside authorised files
 grep -rn "SELECT.*knowledge_nodes\|from knowledge_nodes" \
@@ -1630,7 +1637,7 @@ grep -rn "SELECT.*knowledge_nodes\|from knowledge_nodes" \
 # Expected: 0 lines
 ```
 
-- [ ] **8.4** Run alembic upgrade (clean from scratch):
+- [x] **8.4** Run alembic upgrade (clean from scratch):
 ```bash
 cd backend
 alembic downgrade base
@@ -1638,7 +1645,7 @@ alembic upgrade head
 # Expected: no errors
 ```
 
-- [ ] **8.5** Frontend build:
+- [x] **8.5** Frontend build:
 ```bash
 cd frontend && npm run build && npm run lint && npx vitest run
 ```
