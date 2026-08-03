@@ -92,7 +92,7 @@ def _graph_recorder(monkeypatch):
         calls.append(("upsert", str(node.id)))
 
     async def fake_merge(source_id, target_id, label, created_by, score=None):
-        calls.append(("edge", str(source_id), str(target_id), label, created_by))
+        calls.append(("edge", str(source_id), str(target_id), label, created_by, score))
 
     monkeypatch.setattr(gs, "upsert_vertex", fake_upsert)
     monkeypatch.setattr(gs, "merge_edge", fake_merge)
@@ -112,7 +112,7 @@ async def test_resolve_edges_defers_graph_sync(db, make_user, monkeypatch):
 
     assert calls == []  # nothing hit Neo4j inside the transaction
     await ns.run_pending_graph_ops(db)
-    assert ("edge", str(n1.id), str(n2.id), "LINKS_TO", "ingest") in calls
+    assert ("edge", str(n1.id), str(n2.id), "LINKS_TO", "ingest") in [c[:5] for c in calls]
 
 
 async def test_resolve_edges_skips_dangling_refs(db, make_user, monkeypatch):
@@ -130,3 +130,123 @@ async def test_resolve_edges_skips_dangling_refs(db, make_user, monkeypatch):
     await ns.run_pending_graph_ops(db)
 
     assert all(c[0] != "edge" for c in calls)
+
+
+# --- Task 4a: DB-fallback resolution + upsert stats ---
+
+
+async def test_resolve_edges_db_fallback_resolves_committed_ref(db, make_user, monkeypatch):
+    """A ref absent from this batch resolves against an already-persisted row."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    first = KnowledgeIngestor(db, viewer)
+    tgt = await first.upsert(
+        IngestItem(source="codebase", source_ref="r/a.py#a.beta", title="beta", body="b")
+    )
+    await db.flush()
+
+    second = KnowledgeIngestor(db, viewer)  # fresh: empty _ref_to_node
+    src = await second.upsert(
+        IngestItem(source="codebase", source_ref="r/b.py#b.alpha", title="alpha", body="a")
+    )
+    second.add_edge_spec(
+        EdgeSpec(
+            source_ref="r/b.py#b.alpha",
+            target_ref="r/a.py#a.beta",
+            label="CALLS",
+            props={"score": 0.7},
+        )
+    )
+    dangling = await second.resolve_edges(db_fallback=True, fallback_source="codebase")
+    assert dangling == 0
+    await ns.run_pending_graph_ops(db)
+    assert ("edge", str(src.id), str(tgt.id), "CALLS", "ingest", 0.7) in calls
+
+
+async def test_resolve_edges_db_fallback_never_crosses_owners(db, make_user, monkeypatch):
+    """Fallback is pinned to (viewer visibility, owner) — another user's node never resolves."""
+    _graph_recorder(monkeypatch)
+    other = await make_user(email="ing_fb_other@test.com")
+    other_viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
+    await KnowledgeIngestor(db, other_viewer).upsert(
+        IngestItem(source="codebase", source_ref="shared.py#x", title="x", body="x")
+    )
+    await db.flush()
+
+    owner = await make_user(email="ing_fb_me@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="mine.py#m", title="m", body="m"))
+    ing.add_edge_spec(EdgeSpec(source_ref="mine.py#m", target_ref="shared.py#x", label="CALLS"))
+    dangling = await ing.resolve_edges(db_fallback=True, fallback_source="codebase")
+    assert dangling == 1  # dangling, not another owner's node
+
+
+# --- 4.R.1: DB fallback is source-scoped (source_ref unique WITHIN a source) ---
+
+
+async def test_resolve_edges_db_fallback_is_source_scoped(db, make_user, monkeypatch):
+    """A same-owner ref collision across sources must not mislink: the probe is
+    pinned to fallback_source, so a foreign-source row counts as dangling."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb_src@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await KnowledgeIngestor(db, viewer).upsert(
+        IngestItem(source="md_upload", source_ref="X", title="doc", body="d")
+    )
+    await db.flush()
+
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="c.py#f", title="f", body="f"))
+    ing.add_edge_spec(EdgeSpec(source_ref="c.py#f", target_ref="X", label="CALLS"))
+    assert await ing.resolve_edges(db_fallback=True, fallback_source="codebase") == 1
+    await ns.run_pending_graph_ops(db)
+    assert all(c[0] != "edge" for c in calls)
+
+
+async def test_resolve_edges_db_fallback_matching_source_resolves(db, make_user, monkeypatch):
+    """Same-owner ref collision setup, matching fallback_source: resolves to it."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb_src_ok@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    tgt = await KnowledgeIngestor(db, viewer).upsert(
+        IngestItem(source="md_upload", source_ref="X", title="doc", body="d")
+    )
+    await db.flush()
+
+    ing = KnowledgeIngestor(db, viewer)
+    src = await ing.upsert(IngestItem(source="md_upload", source_ref="y.md", title="y", body="y"))
+    ing.add_edge_spec(EdgeSpec(source_ref="y.md", target_ref="X", label="LINKS_TO"))
+    assert await ing.resolve_edges(db_fallback=True, fallback_source="md_upload") == 0
+    await ns.run_pending_graph_ops(db)
+    assert ("edge", str(src.id), str(tgt.id), "LINKS_TO", "ingest") in [c[:5] for c in calls]
+
+
+async def test_resolve_edges_db_fallback_without_source_never_probes(db, make_user, monkeypatch):
+    """db_fallback with fallback_source=None SKIPS the DB probe (dangling) —
+    an unscoped probe could hit any source's ref (never probe unscoped)."""
+    calls = _graph_recorder(monkeypatch)
+    owner = await make_user(email="ing_fb_nosrc@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    await KnowledgeIngestor(db, viewer).upsert(
+        IngestItem(source="codebase", source_ref="z.py#z", title="z", body="z")
+    )
+    await db.flush()
+
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="w.py#w", title="w", body="w"))
+    ing.add_edge_spec(EdgeSpec(source_ref="w.py#w", target_ref="z.py#z", label="CALLS"))
+    assert await ing.resolve_edges(db_fallback=True) == 1
+    await ns.run_pending_graph_ops(db)
+    assert all(c[0] != "edge" for c in calls)
+
+
+async def test_upsert_stats_created_updated_skipped(db, make_user):
+    owner = await make_user(email="ing_stats@test.com")
+    viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
+    ing = KnowledgeIngestor(db, viewer)
+    await ing.upsert(IngestItem(source="codebase", source_ref="s.py", title="S", body="1"))
+    await ing.upsert(IngestItem(source="codebase", source_ref="s.py", title="S", body="1"))
+    await ing.upsert(IngestItem(source="codebase", source_ref="s.py", title="S", body="2"))
+    assert ing.stats == {"created": 1, "skipped": 1, "updated": 1}

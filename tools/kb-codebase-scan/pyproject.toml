@@ -1,0 +1,35 @@
+# [plan-fix] vs the 5.3 block (mirrors tools/kb-confluence-sync/pyproject.toml):
+# - build-backend "setuptools.backends.legacy:build" does not exist → setuptools.build_meta.
+# - The tool is a flat-module layout (Tasks 1-4), not a kb_codebase_scan package:
+#   modules are listed via py-modules and the console script targets cli:main
+#   ("kb_codebase_scan.__main__:main" would import a nonexistent package; a
+#   "__main__:main" entry would resolve to the running script itself).
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb-codebase-scan"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "tree-sitter>=0.21",
+    "tree-sitter-python>=0.21",
+    "tree-sitter-typescript>=0.21",
+    "gitpython>=3.1",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+kb-codebase-scan = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "cli",
+    "language_parser",
+    "python_parser",
+    "typescript_parser",
+    "repo_walker",
+    "scanner",
+]

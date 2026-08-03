@@ -10,7 +10,7 @@
 | 3 | [phase-3-graph-ui.md](phase-3-graph-ui.md) | Next.js app, auth BFF, Sigma.js explorer, node page, daily logs | Done (canvas render check pending Docker-stack verification) |
 | 4 | [phase-4-md-import.md](phase-4-md-import.md) | Bulk MD upload, two-pass links, WS progress | Done (Neo4j tests pending Docker-stack verification) |
 | 5 | [phase-5-confluence.md](phase-5-confluence.md) | kb-confluence-sync CLI, XHTML→MD, incremental sync | Done |
-| 6 | [phase-6-codebase-scanner.md](phase-6-codebase-scanner.md) | kb-codebase-scan CLI, tree-sitter, code graph | Not started |
+| 6 | [phase-6-codebase-scanner.md](phase-6-codebase-scanner.md) | kb-codebase-scan CLI, tree-sitter, code graph | Done |
 | 7 | [phase-7-rag-admin.md](phase-7-rag-admin.md) | /ask RAG, admin dashboards, audit, hardening | Not started |
 
 > **Plans written:** All 8 phase plans are complete with atomic TDD tasks, full code, and exit gates. Start with Phase 0 (`/kb-next-task`) and proceed in order.

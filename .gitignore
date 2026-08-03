@@ -14,5 +14,6 @@ docker/miniodata/
 docker/neo4jdata/
 docker/neo4jlogs/
 backend/openapi.json
+.codebase_scan_cache.json
 *.bundle
 .claude/
