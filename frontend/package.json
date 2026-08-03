@@ -1,0 +1,46 @@
+{
+  "name": "kb-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint && tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "next": "14.2.3",
+    "react": "^18",
+    "react-dom": "^18",
+    "@tanstack/react-query": "^5.28.6",
+    "zustand": "^4.5.2",
+    "graphology": "^0.25.4",
+    "graphology-layout-forceatlas2": "^0.10.1",
+    "sigma": "^3.0.0",
+    "graphology-types": "^0.24.7",
+    "graphology-utils": "^2.5.2",
+    "graphology-layout": "^0.6.1",
+    "jose": "^5.2.4",
+    "clsx": "^2.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@typescript-eslint/eslint-plugin": "^7.2.0",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "tailwindcss": "^3.4.1",
+    "autoprefixer": "^10.0.1",
+    "postcss": "^8",
+    "eslint": "^8",
+    "eslint-config-next": "14.2.3",
+    "vitest": "^1.4.0",
+    "@vitest/coverage-v8": "^1.4.0",
+    "@playwright/test": "^1.43.0",
+    "@testing-library/react": "^15.0.2",
+    "@testing-library/jest-dom": "^6.4.2",
+    "jsdom": "^24.0.0"
+  }
+}

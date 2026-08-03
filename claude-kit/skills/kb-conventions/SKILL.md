@@ -25,7 +25,7 @@ These conventions keep 8 phases of agent-written code coherent. Deviating "becau
 
 ## TypeScript (frontend)
 - Strict mode; no `any` (use `unknown` + narrowing).
-- API calls only through the generated client in `frontend/lib/api/` (OpenAPI codegen) — never hand-rolled fetch to `/api/v1`.
+- API calls only through the typed client `frontend/src/lib/api.ts` (hand-rolled per ADR-013; OpenAPI codegen may replace its internals later without changing call sites) — never ad-hoc fetch to `/api/v1` outside it.
 - Server components by default; `"use client"` only where interaction demands it.
 
 ## Commits & branches

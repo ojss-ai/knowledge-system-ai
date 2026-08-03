@@ -12,7 +12,7 @@ Next.js 14 App Router + Sigma.js v3 over a graphology store (ADR-006). The graph
 - Server components by default; the graph canvas and editors are client components.
 - Data: TanStack Query for all server state (keys: `['node', id]`, `['neighborhood', id, filters]`, `['search', params]`); Zustand only for graph UI state (selection, filters, camera).
 - Auth: BFF pattern — Next.js route handlers proxy `/api/v1`, attach httpOnly cookies. Client code never sees tokens (ADR-008).
-- API calls only via the generated client `frontend/lib/api/` (regenerate with `make openapi`).
+- API calls only via the typed client `frontend/src/lib/api.ts` (hand-rolled, ADR-013; codegen may replace its internals later without changing call sites).
 
 ## Graph canvas rules (`components/graph/GraphCanvas.tsx`)
 1. One graphology instance per explorer session, held in a ref; merge incoming neighborhoods with `graph.mergeNode/mergeEdge` (idempotent by node id).

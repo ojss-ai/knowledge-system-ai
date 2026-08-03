@@ -10,12 +10,16 @@
 - `kb-frontend-graph` — BFF pattern, one graphology instance, FA2 in web worker, progressive loading
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `npm run build` in `frontend/` exits 0
-- [ ] `npx vitest run` green
-- [ ] `npx playwright test` green (3 e2e tests)
-- [ ] `npm run lint` (ESLint + tsc --noEmit) clean
-- [ ] Graph canvas renders in browser without console errors
+- [x] All tasks checked
+- [x] `npm run build` exits 0 (sandbox: with a local Inter stub because
+  fonts.googleapis.com is blocked there; committed code keeps `next/font/google` —
+  re-run `npm run build` once on a normal network to confirm)
+- [x] `npx vitest run` green — 7 files / 20 tests
+- [x] `npx playwright test` — 6 passed, 1 skipped in sandbox (canvas test needs
+  Neo4j; expect 7 passed on the Docker stack, no E2E_SKIP_NEO4J)
+- [x] `npm run lint` (ESLint + tsc --noEmit) clean
+- [ ] Graph canvas renders in browser without console errors — **requires Neo4j;
+  verify on the Docker stack** (`make up api` + `npm run dev`, open /graph)
 
 ---
 
@@ -24,17 +28,21 @@
 **Files:**
 - Create: `frontend/package.json`
 - Create: `frontend/tsconfig.json`
-- Create: `frontend/next.config.ts`
+- Create: `frontend/next.config.mjs` <!-- [plan-fix] was next.config.ts; Next 14.2.3 rejects TS config ("Configuring Next.js via 'next.config.ts' is not supported") — TS config support only landed in Next 15 -->
 - Create: `frontend/.eslintrc.json`
 - Create: `frontend/tailwind.config.ts`
 - Create: `frontend/postcss.config.js`
 
 ### Steps
 
-- [ ] **1.1** Write a smoke test first:
+- [x] **1.1** Write a smoke test first:
 
 ```typescript
 // frontend/tests/unit/smoke.test.ts
+// [plan-fix] added explicit vitest imports — vitest globals are not enabled
+// (no vitest config), and Task 2's test already uses explicit imports
+import { describe, it, expect } from "vitest"
+
 describe("scaffold", () => {
   it("environment is Node", () => {
     expect(typeof process).toBe("object")
@@ -42,7 +50,7 @@ describe("scaffold", () => {
 })
 ```
 
-- [ ] **1.2** Create `package.json`:
+- [x] **1.2** Create `package.json`:
 
 ```json
 {
@@ -74,6 +82,7 @@ describe("scaffold", () => {
   },
   "devDependencies": {
     "typescript": "^5",
+    "@typescript-eslint/eslint-plugin": "^7.2.0",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
@@ -92,7 +101,7 @@ describe("scaffold", () => {
 }
 ```
 
-- [ ] **1.3** Create `tsconfig.json`:
+- [x] **1.3** Create `tsconfig.json`:
 
 ```json
 {
@@ -118,30 +127,21 @@ describe("scaffold", () => {
 }
 ```
 
-- [ ] **1.4** Create `next.config.ts`:
+- [x] **1.4** Create `next.config.mjs` <!-- [plan-fix] see Files note: Next 14 cannot load next.config.ts --> <!-- [3.R] rewrites() removed after review: a bare rewrite forwards cookies but FastAPI only accepts Authorization: Bearer (HTTPBearer in deps.py), so every proxied call 401'd. Replaced by the BFF catch-all route handler — see Task 3.R -->:
 
-```typescript
-// frontend/next.config.ts
-import type { NextConfig } from "next"
+```javascript
+// frontend/next.config.mjs
 
-const config: NextConfig = {
+/** @type {import('next').NextConfig} */
+const config = {
   reactStrictMode: true,
   experimental: { serverActions: { allowedOrigins: ["localhost:3000"] } },
-  async rewrites() {
-    return [
-      // BFF: proxy /api/v1/* to FastAPI (in dev)
-      {
-        source: "/api/v1/:path*",
-        destination: `${process.env.API_BASE_URL ?? "http://localhost:8000"}/api/v1/:path*`,
-      },
-    ]
-  },
 }
 
 export default config
 ```
 
-- [ ] **1.5** Create `tailwind.config.ts`:
+- [x] **1.5** Create `tailwind.config.ts`:
 
 ```typescript
 import type { Config } from "tailwindcss"
@@ -155,15 +155,16 @@ const config: Config = {
 export default config
 ```
 
-- [ ] **1.6** Create `postcss.config.js`:
+- [x] **1.6** Create `postcss.config.js`:
 ```javascript
 module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }
 ```
 
-- [ ] **1.7** Create `.eslintrc.json`:
+- [x] **1.7** Create `.eslintrc.json`: <!-- [plan-fix, found in Task 5] eslint-config-next 14 ships only @typescript-eslint/parser, not the plugin — the no-explicit-any rule was unresolvable ("Definition for rule ... was not found") and failed `next build`. Added @typescript-eslint/eslint-plugin@^7.2.0 (matches bundled parser 7.2.0) to devDependencies and declared the plugin. -->
 ```json
 {
   "extends": ["next/core-web-vitals"],
+  "plugins": ["@typescript-eslint"],
   "rules": {
     "no-console": "warn",
     "@typescript-eslint/no-explicit-any": "error"
@@ -171,14 +172,14 @@ module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }
 }
 ```
 
-- [ ] **1.8** Install and run smoke test:
+- [x] **1.8** Install and run smoke test:
 ```bash
 cd frontend && npm install
 npx vitest run tests/unit/smoke.test.ts
 # Expected: 1 passed
 ```
 
-- [ ] **1.9** Commit:
+- [x] **1.9** Commit:
 ```
 chore(frontend): Next.js 14 scaffold — package.json, tsconfig, next.config, tailwind
 ```
@@ -191,10 +192,11 @@ chore(frontend): Next.js 14 scaffold — package.json, tsconfig, next.config, ta
 - Create: `frontend/src/lib/api.ts`
 - Create: `frontend/src/lib/types.ts`
 - Create: `frontend/tests/unit/api.test.ts`
+- Create: `frontend/vitest.config.ts` <!-- [plan-fix] added: test imports "@/lib/api" but vitest does not read tsconfig paths; config maps "@" → ./src -->
 
 ### Steps
 
-- [ ] **2.1** Write the failing test:
+- [x] **2.1** Write the failing test:
 
 ```typescript
 // frontend/tests/unit/api.test.ts
@@ -237,13 +239,15 @@ describe("searchNodes", () => {
 })
 ```
 
-- [ ] **2.2** Create `types.ts`:
+- [x] **2.2** Create `types.ts`:
 
 ```typescript
 // frontend/src/lib/types.ts
 export type Visibility = "private" | "public" | "shared"
 export type NodeType = "note" | "daily_log" | "file" | "code_file" | "code_symbol" | "confluence_page"
 
+// [plan-fix] dropped deleted_at — backend NodeOut (backend/app/schemas/node.py)
+// does not expose it; soft-deleted nodes are never returned.
 export interface KBNode {
   id: string
   owner_id: string
@@ -256,7 +260,6 @@ export interface KBNode {
   meta: Record<string, unknown>
   created_at: string
   updated_at: string
-  deleted_at: string | null
 }
 
 export interface NodeListOut {
@@ -282,12 +285,14 @@ export interface SearchOut {
 }
 
 export interface GraphData {
-  nodes: { id: string; title: string; node_type: string; visibility: string }[]
+  // [plan-fix] visibility optional — GET /graph/overview omits it
+  // (graph_service.get_overview returns only id/title/node_type)
+  nodes: { id: string; title: string; node_type: string; visibility?: string }[]
   edges: { source: string; target: string; label: string }[]
 }
 ```
 
-- [ ] **2.3** Create `api.ts`:
+- [x] **2.3** Create `api.ts`:
 
 ```typescript
 // frontend/src/lib/api.ts
@@ -304,6 +309,11 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
     throw new Error(`API ${res.status}: ${text}`)
+  }
+  // [plan-fix] DELETE /nodes/{id} returns 204 No Content — res.json() would
+  // throw on the empty body.
+  if (res.status === 204) {
+    return undefined as T
   }
   return res.json() as Promise<T>
 }
@@ -350,13 +360,13 @@ export async function fetchDailyLog(date: string): Promise<KBNode> {
 }
 ```
 
-- [ ] **2.4** Run tests:
+- [x] **2.4** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/api.test.ts
 # Expected: 2 passed
 ```
 
-- [ ] **2.5** Commit:
+- [x] **2.5** Commit:
 ```
 feat(frontend): API client layer with typed wrappers for all endpoints
 ```
@@ -366,15 +376,20 @@ feat(frontend): API client layer with typed wrappers for all endpoints
 ## Task 3 — BFF auth route handlers + middleware
 
 **Files:**
+- Create: `frontend/src/lib/auth.ts` <!-- [plan-fix] was missing from Files list; step 3.2 creates it -->
 - Create: `frontend/src/app/api/auth/login/route.ts`
 - Create: `frontend/src/app/api/auth/logout/route.ts`
 - Create: `frontend/src/app/api/auth/me/route.ts`
 - Create: `frontend/src/middleware.ts`
 - Create: `frontend/tests/unit/auth.test.ts`
+- Create: `frontend/src/app/api/v1/[...path]/route.ts` <!-- [3.R] BFF proxy, replaces the next.config rewrite -->
+- Create: `frontend/src/lib/routes.ts` <!-- [3.R] pure middleware predicate, unit-testable -->
+- Create: `frontend/tests/unit/proxy.test.ts` <!-- [3.R] -->
+- Create: `frontend/tests/unit/routes.test.ts` <!-- [3.R] -->
 
 ### Steps
 
-- [ ] **3.1** Write failing tests:
+- [x] **3.1** Write failing tests:
 
 ```typescript
 // frontend/tests/unit/auth.test.ts
@@ -392,7 +407,7 @@ describe("parseAccessToken", () => {
 })
 ```
 
-- [ ] **3.2** Create `frontend/src/lib/auth.ts`:
+- [x] **3.2** Create `frontend/src/lib/auth.ts`:
 
 ```typescript
 // frontend/src/lib/auth.ts
@@ -420,7 +435,7 @@ export function isTokenExpired(claims: TokenClaims): boolean {
 }
 ```
 
-- [ ] **3.3** Create BFF login route:
+- [x] **3.3** Create BFF login route:
 
 ```typescript
 // frontend/src/app/api/auth/login/route.ts
@@ -428,12 +443,14 @@ import { NextRequest, NextResponse } from "next/server"
 
 export async function POST(req: NextRequest) {
   const { email, password } = await req.json()
+  // [plan-fix] backend login is JSON {email, password} (LoginIn schema in
+  // backend/app/schemas/auth.py), not OAuth2 form-urlencoded {username, password}
   const apiRes = await fetch(
     `${process.env.API_BASE_URL ?? "http://localhost:8000"}/api/v1/auth/login`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ username: email, password }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
     }
   )
   if (!apiRes.ok) {
@@ -454,13 +471,17 @@ export async function POST(req: NextRequest) {
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     maxAge: 604800,
+    // [3.R] NOTE: this cookie path targets /api/auth/refresh, a BFF route that
+    // no task in this phase creates (backend /api/v1/auth/refresh exists since
+    // Phase 0). Harmless until then — the cookie is simply never sent. See
+    // "## Blockers" at the end of this file (Phase 7 hardening).
     path: "/api/auth/refresh",
   })
   return res
 }
 ```
 
-- [ ] **3.4** Create BFF logout route:
+- [x] **3.4** Create BFF logout route:
 
 ```typescript
 // frontend/src/app/api/auth/logout/route.ts
@@ -474,7 +495,7 @@ export async function POST() {
 }
 ```
 
-- [ ] **3.5** Create BFF me route (proxies to FastAPI with access_token from cookie):
+- [x] **3.5** Create BFF me route (proxies to FastAPI with access_token from cookie):
 
 ```typescript
 // frontend/src/app/api/auth/me/route.ts
@@ -493,17 +514,16 @@ export async function GET(req: NextRequest) {
 }
 ```
 
-- [ ] **3.6** Create middleware (protect all non-auth pages):
+- [x] **3.6** Create middleware (protect all non-auth pages) <!-- [3.R] revised after review: /api/ is now fully excluded (matcher + requiresLoginRedirect helper in src/lib/routes.ts) so unauthenticated API calls get a JSON 401, never a 307 HTML redirect -->:
 
 ```typescript
 // frontend/src/middleware.ts
 import { NextRequest, NextResponse } from "next/server"
-
-const PUBLIC_PATHS = ["/login", "/api/auth"]
+import { requiresLoginRedirect } from "@/lib/routes"
 
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl
-  if (PUBLIC_PATHS.some((p) => pathname.startsWith(p))) return NextResponse.next()
+  if (!requiresLoginRedirect(pathname)) return NextResponse.next()
   const token = req.cookies.get("access_token")?.value
   if (!token) {
     return NextResponse.redirect(new URL("/login", req.url))
@@ -512,20 +532,49 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  // api/ is excluded: unauthenticated API calls must get a JSON 401 from the
+  // BFF proxy / backend, never a 307 HTML redirect to /login. Only page
+  // navigations are guarded here. requiresLoginRedirect() repeats the /api
+  // exclusion defensively (the matcher can't be unit-tested; the helper can).
+  matcher: ["/((?!api/|_next/static|_next/image|favicon.ico).*)"],
 }
 ```
 
-- [ ] **3.7** Run tests:
+- [x] **3.7** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/auth.test.ts
 # Expected: 2 passed
 ```
 
-- [ ] **3.8** Commit:
+- [x] **3.8** Commit:
 ```
 feat(frontend): BFF auth — login/logout/me routes + middleware cookie guard
 ```
+
+### 3.R — Review fixes (post-/kb-review)
+
+Review found the Task 1 `rewrites()` proxy critically broken: Next rewrites
+forward cookies as-is, but FastAPI's `deps.py` uses `HTTPBearer` and only
+accepts `Authorization: Bearer`, so every browser call to `/api/v1/*` 401'd.
+Fix per the kb-frontend-graph BFF pattern (ADR-008):
+
+- [x] **3.R.1** Failing tests first — `frontend/tests/unit/proxy.test.ts`
+  (Authorization attached from `access_token` cookie, query string preserved,
+  no-cookie forwards without header, 204 passthrough, body/status/JSON
+  passthrough) and `frontend/tests/unit/routes.test.ts`
+  (`requiresLoginRedirect` excludes `/api/*`; middleware never 307s API calls).
+- [x] **3.R.2** Create `frontend/src/app/api/v1/[...path]/route.ts` — catch-all
+  GET/POST/PATCH/DELETE handler: reads the httpOnly `access_token` cookie,
+  forwards to `${API_BASE_URL}/api/v1/<path>?<query>` with
+  `Authorization: Bearer <token>`, passes through body/status/content-type.
+  No cookie → forward without header (backend 401s cleanly, JSON). Tokens
+  never reach client JS.
+- [x] **3.R.3** Remove `rewrites()` from `frontend/next.config.mjs` (Task 1.4
+  block updated in place).
+- [x] **3.R.4** Middleware: extract `requiresLoginRedirect` into
+  `frontend/src/lib/routes.ts`, exclude `api/` in the matcher (see 3.6 block).
+- [x] **3.R.5** Verify: `npx vitest run` (15 passed) and `npx tsc --noEmit`
+  clean. Commits: `fix(frontend): ...` below.
 
 ---
 
@@ -539,7 +588,7 @@ feat(frontend): BFF auth — login/logout/me routes + middleware cookie guard
 
 ### Steps
 
-- [ ] **4.1** Write the failing test:
+- [x] **4.1** Write the failing test:
 
 ```typescript
 // frontend/tests/unit/graphStyle.test.ts
@@ -562,7 +611,7 @@ describe("graphStyle", () => {
 })
 ```
 
-- [ ] **4.2** Create `graphStyle.ts`:
+- [x] **4.2** Create `graphStyle.ts`:
 
 ```typescript
 // frontend/src/lib/graphStyle.ts
@@ -600,7 +649,7 @@ export function edgeColor(label: string): string {
 }
 ```
 
-- [ ] **4.3** Create `graphStore.ts` (Zustand — graph UI state only):
+- [x] **4.3** Create `graphStore.ts` (Zustand — graph UI state only):
 
 ```typescript
 // frontend/src/lib/graphStore.ts
@@ -626,7 +675,7 @@ export const useGraphStore = create<GraphStore>((set) => ({
 }))
 ```
 
-- [ ] **4.4** Create `GraphCanvas.tsx` (Sigma.js v3 + FA2 web worker):
+- [x] **4.4** Create `GraphCanvas.tsx` (Sigma.js v3 + FA2 web worker):
 
 ```typescript
 // frontend/src/components/GraphCanvas.tsx
@@ -636,6 +685,7 @@ import { useEffect, useRef, useCallback } from "react"
 import Graph from "graphology"
 import { Sigma } from "sigma"
 import forceAtlas2 from "graphology-layout-forceatlas2"
+import FA2LayoutSupervisor from "graphology-layout-forceatlas2/worker"
 import { nodeColor, nodeSize, edgeColor } from "@/lib/graphStyle"
 import { useGraphStore } from "@/lib/graphStore"
 import type { GraphData } from "@/lib/types"
@@ -696,9 +746,17 @@ export default function GraphCanvas({ data, onNodeClick, className }: GraphCanva
     const g = buildGraph(data)
     graphRef.current = g
 
-    // ForceAtlas2 layout (synchronous for small graphs; move to worker for >500 nodes)
+    // [plan-fix] ForceAtlas2 runs in a web worker (kb-frontend-graph rule:
+    // never run layout on the main thread) — plan originally ran it synchronously.
+    // Start on build, stop after a bounded settle window, kill on cleanup.
+    let layout: FA2LayoutSupervisor | null = null
+    let layoutTimer: ReturnType<typeof setTimeout> | null = null
     if (g.order > 0) {
-      forceAtlas2.assign(g, { iterations: 50, settings: { gravity: 1, scalingRatio: 2 } })
+      layout = new FA2LayoutSupervisor(g, {
+        settings: { ...forceAtlas2.inferSettings(g), gravity: 1, scalingRatio: 2 },
+      })
+      layout.start()
+      layoutTimer = setTimeout(() => layout?.stop(), 3000)
     }
 
     // Dispose existing Sigma instance before creating a new one
@@ -719,6 +777,8 @@ export default function GraphCanvas({ data, onNodeClick, className }: GraphCanva
     sigma.on("leaveNode", () => setHoveredNode(null))
 
     return () => {
+      if (layoutTimer) clearTimeout(layoutTimer)
+      layout?.kill()
       sigma.kill()
       sigmaRef.current = null
     }
@@ -734,13 +794,13 @@ export default function GraphCanvas({ data, onNodeClick, className }: GraphCanva
 }
 ```
 
-- [ ] **4.5** Run tests:
+- [x] **4.5** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/graphStyle.test.ts
 # Expected: 4 passed
 ```
 
-- [ ] **4.6** Commit:
+- [x] **4.6** Commit:
 ```
 feat(frontend): graphStyle, graphStore (Zustand), GraphCanvas with Sigma.js v3 + FA2
 ```
@@ -751,6 +811,7 @@ feat(frontend): graphStyle, graphStore (Zustand), GraphCanvas with Sigma.js v3 +
 
 **Files:**
 - Create: `frontend/src/app/layout.tsx`
+- Create: `frontend/src/app/globals.css`
 - Create: `frontend/src/app/login/page.tsx`
 - Create: `frontend/src/app/graph/page.tsx`
 - Create: `frontend/src/app/nodes/[id]/page.tsx`
@@ -760,10 +821,12 @@ feat(frontend): graphStyle, graphStore (Zustand), GraphCanvas with Sigma.js v3 +
 - Create: `frontend/src/components/Providers.tsx`
 - Create: `frontend/src/components/Sidebar.tsx`
 - Create: `frontend/tests/unit/pages.test.tsx`
+- Modify: `frontend/vitest.config.ts` <!-- [plan-fix] include pattern was tests/unit/**/*.test.ts — added {ts,tsx} so pages.test.tsx is discovered -->
+- Modify: `frontend/.eslintrc.json`, `frontend/package.json` <!-- [plan-fix] see Task 1 step 1.7 note — @typescript-eslint plugin was missing, surfaced by this task's first `next build` -->
 
 ### Steps
 
-- [ ] **5.1** Write failing test:
+- [x] **5.1** Write failing test:
 
 ```typescript
 // frontend/tests/unit/pages.test.tsx
@@ -779,7 +842,7 @@ describe("page modules", () => {
 })
 ```
 
-- [ ] **5.2** Create root layout:
+- [x] **5.2** Create root layout:
 
 ```typescript
 // frontend/src/app/layout.tsx
@@ -806,7 +869,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 ```
 
-- [ ] **5.3** Create `globals.css`:
+- [x] **5.3** Create `globals.css`:
 ```css
 /* frontend/src/app/globals.css */
 @tailwind base;
@@ -814,7 +877,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 @tailwind utilities;
 ```
 
-- [ ] **5.4** Create Providers (TanStack Query):
+- [x] **5.4** Create Providers (TanStack Query):
 
 ```typescript
 // frontend/src/components/Providers.tsx
@@ -830,7 +893,7 @@ export default function Providers({ children }: { children: React.ReactNode }) {
 }
 ```
 
-- [ ] **5.5** Create Login page:
+- [x] **5.5** Create Login page:
 
 ```typescript
 // frontend/src/app/login/page.tsx
@@ -883,7 +946,7 @@ export default function LoginPage() {
 }
 ```
 
-- [ ] **5.6** Create Sidebar:
+- [x] **5.6** Create Sidebar:
 
 ```typescript
 // frontend/src/components/Sidebar.tsx
@@ -918,7 +981,7 @@ export default function Sidebar() {
 }
 ```
 
-- [ ] **5.7** Create Graph explorer page:
+- [x] **5.7** Create Graph explorer page:
 
 ```typescript
 // frontend/src/app/graph/page.tsx
@@ -960,19 +1023,18 @@ export default function GraphPage() {
 }
 ```
 
-- [ ] **5.8** Create Node detail page:
+- [x] **5.8** Create Node detail page:
 
 ```typescript
 // frontend/src/app/nodes/[id]/page.tsx
 "use client"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { useParams, useRouter } from "next/navigation"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Sidebar from "@/components/Sidebar"
 import { fetchNode, updateNode, deleteNode } from "@/lib/api"
-import dynamic from "next/dynamic"
-
-const GraphCanvas = dynamic(() => import("@/components/GraphCanvas"), { ssr: false })
+// [plan-fix] dropped unused dynamic GraphCanvas import — this page renders no
+// mini-graph yet; the unused variable fails lint
 
 export default function NodePage() {
   const { id } = useParams<{ id: string }>()
@@ -984,8 +1046,12 @@ export default function NodePage() {
   const { data: node, isLoading } = useQuery({
     queryKey: ["node", id],
     queryFn: () => fetchNode(id),
-    onSuccess: (n) => setBody(n.body),
   })
+
+  // [plan-fix] TanStack Query v5 removed useQuery onSuccess — sync via effect
+  useEffect(() => {
+    if (node) setBody(node.body)
+  }, [node])
 
   const update = useMutation({
     mutationFn: () => updateNode(id, { body }),
@@ -1034,7 +1100,7 @@ export default function NodePage() {
 }
 ```
 
-- [ ] **5.9** Create Search page:
+- [x] **5.9** Create Search page:
 
 ```typescript
 // frontend/src/app/search/page.tsx
@@ -1090,12 +1156,12 @@ export default function SearchPage() {
 }
 ```
 
-- [ ] **5.10** Create Daily Log page:
+- [x] **5.10** Create Daily Log page:
 
 ```typescript
 // frontend/src/app/daily/page.tsx
 "use client"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import Sidebar from "@/components/Sidebar"
 import { fetchDailyLog, upsertDailyLog } from "@/lib/api"
@@ -1113,8 +1179,12 @@ export default function DailyPage() {
   const { data: log } = useQuery({
     queryKey: ["daily-log", today],
     queryFn: () => fetchDailyLog(today).catch(() => null),
-    onSuccess: (d) => { if (d) setBody(d.body) },
   })
+
+  // [plan-fix] TanStack Query v5 removed useQuery onSuccess — sync via effect
+  useEffect(() => {
+    if (log) setBody(log.body)
+  }, [log])
 
   const save = useMutation({
     mutationFn: () => upsertDailyLog(today, body),
@@ -1144,7 +1214,7 @@ export default function DailyPage() {
 }
 ```
 
-- [ ] **5.11** Create Upload stub page:
+- [x] **5.11** Create Upload stub page:
 
 ```typescript
 // frontend/src/app/upload/page.tsx
@@ -1164,15 +1234,20 @@ export default function UploadPage() {
 }
 ```
 
-- [ ] **5.12** Run tests:
+- [x] **5.12** Run tests:
 ```bash
 cd frontend && npx vitest run tests/unit/pages.test.tsx
 # Expected: 1 passed
 npm run build
 # Expected: exit 0
 ```
+<!-- Verification note: in the CI sandbox the proxy returns 403 for
+fonts.googleapis.com, so next/font/google cannot fetch Inter there. Build was
+verified exit 0 (all 11 routes, lint clean) with the font import patched out
+locally in the sandbox working copy only; committed code keeps Inter as
+planned and builds on machines with normal network. -->
 
-- [ ] **5.13** Commit:
+- [x] **5.13** Commit:
 ```
 feat(frontend): layout, login, graph explorer, node detail, search, daily-log, upload stub pages
 ```
@@ -1189,7 +1264,7 @@ feat(frontend): layout, login, graph explorer, node detail, search, daily-log, u
 
 ### Steps
 
-- [ ] **6.1** Create Playwright config:
+- [x] **6.1** Create Playwright config:
 
 ```typescript
 // frontend/playwright.config.ts
@@ -1215,7 +1290,7 @@ export default defineConfig({
 })
 ```
 
-- [ ] **6.2** Auth e2e test:
+- [x] **6.2** Auth e2e test:
 
 ```typescript
 // frontend/tests/e2e/auth.spec.ts
@@ -1227,9 +1302,13 @@ test("unauthenticated user is redirected to /login", async ({ page }) => {
 })
 
 test("login with valid credentials navigates to graph", async ({ page }) => {
-  // Assumes seed admin exists (from Phase 0, Task 10)
+  // Assumes seed admin exists (from Phase 0, Task 10):
+  //   python -m app.scripts.seed_admin admin@example.com admin1234
+  // [plan-fix] plan used admin@kb.local, but the backend's EmailStr
+  // (email-validator >= 2) rejects .local as a special-use reserved
+  // domain — login would 422 before ever checking the password.
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "admin1234")
   await page.click('button[type="submit"]')
   await expect(page).toHaveURL(/\/graph/, { timeout: 10_000 })
@@ -1237,29 +1316,34 @@ test("login with valid credentials navigates to graph", async ({ page }) => {
 
 test("login with wrong password shows error", async ({ page }) => {
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "wrongpassword")
   await page.click('button[type="submit"]')
   await expect(page.locator("text=Invalid credentials")).toBeVisible()
 })
 ```
 
-- [ ] **6.3** Graph e2e test:
+- [x] **6.3** Graph e2e test:
 
 ```typescript
 // frontend/tests/e2e/graph.spec.ts
 import { test, expect } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
-  // Log in first
+  // Log in first ([plan-fix] admin@example.com — see auth.spec.ts)
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "admin1234")
   await page.click('button[type="submit"]')
   await page.waitForURL(/\/graph/)
 })
 
 test("graph page renders canvas element", async ({ page }) => {
+  // [plan-fix] requires a live Neo4j: /api/v1/graph/overview 503s without it
+  // and the page shows its error state instead of the canvas. Set
+  // E2E_SKIP_NEO4J=1 to skip in Neo4j-less environments (sandbox); runs by
+  // default on the Docker stack.
+  test.skip(process.env.E2E_SKIP_NEO4J === "1", "requires Neo4j (graph overview 503s)")
   await expect(page.locator("canvas")).toBeVisible({ timeout: 10_000 })
 })
 
@@ -1269,15 +1353,16 @@ test("graph page shows sidebar links", async ({ page }) => {
 })
 ```
 
-- [ ] **6.4** Search e2e test:
+- [x] **6.4** Search e2e test:
 
 ```typescript
 // frontend/tests/e2e/search.spec.ts
 import { test, expect } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
+  // [plan-fix] admin@example.com — see auth.spec.ts
   await page.goto("/login")
-  await page.fill('input[type="email"]', "admin@kb.local")
+  await page.fill('input[type="email"]', "admin@example.com")
   await page.fill('input[type="password"]', "admin1234")
   await page.click('button[type="submit"]')
   await page.waitForURL(/\/graph/)
@@ -1293,21 +1378,32 @@ test("search returns results or empty list", async ({ page }) => {
   await page.goto("/search")
   await page.fill('input[placeholder*="Search"]', "knowledge")
   await page.click('button[type="submit"]')
-  // Either results appear or no error is shown
-  await expect(page.locator("text=Searching…").or(page.locator("ul"))).toBeVisible({ timeout: 10_000 })
+  // Either results appear or no error is shown. [plan-fix] .first(): both the
+  // transient "Searching…" state and the <ul> can be visible at once, which
+  // trips Playwright's strict mode on an .or() locator.
+  await expect(
+    page.locator("text=Searching…").or(page.locator("ul")).first()
+  ).toBeVisible({ timeout: 10_000 })
 })
 ```
 
-- [ ] **6.5** Run e2e tests (requires running stack):
+- [x] **6.5** Run e2e tests (requires running stack):
 ```bash
 cd frontend
 npx playwright install chromium
 # Start the stack first: cd .. && make up api
 npx playwright test
 # Expected: 3+ passed
+# Sandbox run 2026-07-24 (real output): backend `EMBEDDING_BACKEND=fake uvicorn
+# app.main:app --port 8000` + `npx next start -p 3000` + seeded admin:
+#   E2E_SKIP_NEO4J=1 npx playwright test --reporter=line
+#   -> 6 passed, 1 skipped (canvas test needs Neo4j)
+# On the Docker stack run WITHOUT E2E_SKIP_NEO4J: expect 7 passed.
+# Note: e2e backend must run with EMBEDDING_BACKEND=fake (or a real model
+# installed) or /api/v1/search 500s trying to load sentence-transformers.
 ```
 
-- [ ] **6.6** Run final checks:
+- [x] **6.6** Run final checks:
 ```bash
 cd frontend
 npm run lint    # ESLint + tsc --noEmit
@@ -1315,7 +1411,7 @@ npm run build   # Next.js production build
 npx vitest run  # Unit tests
 ```
 
-- [ ] **6.7** Commit:
+- [x] **6.7** Commit:
 ```
 feat(frontend): Playwright e2e tests — auth, graph, search
 ```
@@ -1338,3 +1434,16 @@ npx playwright test     # e2e tests pass
 ```
 
 Update `docs/plans/README.md` — Phase 3 Status → `Done`.
+
+---
+
+## Blockers
+
+- **No `/api/auth/refresh` BFF route in this phase** — Task 3.3 scopes the
+  `refresh_token` cookie to `path: "/api/auth/refresh"`, but no task in
+  Phase 3 (or any later phase plan) creates that Next.js route handler; only
+  the backend `/api/v1/auth/refresh` endpoint exists (Phase 0, exercised again
+  in Phase 7 tests). Consequence: when the 15-min access token expires, the
+  session dies until re-login. Deferred to **Phase 7 hardening**: add the BFF
+  refresh route (read refresh cookie → call backend refresh → rotate both
+  cookies) and have the proxy retry-on-401 or the client redirect on 401.
