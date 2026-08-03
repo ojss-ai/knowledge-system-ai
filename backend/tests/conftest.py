@@ -29,12 +29,16 @@ def _neo4j_available() -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _fake_embedding_backend(monkeypatch):
+def _fake_ai_backends(monkeypatch):
     """[plan-fix, Task 8.1]: the API search path calls get_embedder(), which reads
     settings.embedding_backend at call time; the default would lazy-load the real
     sentence-transformers model inside unit tests (kb-tdd-workflow: real model is
-    integration-only). Force the fake backend for every test."""
+    integration-only). Force the fake backend for every test.
+
+    [1.R] Same for the LLM: the /ask path calls get_llm() at request time; the
+    default would hit a live Ollama server. Force FakeLLM for every test."""
     monkeypatch.setattr(settings, "embedding_backend", "fake")
+    monkeypatch.setattr(settings, "llm_backend", "fake")
 
 
 @pytest.fixture

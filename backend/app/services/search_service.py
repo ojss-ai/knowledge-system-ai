@@ -29,15 +29,19 @@ async def hybrid_search(
     *,
     limit: int = _DEFAULT_LIMIT,
     offset: int = 0,
-    fake_embedder: Embedder | None = None,
+    embedder_override: Embedder | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """
     Hybrid RRF search: FTS leg + vector leg fused with Reciprocal Rank Fusion.
     Returns (results, total_count).
 
     score = Σ 1 / (k + rank_i)   where k=60
+
+    embedder_override injects an already-constructed Embedder — a production
+    path (rag_service passes its embedder through), not a test-only hook.
+    Defaults to get_embedder().
     """
-    embedder = fake_embedder or get_embedder()
+    embedder = embedder_override or get_embedder()
     query_vec = embedder.embed([query])[0]
 
     # Build visibility predicate as a subquery node_id list

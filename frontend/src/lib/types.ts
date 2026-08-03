@@ -40,6 +40,14 @@ export interface SearchOut {
   query: string
 }
 
+export interface AdminStats {
+  total_users: number
+  active_users: number
+  total_nodes: number
+  total_chunks: number
+  total_audit_events: number
+}
+
 export interface GraphData {
   // [plan-fix] visibility is optional — GET /graph/overview omits it
   // (graph_service.get_overview returns only id/title/node_type);

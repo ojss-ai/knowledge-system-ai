@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     jwt_refresh_ttl_seconds: int = 604800
     embedding_backend: str = "sentence_transformers"  # fake | sentence_transformers | ollama
     embedding_model: str = "sentence-transformers/all-MiniLM-L12-v2"
+    llm_backend: str = "ollama"  # fake | ollama | openai
+    llm_allow_external: bool = False
+    ollama_model: str = "llama3"
+    ollama_base_url: str = "http://localhost:11434"
+    openai_model: str = "gpt-4o-mini"
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"

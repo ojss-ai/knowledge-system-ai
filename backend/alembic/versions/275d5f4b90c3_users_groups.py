@@ -82,4 +82,10 @@ def downgrade() -> None:
     op.drop_table("groups")
     op.drop_index(op.f("ix_users_email"), table_name="users")
     op.drop_table("users")
+    # drop_table does not drop the enum TYPEs this migration created —
+    # without these, `alembic downgrade base && alembic upgrade head`
+    # fails with DuplicateObject on CREATE TYPE (found by /kb-verify 8.4).
+    sa.Enum(name="group_role").drop(op.get_bind(), checkfirst=True)
+    sa.Enum(name="visibility").drop(op.get_bind(), checkfirst=True)
+    sa.Enum(name="role").drop(op.get_bind(), checkfirst=True)
     # ### end Alembic commands ###

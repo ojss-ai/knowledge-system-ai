@@ -1,3 +1,5 @@
+import uuid
+
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from sqlalchemy import select
@@ -20,6 +22,14 @@ async def register(
     )
     db.add(user)
     await db.flush()
+    return user
+
+
+async def get_active_user(db: AsyncSession, user_id: uuid.UUID) -> User | None:
+    """Fetch a user by id iff active — used by token refresh (ADR-008)."""
+    user: User | None = await db.scalar(
+        select(User).where(User.id == user_id, User.is_active.is_(True))
+    )
     return user
 
 
