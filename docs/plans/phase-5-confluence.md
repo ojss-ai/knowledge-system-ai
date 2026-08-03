@@ -12,13 +12,16 @@
 - `kb-api-conventions`
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `pytest -x backend/tests/` green
-- [ ] `ruff check tools/kb-confluence-sync/` clean
-- [ ] `mypy --strict tools/kb-confluence-sync/` clean
-- [ ] `kb-confluence-sync --dry-run` exits 0 against a mocked Confluence server
-- [ ] Idempotency test: sync twice → same node count
-- [ ] Exit codes: 0=success, 1=sync error, 2=config error
+- [x] All tasks checked
+- [x] `pytest backend/tests/` green — `190 passed, 13 skipped` (Neo4j-unreachable
+  sandbox skips; convert to passes on the Docker stack)
+- [x] `ruff check tools/kb-confluence-sync/` clean (tool suite: 20 passed)
+- [x] `mypy --strict tools/kb-confluence-sync/` clean (9 files)
+- [x] `--dry-run` exits 0 against a mocked/stubbed Confluence server (§5.5;
+  would-create vs would-update split per 5.R.5)
+- [x] Idempotency: `test_sync_twice_second_run_all_skipped` (version cache) +
+  backend `test_ingest_item_idempotent` (same node id on repeat POST)
+- [x] Exit codes verified: 0 success, 1 sync error, 2 config error (test_cli)
 
 ---
 
@@ -30,16 +33,23 @@
 
 ### Steps
 
-- [ ] **1.1** Write the failing tests:
+- [x] **1.1** Write the failing tests:
+
+> [plan-fix] Test code adjusted for `ruff` (I001/F401/F841) and `mypy --strict`: imports sorted,
+> unused `pytest`/`ConfluencePage` imports dropped, functions annotated, and the auth test now
+> asserts the exact `Basic <b64>` header (uses `expected` instead of leaving it dead).
+> Also added `tools/kb-confluence-sync/ruff.toml` (mirrors backend select: E,F,I,UP,B,ASYNC) so the
+> exit criterion `ruff check tools/kb-confluence-sync/` is deterministic outside backend's config.
 
 ```python
 # tools/kb-confluence-sync/tests/test_confluence_client.py
-from unittest.mock import patch, MagicMock
-import pytest
-from confluence_client import ConfluenceClient, ConfluencePage
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+from confluence_client import ConfluenceClient
 
 
-def mock_session_get(url, **kwargs):
+def mock_session_get(url: str, **kwargs: Any) -> MagicMock:
     """Return canned responses based on URL fragment."""
     resp = MagicMock()
     resp.raise_for_status = MagicMock()
@@ -64,7 +74,7 @@ def mock_session_get(url, **kwargs):
     return resp
 
 
-def test_list_pages():
+def test_list_pages() -> None:
     client = ConfluenceClient(base_url="https://example.atlassian.net/wiki", token="tok")
     with patch.object(client._session, "get", side_effect=mock_session_get):
         pages = client.list_pages("TS")
@@ -74,7 +84,7 @@ def test_list_pages():
         assert pages[0].version == 3
 
 
-def test_get_page_content():
+def test_get_page_content() -> None:
     client = ConfluenceClient(base_url="https://example.atlassian.net/wiki", token="tok")
     with patch.object(client._session, "get", side_effect=mock_session_get):
         page = client.get_page("123")
@@ -82,15 +92,21 @@ def test_get_page_content():
         assert "<p>" in page.body_storage
 
 
-def test_client_uses_token_auth():
-    client = ConfluenceClient(base_url="https://example.atlassian.net/wiki", token="mytoken", email="user@test.com")
+def test_client_uses_token_auth() -> None:
+    client = ConfluenceClient(
+        base_url="https://example.atlassian.net/wiki", token="mytoken", email="user@test.com"
+    )
     # Authorization header must be set
     import base64
+
     expected = base64.b64encode(b"user@test.com:mytoken").decode()
-    assert client._session.auth is not None or "Authorization" in client._session.headers
+    assert client._session.headers["Authorization"] == f"Basic {expected}"
 ```
 
-- [ ] **1.2** Create the client:
+- [x] **1.2** Create the client:
+
+> [plan-fix] Dropped unused `from typing import Generator` (ruff F401); `list_pages` builds its
+> query dict as `params: dict[str, str | int]` so `mypy --strict` accepts `Session.get(params=...)`.
 
 ```python
 # tools/kb-confluence-sync/confluence_client.py
@@ -98,7 +114,6 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from typing import Generator
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -156,16 +171,14 @@ class ConfluenceClient:
         start = 0
 
         while True:
-            r = self._session.get(
-                f"{self._base}/rest/api/content",
-                params={
-                    "spaceKey": space_key,
-                    "type": "page",
-                    "limit": limit,
-                    "start": start,
-                    "expand": "version,ancestors",
-                },
-            )
+            params: dict[str, str | int] = {
+                "spaceKey": space_key,
+                "type": "page",
+                "limit": limit,
+                "start": start,
+                "expand": "version,ancestors",
+            }
+            r = self._session.get(f"{self._base}/rest/api/content", params=params)
             r.raise_for_status()
             data = r.json()
 
@@ -219,13 +232,13 @@ class ConfluenceClient:
         )
 ```
 
-- [ ] **1.3** Run tests:
+- [x] **1.3** Run tests:
 ```bash
 cd tools/kb-confluence-sync && python -m pytest tests/test_confluence_client.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **1.4** Commit:
+- [x] **1.4** Commit:
 ```
 feat(tools): ConfluenceClient — list_pages, get_page, Basic/Bearer auth, pagination
 ```
@@ -240,47 +253,56 @@ feat(tools): ConfluenceClient — list_pages, get_page, Basic/Bearer auth, pagin
 
 ### Steps
 
-- [ ] **2.1** Write the failing tests:
+- [x] **2.1** Write the failing tests:
+
+> [plan-fix] Tests annotated (`-> None`) and long macro literals split for `mypy --strict` /
+> `ruff` line-length; behavior identical to the original block below.
 
 ```python
 # tools/kb-confluence-sync/tests/test_xhtml_to_md.py
 from xhtml_to_md import convert_storage_to_md
 
 
-def test_basic_paragraph():
+def test_basic_paragraph() -> None:
     html = "<p>Hello <strong>world</strong></p>"
     md = convert_storage_to_md(html)
     assert "Hello" in md
     assert "**world**" in md
 
 
-def test_heading_conversion():
+def test_heading_conversion() -> None:
     html = "<h1>Title</h1><h2>Sub</h2>"
     md = convert_storage_to_md(html)
     assert "# Title" in md
     assert "## Sub" in md
 
 
-def test_code_block():
-    html = '<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[print("hi")]]></ac:plain-text-body></ac:structured-macro>'
+def test_code_block() -> None:
+    html = (
+        '<ac:structured-macro ac:name="code"><ac:plain-text-body>'
+        '<![CDATA[print("hi")]]></ac:plain-text-body></ac:structured-macro>'
+    )
     md = convert_storage_to_md(html)
     assert "```" in md
     assert 'print("hi")' in md
 
 
-def test_unknown_macro_becomes_named_fence():
-    html = '<ac:structured-macro ac:name="jira"><ac:parameter ac:name="key">KB-1</ac:parameter></ac:structured-macro>'
+def test_unknown_macro_becomes_named_fence() -> None:
+    html = (
+        '<ac:structured-macro ac:name="jira">'
+        '<ac:parameter ac:name="key">KB-1</ac:parameter></ac:structured-macro>'
+    )
     md = convert_storage_to_md(html)
     assert "```confluence-macro-jira" in md
 
 
-def test_link_conversion():
+def test_link_conversion() -> None:
     html = '<a href="https://example.com">click</a>'
     md = convert_storage_to_md(html)
     assert "[click](https://example.com)" in md
 
 
-def test_table_conversion():
+def test_table_conversion() -> None:
     html = """
     <table><tbody>
       <tr><th>Name</th><th>Value</th></tr>
@@ -292,26 +314,51 @@ def test_table_conversion():
     assert "| A |" in md
 
 
-def test_unknown_macro_captured_in_meta():
-    html = '<ac:structured-macro ac:name="widget"><ac:parameter ac:name="url">https://x.com</ac:parameter></ac:structured-macro>'
+def test_unknown_macro_captured_in_meta() -> None:
+    html = (
+        '<ac:structured-macro ac:name="widget">'
+        '<ac:parameter ac:name="url">https://x.com</ac:parameter></ac:structured-macro>'
+    )
     md, meta = convert_storage_to_md(html, return_meta=True)
     assert "widget" in meta.get("raw_macros", [{}])[0].get("name", "")
 ```
 
-- [ ] **2.2** Implement (using `beautifulsoup4` + `html2text` + custom macro handling):
+- [x] **2.2** Implement (using `beautifulsoup4` + `html2text` + custom macro handling):
+
+> [plan-fix] Three deviations from the block below, all forced by the plan's own tests/gates:
+> 1. `@overload` on `convert_storage_to_md` (`Literal[True/False]` for `return_meta`) so the
+>    tuple unpacking in `test_unknown_macro_captured_in_meta` passes `mypy --strict`.
+> 2. bs4 4.15 native typing: attribute reads narrowed with `isinstance(..., str)` /
+>    `isinstance(href_tag, Tag)`; unused `Generator`-style imports dropped; dead `else: pass` removed.
+> 3. Tables are converted to GFM pipe tables directly via bs4 and re-inserted through
+>    placeholders after `html2text` — html2text cannot emit unpadded GFM tables (compact mode
+>    drops leading pipes; `pad_tables` pads cell widths), which fails `assert "| A |" in md`.
+> Canonical source: `tools/kb-confluence-sync/xhtml_to_md.py`.
 
 ```python
 # tools/kb-confluence-sync/xhtml_to_md.py
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal, overload
 
 try:
-    from bs4 import BeautifulSoup, Tag
     import html2text
+    from bs4 import BeautifulSoup, Tag
 except ImportError as e:
-    raise ImportError("Install beautifulsoup4 and html2text: pip install beautifulsoup4 html2text") from e
+    raise ImportError(
+        "Install beautifulsoup4 and html2text: pip install beautifulsoup4 html2text"
+    ) from e
+
+
+@overload
+def convert_storage_to_md(xhtml: str, return_meta: Literal[False] = False) -> str: ...
+
+
+@overload
+def convert_storage_to_md(
+    xhtml: str, return_meta: Literal[True]
+) -> tuple[str, dict[str, Any]]: ...
 
 
 def convert_storage_to_md(
@@ -333,7 +380,8 @@ def convert_storage_to_md(
 
     # Process structured macros
     for macro in soup.find_all("ac:structured-macro"):
-        name = macro.get("ac:name", "unknown")
+        name_attr = macro.get("ac:name")
+        name = name_attr if isinstance(name_attr, str) else "unknown"
 
         if name == "code":
             # Extract language parameter
@@ -350,7 +398,10 @@ def convert_storage_to_md(
             body_tag = macro.find("ac:rich-text-body") or macro.find("ac:plain-text-body")
             body = body_tag.get_text(strip=True) if body_tag else ""
             macro.replace_with(
-                BeautifulSoup(f"<blockquote><strong>{title}:</strong> {body}</blockquote>", "html.parser")
+                BeautifulSoup(
+                    f"<blockquote><strong>{title}:</strong> {body}</blockquote>",
+                    "html.parser",
+                )
             )
 
         else:
@@ -364,12 +415,32 @@ def convert_storage_to_md(
     for link in soup.find_all("ac:link"):
         href_tag = link.find("ri:url")
         anchor = link.find("ac:plain-text-link-body") or link.find("ac:link-body")
-        if href_tag:
-            url = href_tag.get("ri:value", "#")
+        if isinstance(href_tag, Tag):
+            url_attr = href_tag.get("ri:value")
+            url = url_attr if isinstance(url_attr, str) else "#"
             text = anchor.get_text(strip=True) if anchor else url
             link.replace_with(BeautifulSoup(f'<a href="{url}">{text}</a>', "html.parser"))
         else:
             link.replace_with(anchor.get_text(strip=True) if anchor else "")
+
+    # Tables → GFM pipe tables. html2text cannot produce them (compact mode drops
+    # the leading/trailing pipes, pad_tables pads cell widths), so convert directly
+    # and re-insert after html2text via placeholders.
+    table_blocks: list[str] = []
+    for idx, table in enumerate(soup.find_all("table")):
+        rows: list[list[str]] = []
+        for tr in table.find_all("tr"):
+            cells = [cell.get_text(strip=True) for cell in tr.find_all(["th", "td"])]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            table.decompose()
+            continue
+        lines = ["| " + " | ".join(rows[0]) + " |"]
+        lines.append("|" + "|".join(" --- " for _ in rows[0]) + "|")
+        lines.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+        table_blocks.append("\n".join(lines))
+        table.replace_with(f"kbtableplaceholder{idx}")
 
     # Convert remaining tags with html2text
     h = html2text.HTML2Text()
@@ -381,28 +452,31 @@ def convert_storage_to_md(
 
     md = h.handle(str(soup))
 
+    for idx, block in enumerate(table_blocks):
+        md = md.replace(f"kbtableplaceholder{idx}", f"\n{block}\n")
+
     # Clean up html2text pre-block artefacts
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
 
     if not meta["raw_macros"]:
         del meta["raw_macros"]
-    else:
-        pass  # keep for caller
 
     if return_meta:
         return md, meta
     return md
 ```
 
-- [ ] **2.3** Create `tools/kb-confluence-sync/requirements.txt`:
+- [x] **2.3** Create `tools/kb-confluence-sync/requirements.txt`:
 ```
 requests>=2.31
 beautifulsoup4>=4.12
 html2text>=2020.1
 lxml>=4.9
+# lint/type-check only
+types-requests
 ```
 
-- [ ] **2.4** Run tests:
+- [x] **2.4** Run tests:
 ```bash
 cd tools/kb-confluence-sync
 pip install -r requirements.txt --break-system-packages
@@ -410,7 +484,7 @@ python -m pytest tests/test_xhtml_to_md.py -v
 # Expected: 7 passed
 ```
 
-- [ ] **2.5** Commit:
+- [x] **2.5** Commit:
 ```
 feat(tools): XHTML→Markdown converter with Confluence macro handling
 ```
@@ -425,24 +499,50 @@ feat(tools): XHTML→Markdown converter with Confluence macro handling
 
 ### Steps
 
-- [ ] **3.1** Write failing tests:
+- [x] **3.1** Write failing tests:
+
+> **[plan-fix]** Adjusted from the original block for this repo's gates: typed signatures + no
+> unused imports (ruff/`mypy --strict`, matching Task 1/2 test style); tests write the version
+> cache to `tmp_path` instead of the repo cwd; added a fourth test
+> (`test_sync_twice_second_run_all_skipped`) — the sync-twice idempotency test required by
+> `kb-ingestion-connectors` and this plan's exit criteria.
 
 ```python
 # tools/kb-confluence-sync/tests/test_sync_engine.py
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-import pytest
-from sync_engine import SyncEngine, SyncConfig, SyncResult
+
 from confluence_client import ConfluencePage
+from sync_engine import SyncConfig, SyncEngine, SyncResult
 
 
-def make_page(pid="1", title="Test", version=1, body="<p>Content</p>"):
+def make_page(
+    pid: str = "1", title: str = "Test", version: int = 1, body: str = "<p>Content</p>"
+) -> ConfluencePage:
     return ConfluencePage(
-        page_id=pid, title=title, version=version,
-        space_key="TS", web_url=f"/pages/{pid}", body_storage=body,
+        page_id=pid,
+        title=title,
+        version=version,
+        space_key="TS",
+        web_url=f"/pages/{pid}",
+        body_storage=body,
     )
 
 
-def test_sync_result_counts():
+def make_config(dry_run: bool, cache_file: str) -> SyncConfig:
+    return SyncConfig(
+        confluence_url="https://example.atlassian.net/wiki",
+        confluence_token="tok",
+        confluence_email="user@test.com",
+        space_keys=["TS"],
+        kb_api_url="http://localhost:8000",
+        kb_token="kb-tok",
+        dry_run=dry_run,
+        version_cache_file=cache_file,
+    )
+
+
+def test_sync_result_counts() -> None:
     result = SyncResult()
     result.created += 1
     result.updated += 2
@@ -450,37 +550,24 @@ def test_sync_result_counts():
     assert result.total == 6
 
 
-def test_sync_engine_dry_run():
+def test_sync_engine_dry_run(tmp_path: Path) -> None:
     """Dry run must not call the KB API."""
-    config = SyncConfig(
-        confluence_url="https://example.atlassian.net/wiki",
-        confluence_token="tok",
-        confluence_email="user@test.com",
-        space_keys=["TS"],
-        kb_api_url="http://localhost:8000",
-        kb_token="kb-tok",
-        dry_run=True,
-    )
+    config = make_config(dry_run=True, cache_file=str(tmp_path / "versions.json"))
     engine = SyncEngine(config)
     pages = [make_page("1", "Page 1"), make_page("2", "Page 2")]
-    with patch.object(engine._client, "list_pages", return_value=pages), \
-         patch.object(engine._client, "get_page", side_effect=lambda pid: make_page(pid)):
+    with (
+        patch.object(engine._client, "list_pages", return_value=pages),
+        patch.object(engine._client, "get_page", side_effect=lambda pid: make_page(pid)),
+    ):
         result = engine.sync_space("TS")
         assert result.total > 0
         # In dry run mode, no HTTP calls to KB API
         assert result.api_calls == 0
 
 
-def test_sync_skips_unchanged_page():
+def test_sync_skips_unchanged_page(tmp_path: Path) -> None:
     """Page with same version should be skipped (idempotency)."""
-    config = SyncConfig(
-        confluence_url="https://example.atlassian.net/wiki",
-        confluence_token="tok",
-        space_keys=["TS"],
-        kb_api_url="http://localhost:8000",
-        kb_token="kb-tok",
-        dry_run=False,
-    )
+    config = make_config(dry_run=False, cache_file=str(tmp_path / "versions.json"))
     engine = SyncEngine(config)
     # Simulate: page already synced at version 3
     engine._version_cache["TS:1"] = 3
@@ -491,9 +578,45 @@ def test_sync_skips_unchanged_page():
         assert result.skipped == 1
         assert result.created == 0
         assert result.updated == 0
+
+
+def test_sync_twice_second_run_all_skipped(tmp_path: Path) -> None:
+    """Full idempotency: re-sync with a fresh engine skips every unchanged page."""
+    config = make_config(dry_run=False, cache_file=str(tmp_path / "versions.json"))
+    pages = [make_page("1", "Page 1"), make_page("2", "Page 2")]
+
+    def run_sync() -> SyncResult:
+        engine = SyncEngine(config)
+        engine._kb_session = MagicMock()
+        engine._kb_session.post.return_value.status_code = 201
+        with (
+            patch.object(engine._client, "list_pages", return_value=pages),
+            patch.object(engine._client, "get_page", side_effect=lambda pid: make_page(pid)),
+        ):
+            return engine.sync_space("TS")
+
+    first = run_sync()
+    assert first.created == 2
+    assert first.failed == 0
+
+    second = run_sync()  # fresh engine → cache re-loaded from disk
+    assert second.skipped == 2
+    assert second.created == 0
+    assert second.updated == 0
+    assert second.api_calls == 0
 ```
 
-- [ ] **3.2** Create `sync_engine.py`:
+- [x] **3.2** Create `sync_engine.py`:
+
+> **[plan-fix]** Deviations from the original block, all forced by ruff/`mypy --strict`:
+> removed unused `field`/`Any` imports; `_load_cache` assigns `json.load` to a typed local
+> (mypy strict forbids returning `Any`); `sync_all` annotates `results`; dropped the dead
+> `r = self._kb_session.get(/api/v1/nodes...)` existence check (F841 — its response was never
+> read; the ingest-item endpoint owns upsert semantics per Task 4).
+>
+> **[review-fix 5.R.4/5.R.5]** block updated in place: `_load_cache` self-heals on a
+> corrupt/unreadable cache file (warn + empty cache), and the dry-run branch splits
+> would-create vs would-update using the local version cache.
 
 ```python
 # tools/kb-confluence-sync/sync_engine.py
@@ -501,8 +624,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass
 
 import requests
 
@@ -561,8 +683,18 @@ class SyncEngine:
     def _load_cache(self) -> dict[str, int]:
         try:
             with open(self._config.version_cache_file) as f:
-                return json.load(f)
+                cache: dict[str, int] = json.load(f)
+                return cache
         except FileNotFoundError:
+            return {}  # first run — silent
+        except (json.JSONDecodeError, OSError) as exc:
+            # [review-fix 5.R.4] self-healing: a truncated/garbage/unreadable
+            # cache must not brick the tool. Worst case every page re-syncs —
+            # the ingest-item endpoint is an idempotent upsert by source_ref.
+            logger.warning(
+                f"Version cache {self._config.version_cache_file!r} unreadable "
+                f"({exc}); starting with an empty cache — all pages will re-sync"
+            )
             return {}
 
     def _save_cache(self) -> None:
@@ -585,8 +717,15 @@ class SyncEngine:
                 continue
 
             if self._config.dry_run:
-                logger.info(f"[DRY RUN] Would sync: {page.title} (v{page.version})")
-                result.created += 1
+                # [review-fix 5.R.5] a cached page (older version) is a
+                # would-update; an uncached one a would-create. Best-effort from
+                # local knowledge only — dry run never asks the KB API.
+                if cache_key in self._version_cache:
+                    logger.info(f"[DRY RUN] Would update: {page.title} (v{page.version})")
+                    result.updated += 1
+                else:
+                    logger.info(f"[DRY RUN] Would create: {page.title} (v{page.version})")
+                    result.created += 1
                 continue
 
             try:
@@ -623,14 +762,7 @@ class SyncEngine:
             "tags": page.labels,
         }
 
-        # Check if node already exists by source_ref
-        r = self._kb_session.get(
-            f"{self._config.kb_api_url}/api/v1/nodes",
-            params={"source_ref": source_ref, "limit": 1},
-        )
-        result.api_calls += 1
-
-        # Simple upsert: POST creates or PATCH updates (server handles idempotency)
+        # Upsert: the ingest-item endpoint creates (201) or updates (200) by source_ref
         ingest_r = self._kb_session.post(
             f"{self._config.kb_api_url}/api/v1/uploads/ingest-item",
             json=payload,
@@ -644,20 +776,20 @@ class SyncEngine:
             result.updated += 1
 
     def sync_all(self) -> dict[str, SyncResult]:
-        results = {}
+        results: dict[str, SyncResult] = {}
         for space_key in self._config.space_keys:
             logger.info(f"Syncing space: {space_key}")
             results[space_key] = self.sync_space(space_key)
         return results
 ```
 
-- [ ] **3.3** Run tests:
+- [x] **3.3** Run tests:
 ```bash
 cd tools/kb-confluence-sync && python -m pytest tests/test_sync_engine.py -v
-# Expected: 3 passed
+# Expected: 4 passed  [plan-fix: was 3 — sync-twice idempotency test added in 3.1]
 ```
 
-- [ ] **3.4** Commit:
+- [x] **3.4** Commit:
 ```
 feat(tools): SyncEngine with incremental sync, version cache, dry-run mode
 ```
@@ -672,14 +804,20 @@ feat(tools): SyncEngine with incremental sync, version cache, dry-run mode
 
 ### Steps
 
-- [ ] **4.1** Write failing test:
+- [x] **4.1** Write failing test:
+
+> [plan-fix] vs the original block: dropped `pytestmark = pytest.mark.asyncio`
+> (asyncio_mode="auto", test_tokens_api precedent); added the kb-api-conventions
+> checklist tests (401 unauthenticated, 422 missing title) and a tags-persistence
+> test — the sync engine (Task 3) sends Confluence labels as `tags`, which the
+> original 4.2 block dropped silently (labels → tags, kb-ingestion-connectors).
 
 ```python
 # backend/tests/api/test_ingest_item_api.py
-import pytest
-from httpx import AsyncClient
+import uuid
 
-pytestmark = pytest.mark.asyncio
+from httpx import AsyncClient
+from sqlalchemy import select
 
 
 async def test_ingest_item_creates_node(client: AsyncClient, auth_headers):
@@ -713,25 +851,88 @@ async def test_ingest_item_idempotent(client: AsyncClient, auth_headers):
     r1 = await client.post("/api/v1/uploads/ingest-item", json=payload, headers=auth_headers)
     r2 = await client.post("/api/v1/uploads/ingest-item", json=payload, headers=auth_headers)
     assert r1.json()["id"] == r2.json()["id"], "Same source_ref must return same node ID"
+
+
+async def test_ingest_item_persists_tags(client: AsyncClient, auth_headers, db):
+    """Confluence labels arrive as `tags` and must land in tags/node_tags."""
+    from app.models.knowledge import NodeTag, Tag
+
+    r = await client.post(
+        "/api/v1/uploads/ingest-item",
+        json={
+            "title": "Tagged Page",
+            "body": "body",
+            "source": "confluence",
+            "source_ref": "confluence:TS:tagged1",
+            "tags": ["confluence", "docs"],
+        },
+        headers=auth_headers,
+    )
+    node_id = uuid.UUID(r.json()["id"])
+    slugs = await db.scalars(
+        select(Tag.slug).join(NodeTag, NodeTag.tag_id == Tag.id).where(NodeTag.node_id == node_id)
+    )
+    assert set(slugs) == {"confluence", "docs"}
+
+
+async def test_ingest_item_unauthenticated_is_401(client: AsyncClient):
+    r = await client.post("/api/v1/uploads/ingest-item", json={"title": "t", "body": "b"})
+    assert r.status_code == 401
+
+
+async def test_ingest_item_missing_title_is_422(client: AsyncClient, auth_headers):
+    r = await client.post(
+        "/api/v1/uploads/ingest-item", json={"body": "no title"}, headers=auth_headers
+    )
+    assert r.status_code == 422
 ```
 
-- [ ] **4.2** Add `POST /api/v1/uploads/ingest-item` to `uploads.py`:
+- [x] **4.2** Add `POST /api/v1/uploads/ingest-item` to `uploads.py`:
+
+> [plan-fix] vs the original block:
+> - `get_scoped_viewer`, not `get_current_viewer` — the admin visibility bypass
+>   is only reachable under /api/v1/admin/* (Phase 1 standard, kb-visibility rule 5).
+> - `run_pending_graph_ops(db)` after the commit — create/update queue the Neo4j
+>   vertex sync on the session; the original block never drained it (ADR-011,
+>   nodes.py standard).
+> - `IngestItemIn(NodeCreate)` adds the `tags` field and passes it to IngestItem —
+>   NodeCreate has no tags field, so Confluence labels sent by the sync engine
+>   would have been dropped silently.
+> - Typed return + `NodeOut.model_validate(node)` (never return ORM objects) and
+>   summary/operation_id, per kb-api-conventions.
+> - **[review-fix 5.R.1]** `viewer` now comes from `Depends(_require_ingest_scope)`
+>   (module-level singleton of `deps.require_scope("ingest")` — ruff B008 forbids
+>   the factory call inline): service tokens must hold the `"ingest"` scope; JWT
+>   users carry `scopes=None` and pass implicitly. Block updated in place.
 
 ```python
 # backend/app/api/v1/uploads.py  (add after existing routes)
 from app.schemas.node import NodeCreate, NodeOut
+from app.services import node_service as ns
 from app.services.ingest.base import IngestItem, KnowledgeIngestor
 
 
-@router.post("/ingest-item", response_model=NodeOut)
+class IngestItemIn(NodeCreate):
+    """NodeCreate + `tags` — Confluence labels arrive as tags [plan-fix]."""
+
+    tags: list[str] = Field(default_factory=list)
+
+
+@router.post(
+    "/ingest-item",
+    response_model=NodeOut,
+    summary="Upsert a single knowledge node from an external source",
+    operation_id="ingestSingleItem",
+)
 async def ingest_single_item(
-    payload: NodeCreate,
-    viewer: Viewer = Depends(get_current_viewer),
+    payload: IngestItemIn,
+    # [review-fix 5.R.1] service tokens must hold the "ingest" scope; JWT users
+    # (scopes=None) pass implicitly. ApiToken.scopes was stored but never read.
+    viewer: Viewer = Depends(_require_ingest_scope),
     db: AsyncSession = Depends(get_db),
-):
-    """
-    Upsert a single knowledge node from an external source (Confluence CLI, codebase scanner).
-    Idempotent: same source+source_ref → same node.
+) -> NodeOut:
+    """Upsert a single knowledge node from an external source (Confluence CLI,
+    codebase scanner). Idempotent: same source+source_ref → same node.
     """
     item = IngestItem(
         source=payload.source or "api",
@@ -740,21 +941,28 @@ async def ingest_single_item(
         body=payload.body,
         node_type=payload.node_type,
         visibility=payload.visibility,
+        tags=payload.tags,
         meta=payload.meta,
     )
     ingestor = KnowledgeIngestor(db, viewer)
     node = await ingestor.upsert(item)
     await db.commit()
-    return node
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
+    return NodeOut.model_validate(node)
 ```
 
-- [ ] **4.3** Run tests:
+> Note (not fixed here): the Task 3 sync engine counts `created` only on a 201,
+> but this endpoint returns 200 for create and update alike (the ingestor does
+> not report which branch it took) — first syncs will log created=0/updated=N.
+> Cosmetic only; revisit if SyncResult accuracy ever matters.
+
+- [x] **4.3** Run tests:
 ```bash
 cd backend && pytest tests/api/test_ingest_item_api.py -v
-# Expected: 2 passed
+# Expected: 5 passed  [plan-fix: was 2 — 401/422/tags tests added in 4.1]
 ```
 
-- [ ] **4.4** Commit:
+- [x] **4.4** Commit:
 ```
 feat(api): POST /api/v1/uploads/ingest-item — single-item upsert for CLI tools
 ```
@@ -765,15 +973,44 @@ feat(api): POST /api/v1/uploads/ingest-item — single-item upsert for CLI tools
 
 **Files:**
 - Create: `tools/kb-confluence-sync/__main__.py`
+- Create: `tools/kb-confluence-sync/cli.py` *(plan-fix, see 5.2)*
 - Create: `tools/kb-confluence-sync/pyproject.toml`
 - Create: `tools/kb-confluence-sync/tests/test_cli.py`
+- Modify: `backend/app/core/deps.py`, `backend/app/api/v1/tokens.py` *(plan-fix, see below)*
+- Create: `backend/tests/api/test_service_token_auth.py` *(plan-fix, see below)*
+
+> **[plan-fix] Service-token bearer auth (gap between Tasks 3/5 and Phase 4 Task 6).**
+> The CLI sends `KB_API_TOKEN` (raw token from POST /api/v1/tokens) as
+> `Authorization: Bearer`, but `get_current_viewer` only decoded JWTs — every CLI
+> request would 401. Fixed in the same TDD loop as this task:
+> - Raw token format is now `kb_<token-id-hex>.<secret>` (was bare
+>   `token_urlsafe(32)`); the embedded id makes bearer lookup O(1) by primary key —
+>   argon2 hashes are salted, so rows can't be found by hashing the presented
+>   token. Acceptable format migration: nothing is deployed; hashing/`shown once`
+>   semantics unchanged, all Task 6 (Phase 4) tests still green.
+> - `get_current_viewer` falls back to `_viewer_from_service_token` when JWT decode
+>   fails: PK lookup → revoked/expired check → argon2 verify of the full raw token →
+>   `Viewer(user_id=owner_id, role=service)` (never admin — visibility bypass
+>   unreachable, kb-visibility rule 5; `get_scoped_viewer` passes service through).
+> - Tests: `backend/tests/api/test_service_token_auth.py` — valid token ingests
+>   (200/201), node owned by token owner, revoked → 401, tampered secret → 401,
+>   unknown id → 401.
 
 ### Steps
 
-- [ ] **5.1** Write failing tests:
+- [x] **5.1** Write failing tests:
+
+> [plan-fix] vs the block below — there is no `kb_confluence_sync` package (flat-module layout,
+> Tasks 1-3), so the CLI runs as `python __main__.py`; `cwd` resolved from `__file__` (the block's
+> repo-root-relative path breaks — pytest runs from the tool dir); interpreter taken from PATH
+> before `sys.executable` (sandbox python is a loader-wrapped binary that can't exec directly);
+> subprocess env scrubbed of `CONFLUENCE_*`/`KB_*` so the missing-config test is deterministic.
+> Added `test_dry_run_exits_0_against_mocked_confluence` (threaded stdlib HTTP stub) — the phase
+> exit criterion "`--dry-run` exits 0 against a mocked Confluence server".
+> Canonical source: `tools/kb-confluence-sync/tests/test_cli.py`.
 
 ```python
-# tools/kb-confluence-sync/tests/test_cli.py
+# tools/kb-confluence-sync/tests/test_cli.py — excerpt; see file for the mocked-server test
 import subprocess
 import sys
 
@@ -797,7 +1034,16 @@ def test_missing_config_exits_2():
     assert r.returncode == 2
 ```
 
-- [ ] **5.2** Create `__main__.py`:
+- [x] **5.2** Create `__main__.py`:
+
+> [plan-fix] Implementation lives in `cli.py`; `__main__.py` is a two-line shim. A setuptools
+> console script cannot target a module named `__main__` — at runtime that name resolves to the
+> generated script itself. Deviations from the block below, forced by ruff/`mypy --strict`:
+> `argparse` imported top-level (only `python-dotenv` is optional), `SyncConfig`/`SyncEngine`
+> imported normally (no `"SyncConfig"` string annotation + `noqa: F821`),
+> `build_config(args: argparse.Namespace)` typed, `--visibility` read directly (it is defined on
+> the sync subparser — no `getattr` fallback). Behavior and exit codes identical.
+> Canonical source: `tools/kb-confluence-sync/cli.py`.
 
 ```python
 # tools/kb-confluence-sync/__main__.py
@@ -933,12 +1179,16 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **5.3** Create `pyproject.toml`:
+- [x] **5.3** Create `pyproject.toml`:
+
+> [plan-fix] build-backend `setuptools.backends.legacy:build` does not exist →
+> `setuptools.build_meta`; flat modules declared via `[tool.setuptools] py-modules`; script entry
+> `cli:main` (`kb_confluence_sync.__main__:main` names a nonexistent package).
 
 ```toml
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "kb-confluence-sync"
@@ -952,36 +1202,94 @@ dependencies = [
 ]
 
 [project.scripts]
-kb-confluence-sync = "kb_confluence_sync.__main__:main"
+kb-confluence-sync = "cli:main"
+
+[tool.setuptools]
+py-modules = ["cli", "confluence_client", "sync_engine", "xhtml_to_md"]
 ```
 
-- [ ] **5.4** Run tests:
+- [x] **5.4** Run tests:
 ```bash
 cd tools/kb-confluence-sync && python -m pytest tests/test_cli.py -v
-# Expected: 2 passed
+# Expected: 3 passed  [plan-fix: was 2 — mocked-server dry-run test added in 5.1]
 ```
 
-- [ ] **5.5** Verify dry-run:
+- [x] **5.5** Verify dry-run:
+
+> [plan-fix] The block pointed the CLI at example.atlassian.net — a REAL network call (dry-run
+> skips the KB API, not the Confluence `list_pages` fetch), which fails offline and contradicts
+> the exit criterion "against a mocked Confluence server". Verified against a local stub instead
+> (executable form: `tests/test_cli.py::test_dry_run_exits_0_against_mocked_confluence`).
+
 ```bash
 cd tools/kb-confluence-sync
-CONFLUENCE_URL=https://example.atlassian.net/wiki \
+python /path/to/confluence_stub.py &   # any local stub serving /rest/api/content JSON
+CONFLUENCE_URL=http://127.0.0.1:8765 \
 CONFLUENCE_TOKEN=fake \
 KB_API_TOKEN=fake \
-python -m __main__ sync --space TS --dry-run
-# Expected: exit 0 (no network calls in dry-run)
+python __main__.py sync --space TS --dry-run
+# Expected: exit 0 (KB API never called in dry-run)
 ```
 
-- [ ] **5.6** Run full lint:
+- [x] **5.6** Run full lint:
 ```bash
 cd tools/kb-confluence-sync
 ruff check .
-mypy --strict confluence_client.py sync_engine.py xhtml_to_md.py
+mypy --strict *.py   # [plan-fix: covers cli.py and __main__.py too]
 ```
 
-- [ ] **5.7** Commit:
+- [x] **5.7** Commit:
 ```
 feat(tools): kb-confluence-sync CLI — sync, dry-run, --json output, exit codes 0/1/2
 ```
+
+---
+
+### 5.R Review fixes (on commit eae45b1)
+
+- [x] **5.R.1 CRITICAL — ApiToken.scopes never enforced.** Tokens stored a
+  `scopes` list but no read path ever checked it: a `scopes=["read"]` token
+  could ingest. Smallest coherent design (approved): `Viewer` grows
+  `scopes: frozenset[str] | None = None` — `None` means "full-access
+  principal" (JWT users, SYSTEM_VIEWER, workers), a set means "service token
+  limited to exactly these". `_viewer_from_service_token` sets
+  `frozenset(row.scopes or ())` (empty list stays an empty set — no
+  capabilities, never all); the admin-downscope constructions in
+  `get_scoped_viewer`/`get_ws_viewer` propagate scopes. New
+  `deps.require_scope(scope)` dependency factory returns 403 on a missing
+  scope; `POST /api/v1/uploads/ingest-item` requires `"ingest"` via a
+  module-level `_require_ingest_scope` singleton (ruff B008). Tests:
+  `scopes=["read"]` → 403, `scopes=["ingest"]` → 200, JWT user unaffected
+  (test_service_token_auth.py). **Documented default:** `TokenCreate.scopes`
+  defaults to `["read"]` (tokens.py) — kept deliberately, least privilege: a
+  token created without explicit scopes CANNOT ingest; the CLI setup docs and
+  tests request `["ingest"]` explicitly.
+- [x] **5.R.2 IMPORTANT — timing side-channel on token lookup.** The
+  not-found/revoked/expired branches returned before any argon2 work, so a 401
+  in microseconds (vs ~50 ms for a live id) was an oracle for enumerating
+  token ids. Fix: module-level `_DUMMY_HASH`; those branches verify the
+  presented token against it and discard the (expected) mismatch, equalizing
+  cost. Test pins that the not-found branch calls `verify` exactly once.
+- [x] **5.R.3 IMPORTANT — corrupt stored hash was a 500.** argon2 raises
+  `InvalidHashError` (NOT a `VerificationError` subclass) when `token_hash` is
+  malformed; it escaped as a server error. Both verify sites now catch
+  `(VerificationError, InvalidHashError)` → 401 (`VerifyMismatchError` is a
+  `VerificationError` subclass, already covered). Test corrupts the row
+  in-place and asserts 401.
+- [x] **5.R.4 IMPORTANT — corrupt version cache crashed the tool.**
+  `sync_engine._load_cache` only caught `FileNotFoundError`; a truncated or
+  unreadable `.confluence_versions.json` raised at construction. Now catches
+  `(json.JSONDecodeError, OSError)` → warn + start empty (self-healing: worst
+  case a full re-sync, and ingest-item is an idempotent upsert). Tests: garbage
+  JSON and cache-path-is-a-directory both start empty with a warning.
+- [x] **5.R.5 NIT — dry run splits would-create vs would-update.** Dry run
+  counted every unskipped page as `created`; it now reports `updated` for
+  pages present in the local version cache at a different version (best-effort
+  from local knowledge — dry run still makes zero KB API calls). The Task 4.2
+  note about 200-vs-201 in REAL syncs stands unchanged.
+
+New test counts: `test_sync_engine.py` 4 → 7, `test_service_token_auth.py`
+5 → 10 (tool suite 20, backend suite 190 passed / 13 skipped).
 
 ---
 

@@ -23,6 +23,18 @@ visibility rule, answered 404-generic like any invisible read.
   would otherwise pin the first-read attributes and the stream would never see
   the worker's committed progress.
 - summary/operation_id added per kb-api-conventions.
+
+[plan-fix] vs the Task 4.2 block (phase 5, ingest-item):
+- `get_scoped_viewer`, not `get_current_viewer` (same Phase 1 standard as above).
+- `run_pending_graph_ops(db)` after the commit: create/update queue the Neo4j
+  vertex sync on the session; the plan block committed and never drained it
+  (ADR-011, nodes.py standard).
+- `IngestItemIn(NodeCreate)` adds the `tags` field: the sync engine (Task 3)
+  sends Confluence labels as `tags` and IngestItem carries them, but NodeCreate
+  has no tags field — the plan's block dropped labels silently, breaking the
+  labels → tags rule (kb-ingestion-connectors).
+- `NodeOut.model_validate(node)` + summary/operation_id per kb-api-conventions
+  (never return ORM objects from routers).
 """
 
 from __future__ import annotations
@@ -43,20 +55,26 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer
+from app.core.deps import Viewer, get_scoped_viewer, get_ws_viewer, require_scope
 from app.core.errors import NotFoundError
 from app.models.ingest import IngestionRun, RunStatus
+from app.schemas.node import NodeCreate, NodeOut
+from app.services import node_service as ns
+from app.services.ingest.base import IngestItem, KnowledgeIngestor
 from app.services.ingest.md_importer import check_zip_limits
 from app.workers.tasks.ingest_md import ingest_md
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+# [review-fix 5.R.1] module-level singleton (ruff B008 forbids the factory call
+# inline in the Depends default): ingest-item demands the "ingest" scope.
+_require_ingest_scope = require_scope("ingest")
 _WS_POLL_SECONDS = 0.5
 # Application close code for "run invisible OR nonexistent" — one code for
 # both, like get_run's generic 404 (a distinct code would confirm the id).
@@ -78,6 +96,12 @@ class RunOut(BaseModel):
 class UploadStarted(BaseModel):
     run_id: uuid.UUID
     status: RunStatus
+
+
+class IngestItemIn(NodeCreate):
+    """NodeCreate + `tags` — Confluence labels arrive as tags [plan-fix]."""
+
+    tags: list[str] = Field(default_factory=list)
 
 
 @router.post(
@@ -141,6 +165,39 @@ async def upload_markdown(
         ) from exc
 
     return UploadStarted(run_id=run.id, status=RunStatus.pending)
+
+
+@router.post(
+    "/ingest-item",
+    response_model=NodeOut,
+    summary="Upsert a single knowledge node from an external source",
+    operation_id="ingestSingleItem",
+)
+async def ingest_single_item(
+    payload: IngestItemIn,
+    # [review-fix 5.R.1] service tokens must hold the "ingest" scope; JWT users
+    # (scopes=None) pass implicitly. ApiToken.scopes was stored but never read.
+    viewer: Viewer = Depends(_require_ingest_scope),
+    db: AsyncSession = Depends(get_db),
+) -> NodeOut:
+    """Upsert a single knowledge node from an external source (Confluence CLI,
+    codebase scanner). Idempotent: same source+source_ref → same node.
+    """
+    item = IngestItem(
+        source=payload.source or "api",
+        source_ref=payload.source_ref or str(uuid.uuid4()),
+        title=payload.title,
+        body=payload.body,
+        node_type=payload.node_type,
+        visibility=payload.visibility,
+        tags=payload.tags,
+        meta=payload.meta,
+    )
+    ingestor = KnowledgeIngestor(db, viewer)
+    node = await ingestor.upsert(item)
+    await db.commit()
+    await ns.run_pending_graph_ops(db)  # Neo4j strictly after PG commit (ADR-011)
+    return NodeOut.model_validate(node)
 
 
 @router.get(
