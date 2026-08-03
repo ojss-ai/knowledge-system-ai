@@ -11,7 +11,7 @@ These conventions keep 8 phases of agent-written code coherent. Deviating "becau
 ## Naming (canonical vocabulary — use these exact names)
 - DB tables: `users`, `groups`, `group_members`, `knowledge_nodes`, `node_shares`, `node_revisions`, `tags`, `node_tags`, `node_chunks`, `attachments`, `ingestion_runs`, `audit_log`.
 - The graph (Neo4j) uses vertex label `Node`; edge labels UPPER_SNAKE: `LINKS_TO`, `REFERENCES`, `DERIVED_FROM`, `TAGGED_WITH`, `SIMILAR_TO`, `PARENT_OF`, `AUTHORED_BY`, `MENTIONS`, `IMPORTS`, `CALLS`, `DEFINES`, `BELONGS_TO_PROJECT`.
-- Node types (str enum `NodeType`): `note`, `daily_log`, `research`, `context`, `document`, `confluence_page`, `code_module`, `code_function`, `concept`, `person`, `project`.
+- Node types (str enum `NodeType`): `note`, `daily_log`, `file`, `code_file`, `code_symbol`, `confluence_page` (per ADR-012 — extend only via a new ADR).
 - Visibility (str enum `Visibility`): `private`, `public`, `shared`.
 - Services: `auth_service`, `node_service`, `graph_service`, `search_service`, `embedding_service`, `llm_service`, modules under `ingest/`: `md_importer`, `confluence`, `codebase`.
 - The auth context object passed to every service read is `Viewer` (fields: `user_id: UUID`, `role: Role`, `group_ids: frozenset[UUID]`).

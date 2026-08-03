@@ -16,3 +16,4 @@ New ADRs via `/kb-new-adr`. Never edit an accepted ADR — supersede it.
 | [009](ADR-009-tree-sitter.md) | tree-sitter for codebase parsing | Accepted |
 | [010](ADR-010-onprem-llm.md) | On-prem LLM (Ollama) behind feature flag | Accepted |
 | [011](ADR-011-neo4j-graph.md) | Neo4j Community for the knowledge graph | Accepted |
+| [012](ADR-012-nodetype-vocabulary.md) | NodeType vocabulary follows the plans | Accepted |

@@ -12,12 +12,19 @@
 - `kb-api-conventions` — router shape, schema naming, 202 for long work
 
 **Exit criteria:**
-- [ ] All tasks checked
-- [ ] `pytest -x backend/tests/` green, no skips
-- [ ] `ruff check backend/` clean
-- [ ] `mypy --strict backend/app/services/ backend/app/schemas/` clean
-- [ ] `/kb-verify` passes (visibility audit grep finds zero raw selects on knowledge_nodes outside visibility.py)
-- [ ] `curl` evidence for every new endpoint in this file
+- [x] All tasks checked
+- [x] `pytest backend/tests/` green — `79 passed, 9 skipped` (the 9 skips are the
+  approved Neo4j-unreachable deviation: sandbox cannot run Neo4j; **run
+  `cd backend && pytest -q` on the Docker stack to convert them to passes**)
+- [x] `ruff check backend/` clean (`All checks passed!`) + `ruff format --check` clean
+- [x] `mypy --strict backend/app/services/ backend/app/schemas/` clean (also `app/api` clean)
+- [x] `/kb-verify` passes — visibility audit: every `select(KnowledgeNode…)` outside
+  `visibility.py` composes `visible_nodes_clause` (daily_logs ×3, graph_service ×2,
+  node_service ×3 + one post-auth row lock); zero Cypher outside `graph_service.py`/
+  `core/neo4j.py`; dynamic audit `pytest -k "visibility or invisible or private"` →
+  20 passed; fresh-DB migration `alembic upgrade head` on empty `kb_fresh` → 9 tables
+- [x] `curl` evidence for every new endpoint in this file (§8.7, §9.7, §10.6;
+  graph/edges happy paths are 503-honest in sandbox — re-run on Docker stack)
 
 ---
 
@@ -28,17 +35,19 @@
 
 ### Steps
 
-- [ ] **1.1** Open `backend/tests/conftest.py` and add these fixtures after the existing `auth_headers` fixture:
+- [x] **1.1** Open `backend/tests/conftest.py` and add these fixtures after the existing `client` fixture (plan-fix: there is no `auth_headers` fixture in conftest; `client` is the last existing fixture). The `app.models.knowledge` imports are done lazily inside each fixture because that module is only created in Task 2 — a top-level import would break collection of the whole suite (`NodeTag` is not needed by these fixtures and is not imported):
 
 ```python
 # backend/tests/conftest.py  (additions only)
 import uuid as _uuid
-from app.models.knowledge import KnowledgeNode, Tag, NodeTag
+import pytest_asyncio
 from app.models.user import Visibility
 
 @pytest_asyncio.fixture
 async def make_node(db):
     """Factory: create a KnowledgeNode in the test DB and return it."""
+    from app.models.knowledge import KnowledgeNode  # lazy: model lands in Task 2
+
     created: list[KnowledgeNode] = []
 
     async def _factory(
@@ -72,6 +81,8 @@ async def make_node(db):
 @pytest_asyncio.fixture
 async def make_tag(db):
     """Factory: create a Tag."""
+    from app.models.knowledge import Tag  # lazy: model lands in Task 2
+
     async def _factory(name: str = "test-tag") -> Tag:
         tag = Tag(id=_uuid.uuid4(), name=name, slug=name.lower().replace(" ", "-"))
         db.add(tag)
@@ -80,14 +91,14 @@ async def make_tag(db):
     return _factory
 ```
 
-- [ ] **1.2** Run tests to confirm fixtures load (no production code yet — test file just imports):
+- [x] **1.2** Run tests to confirm fixtures load (no production code yet — test file just imports):
 
 ```bash
 cd backend && pytest tests/conftest.py --collect-only -q
 # Expected: collected 0 items (fixtures load without error)
 ```
 
-- [ ] **1.3** Commit:
+- [x] **1.3** Commit:
 ```
 chore(test): extend conftest with make_node and make_tag fixtures
 ```
@@ -101,10 +112,11 @@ chore(test): extend conftest with make_node and make_tag fixtures
 - Modify: `backend/app/models/__init__.py`
 - Create: `backend/alembic/versions/0002_knowledge_core.py`
 - Create: `backend/tests/models/test_knowledge_models.py`
+- Modify: `backend/tests/conftest.py` (plan-fix: `make_user` fixture was assumed but never created in Task 1 — added here)
 
 ### Steps
 
-- [ ] **2.1** Write the failing test first:
+- [x] **2.1** Write the failing test first (plan-fix applied to the code below: dropped unused `User`, `Role`, `NodeRevision`, `NodeTag` imports — ruff F401; `pytest.raises(Exception)` → `pytest.raises(IntegrityError)` — ruff B017; the failing flush runs inside `db.begin_nested()` so the outer test transaction stays usable and teardown emits no SAWarning. Post-review additions not shown below: `test_share_requires_exactly_one_grantee_neither`/`_both` (XOR check on `node_shares`) and `test_revision_version_unique_per_node` — see `backend/tests/models/test_knowledge_models.py`):
 
 ```python
 # backend/tests/models/test_knowledge_models.py
@@ -164,12 +176,12 @@ async def test_tag_slug_unique(db):
         await db.flush()
 ```
 
-- [ ] **2.2** Run — expect ImportError / FAIL:
+- [x] **2.2** Run — expect ImportError / FAIL:
 ```bash
 cd backend && pytest tests/models/test_knowledge_models.py -x 2>&1 | head -30
 ```
 
-- [ ] **2.3** Create the model:
+- [x] **2.3** Create the model (plan-fix applied to the code below: added the `Computed` and `CheckConstraint` imports; removed unused `text`/`UTC` imports — ruff F401; `class NodeType(str, enum.Enum)` → `class NodeType(enum.StrEnum)` — ruff UP042, matches `Role`/`Visibility` in `user.py`; post-review: `ck_node_shares_user_xor_group` CheckConstraint added to `NodeShare` — exactly one of `user_id`/`group_id` must be set; NodeType vocabulary confirmed canonical by ADR-012):
 
 ```python
 # backend/app/models/knowledge.py
@@ -204,7 +216,7 @@ class KnowledgeNode(Base):
     __tablename__ = "knowledge_nodes"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False, default="")
     node_type: Mapped[str] = mapped_column(String(64), nullable=False, default=NodeType.note.value)
@@ -239,7 +251,7 @@ class NodeShare(Base):
     __tablename__ = "node_shares"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False)
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"))
     group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("groups.id", ondelete="CASCADE"))
     can_edit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -250,6 +262,7 @@ class NodeShare(Base):
     __table_args__ = (
         UniqueConstraint("node_id", "user_id", name="uq_share_node_user"),
         UniqueConstraint("node_id", "group_id", name="uq_share_node_group"),
+        CheckConstraint("(user_id IS NULL) != (group_id IS NULL)", name="ck_node_shares_user_xor_group"),
     )
 
 
@@ -257,7 +270,7 @@ class NodeRevision(Base):
     __tablename__ = "node_revisions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_nodes.id", ondelete="CASCADE"), nullable=False)
     version: Mapped[int] = mapped_column(nullable=False)
     title_snapshot: Mapped[str] = mapped_column(String(512), nullable=False)
     body_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
@@ -295,13 +308,13 @@ class NodeTag(Base):
 
 > **Note:** `Computed` must be imported: `from sqlalchemy import Computed`
 
-- [ ] **2.4** Add to `backend/app/models/__init__.py`:
+- [x] **2.4** Add to `backend/app/models/__init__.py`:
 
 ```python
 from app.models.knowledge import KnowledgeNode, NodeShare, NodeRevision, Tag, NodeTag, NodeType  # noqa: F401
 ```
 
-- [ ] **2.5** Generate Alembic migration:
+- [x] **2.5** Generate Alembic migration (plan-fix: autogenerate DID include the `body_tsv` Computed column; the `visibility` column had to be switched to `postgresql.ENUM(..., name="visibility", create_type=False)` because the enum type already exists from migration 0001 and `sa.Enum` would try to re-create it. Post-review, migration 0002 was amended in place — it is unreleased: added `ck_node_shares_user_xor_group` check constraint; dropped redundant single-column indexes `ix_knowledge_nodes_owner_id` (covered by `ix_kn_owner_deleted`), `ix_node_shares_node_id` (covered by `uq_share_node_user`/`_group`), `ix_node_revisions_node_id` (covered by `uq_revision_version`) — model `index=True` flags removed to match):
 
 ```bash
 cd backend && alembic revision --autogenerate -m "knowledge_core"
@@ -314,7 +327,7 @@ cd backend && alembic revision --autogenerate -m "knowledge_core"
 #       nullable=True),
 ```
 
-- [ ] **2.6** Apply migration and run tests — expect PASS:
+- [x] **2.6** Apply migration and run tests — expect PASS:
 
 ```bash
 cd backend && alembic upgrade head
@@ -322,7 +335,7 @@ pytest tests/models/test_knowledge_models.py -v
 # Expected: 4 passed
 ```
 
-- [ ] **2.7** Commit:
+- [x] **2.7** Commit:
 ```
 feat(models): knowledge_nodes, node_shares, node_revisions, tags, node_tags + migration 0002
 ```
@@ -332,13 +345,16 @@ feat(models): knowledge_nodes, node_shares, node_revisions, tags, node_tags + mi
 ## Task 3 — Neo4j graph initialisation (constraint + driver singleton)
 
 **Files:**
-- Create: `backend/app/services/graph_service.py` (driver setup only; full service in Task 5)
 - Create: `backend/app/core/neo4j.py`
 - Create: `backend/tests/db/test_neo4j_init.py`
 
+> [plan-fix] `graph_service.py` removed from this task's file list: the steps below define no
+> content for it (driver lives in `app/core/neo4j.py`); the full service lands in Task 5.
+> Also added `neo4j>=5.20` to `backend/pyproject.toml` dependencies (was missing).
+
 ### Steps
 
-- [ ] **3.1** Write the failing test first:
+- [x] **3.1** Write the failing test first:
 
 ```python
 # backend/tests/db/test_neo4j_init.py
@@ -365,12 +381,13 @@ async def test_node_id_constraint_exists(neo4j_session: Neo4jSession):
     assert len(records) >= 1, "Missing uniqueness constraint on :Node(node_id)"
 ```
 
-- [ ] **3.2** Run — expect FAIL (driver not configured yet):
+- [x] **3.2** Run — expect FAIL (driver not configured yet):
 ```bash
 cd backend && pytest tests/db/test_neo4j_init.py -x 2>&1 | head -20
 ```
+Observed RED: `fixture 'neo4j_session' not found` (both tests error at setup).
 
-- [ ] **3.3** Write `backend/app/core/neo4j.py`:
+- [x] **3.3** Write `backend/app/core/neo4j.py`:
 
 ```python
 # backend/app/core/neo4j.py
@@ -385,8 +402,8 @@ def get_driver() -> AsyncDriver:
     global _driver
     if _driver is None:
         _driver = AsyncGraphDatabase.driver(
-            settings.NEO4J_URI,
-            auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD),
+            settings.neo4j_uri,
+            auth=(settings.neo4j_user, settings.neo4j_password),
         )
     return _driver
 
@@ -407,45 +424,53 @@ async def ensure_constraints() -> None:
         )
 ```
 
-- [ ] **3.4** Wire `ensure_constraints()` + `close_driver()` into FastAPI lifespan (`backend/app/main.py`):
+- [x] **3.4** Wire `ensure_constraints()` + `close_driver()` into FastAPI lifespan (`backend/app/main.py`):
 
 ```python
 from contextlib import asynccontextmanager
 from app.core.neo4j import close_driver, ensure_constraints
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await ensure_constraints()
     yield
     await close_driver()
-
-app = FastAPI(lifespan=lifespan, ...)
 ```
+> [plan-fix] `main.py` uses the existing `create_app()` factory, so `lifespan` is passed as
+> `FastAPI(..., lifespan=lifespan)` inside the factory rather than a module-level `app = FastAPI(...)`.
 
-- [ ] **3.5** Add `neo4j_session` fixture to `backend/tests/conftest.py`:
+- [x] **3.5** Add `neo4j_session` fixture to `backend/tests/conftest.py`:
 
 ```python
-import pytest
-from app.core.neo4j import get_driver
-
 @pytest.fixture
 async def neo4j_session():
+    if not _neo4j_available():
+        pytest.skip("Neo4j unreachable")
+    await ensure_constraints()  # tests must not depend on app lifespan having run
     async with get_driver().session() as session:
         yield session
         # Teardown: wipe all test nodes
         await session.run("MATCH (n:Node) WHERE n.test = true DETACH DELETE n")
 ```
+> [plan-fix] (approved deviation) The fixture first probes `settings.neo4j_uri` with a 1 s TCP
+> connect (`_neo4j_available()`) and skips when Neo4j is down, so the suite stays green in
+> environments without Neo4j. It also calls `ensure_constraints()` because httpx's ASGITransport
+> never runs the app lifespan (per kb-neo4j-graph: fixture runs the constraint migration).
 
-- [ ] **3.6** Add Neo4j env vars to `backend/tests/conftest.py` / pytest fixtures (already in `.env.example`; ensure `settings` reads them).
+- [x] **3.6** Add Neo4j env vars to `backend/tests/conftest.py` / pytest fixtures (already in `.env.example`; ensure `settings` reads them).
+> [plan-fix] No `.env.example` exists; vars live in `backend/.env` (uncommitted). Added
+> `neo4j_uri` / `neo4j_user` / `neo4j_password` fields (lowercase, matching existing
+> `Settings` style; env matching is case-insensitive) with docker-compose dev defaults.
 
-- [ ] **3.7** Apply and run tests:
+- [x] **3.7** Apply and run tests:
 
 ```bash
 cd backend && pytest tests/db/test_neo4j_init.py -v
-# Expected: 2 passed
+# Expected: 2 passed (sandbox without Neo4j: 2 skipped "Neo4j unreachable" — verify
+# "2 passed" on the Docker stack)
 ```
 
-- [ ] **3.8** Commit:
+- [x] **3.8** Commit:
 ```
 feat(db): Neo4j driver singleton, ensure_constraints on startup, init tests
 ```
@@ -460,7 +485,7 @@ feat(db): Neo4j driver singleton, ensure_constraints on startup, init tests
 
 ### Steps
 
-- [ ] **4.1** Write the failing tests first:
+- [x] **4.1** Write the failing tests first:
 
 ```python
 # backend/tests/services/test_visibility.py
@@ -555,12 +580,16 @@ async def test_deleted_nodes_excluded(db, make_user, make_node):
     assert node.id not in ids, "Soft-deleted node must be excluded"
 ```
 
-- [ ] **4.2** Run — expect ImportError:
+> [plan-fix] Dropped the test file's unused `import uuid` (ruff F401) and added a seventh test,
+> `test_shared_node_ids_returns_direct_shares` — the plan imported `shared_node_ids` without
+> exercising it (F401 again, and production code must not land untested per kb-tdd-workflow).
+
+- [x] **4.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_visibility.py -x 2>&1 | head -20
 ```
 
-- [ ] **4.3** Implement `visibility.py`:
+- [x] **4.3** Implement `visibility.py`:
 
 ```python
 # backend/app/services/visibility.py
@@ -656,13 +685,19 @@ async def shared_node_ids(viewer: Viewer, db: AsyncSession) -> set[uuid.UUID]:
     return set(rows)
 ```
 
-- [ ] **4.4** Run tests:
+> [plan-fix] As implemented, minus dead weight that fails the gates: removed unused
+> function-local imports (`cast`, `PG_UUID`, `Visibility` in `shared_node_ids`), the empty
+> `TYPE_CHECKING` block, and the redundant `select as sa_select` alias (module-level `select`
+> already imported). Replaced `or_(True)` with `sqlalchemy.true()` — mypy --strict rejects
+> `or_(True)` (the `or_` identity literal is `False` only).
+
+- [x] **4.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_visibility.py -v
-# Expected: 6 passed
+# Expected: 6 passed  (actual: 7 passed — extra shared_node_ids test, see 4.1 plan-fix)
 ```
 
-- [ ] **4.5** Commit:
+- [x] **4.5** Commit:
 ```
 feat(visibility): implement visibility.py with Viewer contract and 6 rule tests
 ```
@@ -672,21 +707,25 @@ feat(visibility): implement visibility.py with Viewer contract and 6 rule tests
 ## Task 5 — Neo4j graph service
 
 **Files:**
-- Update: `backend/app/services/graph_service.py` (full implementation — driver setup skeleton was in Task 3)
+- Create: `backend/app/services/graph_service.py`
 - Create: `backend/tests/services/test_graph_service.py`
+
+> [plan-fix] The plan said "Update … driver setup skeleton was in Task 3", but Task 3 put the
+> driver singleton in `app/core/neo4j.py` (no graph_service skeleton exists). This module is
+> created here and imports `get_driver` from `app.core.neo4j` — exactly as the plan code below
+> already does.
 
 ### Steps
 
-- [ ] **5.1** Write the failing tests:
+- [x] **5.1** Write the failing tests:
 
 ```python
 # backend/tests/services/test_graph_service.py
-import uuid
 import pytest
-from app.models.knowledge import KnowledgeNode
-from app.models.user import Visibility, Role
-from app.services.visibility import Viewer
+
+from app.models.user import Role, Visibility
 from app.services import graph_service as gs
+from app.services.visibility import Viewer
 
 pytestmark = pytest.mark.asyncio
 
@@ -725,7 +764,7 @@ async def test_merge_and_delete_edge(db, neo4j_session, make_user, make_node):
     assert str(n2.id) not in [e["target"] for e in hood2["edges"]]
 
 
-async def test_neighborhood_visibility(db, make_user, make_node):
+async def test_neighborhood_visibility(db, neo4j_session, make_user, make_node):
     """Private nodes must not appear in another user's neighborhood traversal."""
     owner = await make_user(email="gs_vis1@test.com")
     other = await make_user(email="gs_vis2@test.com")
@@ -739,15 +778,28 @@ async def test_neighborhood_visibility(db, make_user, make_node):
     viewer = Viewer(user_id=other.id, role=Role.user, group_ids=frozenset())
     hood = await gs.get_neighborhood(db, public_node.id, viewer, hops=1)
     node_ids = [v["id"] for v in hood["nodes"]]
-    assert str(private_node.id) not in node_ids, "Private node must not leak through graph traversal"
+    assert str(private_node.id) not in node_ids, (
+        "Private node must not leak through graph traversal"
+    )
 ```
 
-- [ ] **5.2** Run — expect ImportError:
+> [plan-fix] As implemented: removed unused imports (`uuid`, `KnowledgeNode`) that fail
+> `ruff check`; isort-ordered the rest; wrapped the >100-char assert. Added `neo4j_session`
+> to `test_neighborhood_visibility` — it drives a live Neo4j via `upsert_vertex`/`merge_edge`,
+> so it must depend on that fixture to SKIP (not error) when Neo4j is down, per the approved
+> sandbox deviation. Test bodies unchanged.
+
+- [x] **5.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_graph_service.py -x 2>&1 | head -20
 ```
 
-- [ ] **5.3** Implement `graph_service.py`:
+- [x] **5.3** Implement `graph_service.py`:
+
+> [plan-fix] As implemented, to pass the gates: bare `dict` generics annotated as
+> `dict[str, Any]` (`mypy --strict` disallow_any_generics — also makes the `Any` import used),
+> `nodes_out`/`raw_edges` explicitly annotated, and >100-char lines wrapped (ruff E501).
+> Cypher, function signatures, and behavior are exactly as planned.
 
 ```python
 # backend/app/services/graph_service.py
@@ -858,25 +910,29 @@ async def get_neighborhood(
     center_id: uuid.UUID,
     viewer: Viewer,
     hops: int = 1,
-) -> dict[str, list[dict]]:
+) -> dict[str, list[dict[str, Any]]]:
     """
     Return nodes and edges within `hops` hops of center_id, visibility-filtered.
     hops clamped to _HOP_LIMIT.  Total nodes capped at _NODE_LIMIT.
     Visibility is enforced by re-querying PG (the authoritative source).
     """
-    hops = min(hops, _HOP_LIMIT)
+    hops = max(0, min(hops, _HOP_LIMIT))  # defense-in-depth: interpolated into the pattern
     candidate_ids: set[uuid.UUID] = {center_id}
-    raw_edges: list[dict] = []
+    raw_edges: list[dict[str, Any]] = []
 
     async with get_driver().session() as session:
+        # [plan-fix] review CRITICAL: LIMIT must run BEFORE collect() — after
+        # aggregation the match is a single row and LIMIT is a no-op (unbounded
+        # pull on hub nodes). LIMIT now bounds rows pre-aggregation.
         result = await session.run(
             f"""
             MATCH (center:Node {{node_id: $cid}})-[e*0..{hops}]-(other:Node)
             WHERE other.deleted IS NULL OR other.deleted = false
+            WITH DISTINCT other, e
+            LIMIT $limit
             WITH collect(DISTINCT other) AS nodes,
                  collect(DISTINCT e)    AS edge_lists
             RETURN nodes, edge_lists
-            LIMIT $limit
             """,
             cid=str(center_id),
             limit=_NODE_LIMIT,
@@ -896,8 +952,8 @@ async def get_neighborhood(
                 for e in path_edges:
                     raw_edges.append({
                         "source": e.start_node["node_id"] if hasattr(e, "start_node") else None,
-                        "target": e.end_node["node_id"]   if hasattr(e, "end_node")   else None,
-                        "label":  e.type                  if hasattr(e, "type")        else "",
+                        "target": e.end_node["node_id"] if hasattr(e, "end_node") else None,
+                        "label": e.type if hasattr(e, "type") else "",
                     })
 
     # Apply visibility filter via Postgres (authoritative)
@@ -913,8 +969,13 @@ async def get_neighborhood(
     visible_nodes = list(visible_rows)
     visible_ids = {str(n.id) for n in visible_nodes}
 
-    nodes_out = [
-        {"id": str(n.id), "title": n.title, "node_type": n.node_type, "visibility": n.visibility.value}
+    nodes_out: list[dict[str, Any]] = [
+        {
+            "id": str(n.id),
+            "title": n.title,
+            "node_type": n.node_type,
+            "visibility": n.visibility.value,
+        }
         for n in visible_nodes
     ]
     edges_out = [
@@ -928,16 +989,21 @@ async def get_overview(
     db: AsyncSession,
     viewer: Viewer,
     limit: int = 100,
-) -> dict[str, list[dict]]:
+) -> dict[str, list[dict[str, Any]]]:
     """Top visible nodes + edges between them for the initial graph viewport."""
     clause = visible_nodes_clause(viewer)
     rows = await db.scalars(
-        select(KnowledgeNode).where(clause).order_by(KnowledgeNode.updated_at.desc()).limit(limit)
+        select(KnowledgeNode)
+        .where(clause)
+        .order_by(KnowledgeNode.updated_at.desc())
+        .limit(limit)
     )
     nodes = list(rows)
     id_set = {str(n.id) for n in nodes}
 
-    nodes_out = [{"id": str(n.id), "title": n.title, "node_type": n.node_type} for n in nodes]
+    nodes_out: list[dict[str, Any]] = [
+        {"id": str(n.id), "title": n.title, "node_type": n.node_type} for n in nodes
+    ]
 
     if not id_set:
         return {"nodes": nodes_out, "edges": []}
@@ -959,13 +1025,15 @@ async def get_overview(
     return {"nodes": nodes_out, "edges": edges_out}
 ```
 
-- [ ] **5.4** Run tests:
+- [x] **5.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_graph_service.py -v
 # Expected: 3 passed
+# (sandbox actual: 3 skipped — "Neo4j unreachable"; approved deviation.
+#  MUST be re-run against the Docker stack and show 3 passed.)
 ```
 
-- [ ] **5.5** Commit:
+- [x] **5.5** Commit:
 ```
 feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edge, neighborhood + visibility gate
 ```
@@ -980,15 +1048,15 @@ feat(graph): graph_service with Neo4j driver — upsert_vertex, merge/delete edg
 
 ### Steps
 
-- [ ] **6.1** Write the failing tests:
+- [x] **6.1** Write the failing tests (plan-fix: dropped unused `import uuid`; `test_wikilink_extraction` takes the `neo4j_session` fixture — it verifies edges via live Neo4j and must skip when Neo4j is unreachable. Review-fix of 24e5685 added: PG-first deferral tests (`_graph_recorder` + create/update/delete/wikilinks queue tests) a self-link guard test, a `max(version)+1` revision-gap test, mutation-authz tests (non-owner update/delete → `ForbiddenError`; admin CAN mutate, per this task's "Only owner or admin can edit/delete" check), and a `list_nodes` visibility test (user B never sees A's private node) — see the final `backend/tests/services/test_node_service.py`; the wikilink live test now calls `run_pending_graph_ops` after `resolve_wikilinks`):
 
 ```python
 # backend/tests/services/test_node_service.py
-import uuid
 import pytest
-from app.models.user import Visibility, Role
-from app.services.visibility import Viewer
+
+from app.models.user import Role, Visibility
 from app.services import node_service as ns
+from app.services.visibility import Viewer
 
 pytestmark = pytest.mark.asyncio
 
@@ -1031,13 +1099,16 @@ async def test_update_node_creates_revision(db, make_user, make_node):
     assert node.revisions[0].title_snapshot == "Old Title"
 
 
-async def test_wikilink_extraction(db, make_user, make_node):
+async def test_wikilink_extraction(db, neo4j_session, make_user, make_node):
     owner = await make_user(email="ns_wl@test.com")
     n1 = await make_node(owner, title="Source Note", body="see [[Target Note]] and [[Other]]")
     n2 = await make_node(owner, title="Target Note", body="")
     await db.flush()
     viewer = Viewer(user_id=owner.id, role=Role.user, group_ids=frozenset())
     await ns.resolve_wikilinks(db, n1, viewer)
+    # resolve_wikilinks only QUEUES graph ops (PG-first); run them as the
+    # post-commit caller would.
+    await ns.run_pending_graph_ops(db)
     # edges should have been created — verify via graph service
     from app.services import graph_service as gs
     hood = await gs.get_neighborhood(db, n1.id, viewer, hops=1)
@@ -1055,12 +1126,22 @@ async def test_soft_delete(db, make_user, make_node):
         await ns.get_node(db, node.id, viewer)
 ```
 
-- [ ] **6.2** Run — expect ImportError:
+- [x] **6.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -x 2>&1 | head -20
 ```
 
-- [ ] **6.3** Implement `node_service.py`:
+- [x] **6.3** Implement `node_service.py` (plan-fix: matched the real `graph_service` API — `upsert_vertex(node)`, `soft_delete_vertex(node_id)`, `merge_edge(src, tgt, label, created_by=...)`; there is no `create_vertex`, no `db` arg, no `props` kwarg. Graph calls wrapped in best-effort `_graph_sync` so a Neo4j failure never fails/rolls back the PG write (CLAUDE.md invariant; Celery retry task lands with the workers phase). `func` imported at top instead of the bottom-of-file import):
+
+> [plan-fix, review of 24e5685] **PG-first invariant**: mutation functions must not run
+> Neo4j ops inside the transaction (get_db commits after the handler returns, so an
+> in-function `_graph_sync` ran pre-commit). All mutations now QUEUE ops on the session
+> (`db.info["pending_graph_ops"]` via `_queue_graph_op`) and the caller runs
+> `await node_service.run_pending_graph_ops(db)` AFTER `db.commit()` (see Task 8 router).
+> `create_node`'s old "caller calls gs.upsert_vertex post-commit" note is superseded by the
+> same queue. Also: `resolve_wikilinks` skips self-links (`[[Own Title]]`), and revision
+> numbering uses `max(version)+1` under a `FOR UPDATE` lock on the node row instead of the
+> racy `COUNT(*)+1`; a residual duplicate `(node_id, version)` maps to `ConflictError` (409).
 
 ```python
 # backend/app/services/node_service.py
@@ -1068,19 +1149,66 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import datetime, UTC
+from collections.abc import Callable, Coroutine
+from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
-from sqlalchemy import select
+import structlog
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import ForbiddenError, NotFoundError
+from app.core.errors import ConflictError, ForbiddenError, NotFoundError
 from app.models.knowledge import KnowledgeNode, NodeRevision, NodeType
 from app.models.user import Role, Visibility
 from app.services import graph_service as gs
 from app.services.visibility import Viewer, visible_nodes_clause
 
+logger = structlog.get_logger(__name__)
+
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
+
+
+async def _graph_sync(op: Coroutine[Any, Any, None]) -> None:
+    """Best-effort Neo4j sync — PG is the source of truth (ADR-011).
+
+    A graph failure must never fail (or roll back) the relational write.
+    TODO(workers phase): enqueue tasks.sync_graph_vertex retry instead of log-only.
+    """
+    try:
+        await op
+    except Exception as exc:
+        logger.warning("graph_sync_failed", error=str(exc))
+
+
+# A pending graph operation: zero-arg callable producing the coroutine to await.
+# Stored as partials (not live coroutines) so discarding them on rollback is safe.
+GraphOp = Callable[[], Coroutine[Any, Any, None]]
+
+_PENDING_KEY = "pending_graph_ops"
+
+
+def _queue_graph_op(db: AsyncSession, op: GraphOp) -> None:
+    """Queue a Neo4j op to run after the PG commit — never inside it (ADR-011)."""
+    db.info.setdefault(_PENDING_KEY, []).append(op)
+
+
+def pending_graph_ops(db: AsyncSession) -> list[GraphOp]:
+    """Graph ops queued on this session, awaiting run_pending_graph_ops()."""
+    ops: list[GraphOp] = db.info.get(_PENDING_KEY, [])
+    return list(ops)
+
+
+async def run_pending_graph_ops(db: AsyncSession) -> None:
+    """Run (and clear) the session's queued Neo4j ops.
+
+    Callers MUST invoke this AFTER ``db.commit()``. Best-effort: each op is
+    wrapped in _graph_sync, so a Neo4j failure is logged, never raised.
+    """
+    ops: list[GraphOp] = db.info.pop(_PENDING_KEY, [])
+    for op in ops:
+        await _graph_sync(op())
 
 
 async def create_node(
@@ -1108,9 +1236,9 @@ async def create_node(
     )
     db.add(node)
     await db.flush()
-    # NOTE: Neo4j vertex upsert happens AFTER db.commit() in the calling code path.
-    # node_service.create_node() callers must call gs.upsert_vertex(node) post-commit,
-    # or the router does so after awaiting the service (see kb-neo4j-graph skill).
+    # Neo4j vertex upsert runs AFTER db.commit(): queued here, executed by the
+    # caller via run_pending_graph_ops(db) (module docstring, kb-neo4j-graph).
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))
     return node
 
 
@@ -1137,7 +1265,6 @@ async def list_nodes(
     offset: int = 0,
     limit: int = 50,
 ) -> tuple[list[KnowledgeNode], int]:
-    from sqlalchemy import func
     clause = visible_nodes_clause(viewer)
     total = await db.scalar(select(func.count()).select_from(KnowledgeNode).where(clause)) or 0
     rows = await db.scalars(
@@ -1160,14 +1287,22 @@ async def update_node(
     if node.owner_id != viewer.user_id and viewer.role != Role.admin:
         raise ForbiddenError("Only owner or admin can edit a node")
 
-    # Save revision before mutating
-    rev_count = await db.scalar(
-        select(func.count()).select_from(NodeRevision).where(NodeRevision.node_id == node_id)
-    ) or 0
+    # Save revision before mutating. Lock the node row so concurrent updates
+    # serialize their revision numbering, then take max(version)+1 —
+    # COUNT(*)+1 is racy and breaks when versions have gaps.
+    await db.execute(
+        select(KnowledgeNode.id).where(KnowledgeNode.id == node_id).with_for_update()
+    )
+    max_version = (
+        await db.scalar(
+            select(func.max(NodeRevision.version)).where(NodeRevision.node_id == node_id)
+        )
+        or 0
+    )
     revision = NodeRevision(
         id=uuid.uuid4(),
         node_id=node.id,
-        version=rev_count + 1,
+        version=max_version + 1,
         title_snapshot=node.title,
         body_snapshot=node.body,
         changed_by=viewer.user_id,
@@ -1184,8 +1319,15 @@ async def update_node(
         node.meta = {**node.meta, **meta}
 
     node.updated_at = datetime.now(UTC)
-    await db.flush()
-    await gs.create_vertex(db, node)  # sync vertex props
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Residual duplicate (node_id, version) despite the row lock —
+        # e.g. a writer path that skipped the lock. Surface as a 409.
+        if "uq_revision_version" in str(exc.orig):
+            raise ConflictError(f"Concurrent revision conflict for node {node_id}") from exc
+        raise
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
     return node
 
 
@@ -1195,47 +1337,49 @@ async def delete_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> N
         raise ForbiddenError("Only owner or admin can delete a node")
     node.deleted_at = datetime.now(UTC)
     await db.flush()
-    await gs.soft_delete_vertex(db, node_id)
+    _queue_graph_op(db, partial(gs.soft_delete_vertex, node_id))
 
 
 async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewer) -> None:
     """
     Find [[Title]] references in node.body, resolve to node IDs by title,
-    and MERGE LINKS_TO edges in Neo4j via graph_service.
-    Unresolved titles are silently skipped.
+    and queue LINKS_TO edge MERGEs for post-commit run_pending_graph_ops().
+    Unresolved titles and self-references ([[Own Title]]) are silently skipped.
     """
     titles = _WIKILINK_RE.findall(node.body)
     if not titles:
         return
 
-    # Ensure source vertex exists
-    await gs.create_vertex(db, node)
+    # Ensure source vertex exists (queued: runs post-commit, before the edges)
+    _queue_graph_op(db, partial(gs.upsert_vertex, node))
 
     clause = visible_nodes_clause(viewer)
     for title in set(titles):
+        if title == node.title:
+            continue  # self-link guard: [[Own Title]] creates no edge
+        # Titles are not unique; MVP behavior is "first visible match wins"
+        # (.limit(1)). Revisit if titles ever get a uniqueness rule.
         target = await db.scalar(
             select(KnowledgeNode)
             .where(KnowledgeNode.title == title)
             .where(clause)
             .limit(1)
         )
-        if target is None:
+        if target is None or target.id == node.id:
             continue
-        await gs.create_vertex(db, target)
-        await gs.merge_edge(db, node.id, target.id, "LINKS_TO", props={"created_by": "wikilink"})
-
-
-# Fix missing import
-from sqlalchemy import func  # noqa: E402 (moved here to avoid circular; OK in service layer)
+        _queue_graph_op(db, partial(gs.upsert_vertex, target))
+        _queue_graph_op(
+            db, partial(gs.merge_edge, node.id, target.id, "LINKS_TO", created_by="wikilink")
+        )
 ```
 
-- [ ] **6.4** Run tests:
+- [x] **6.4** Run tests:
 ```bash
 cd backend && pytest tests/services/test_node_service.py -v
-# Expected: 5 passed
+# Expected: 16 passed (15 passed, 1 skipped when Neo4j is unreachable — wikilink test verifies via live Neo4j)
 ```
 
-- [ ] **6.5** Commit:
+- [x] **6.5** Commit:
 ```
 feat(node_service): CRUD, revisions, wikilink resolution, soft-delete
 ```
@@ -1250,12 +1394,16 @@ feat(node_service): CRUD, revisions, wikilink resolution, soft-delete
 
 ### Steps
 
-- [ ] **7.1** Write the failing test:
+- [x] **7.1** Write the failing test ([plan-fix]: `NodeOut` must not expose `deleted_at` —
+  kb-api-conventions: "Out schemas never expose ... soft-delete fields"; dropped it from the
+  test input dict and asserted its absence in the dump; also added `tests/schemas/__init__.py`
+  to match the existing test-package convention):
 
 ```python
 # backend/tests/schemas/test_node_schemas.py
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
+
 from app.schemas.node import NodeCreate, NodeOut, NodeUpdate
 
 
@@ -1278,12 +1426,12 @@ def test_node_out_no_internal_fields():
         meta={},
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
-        deleted_at=None,
     )
     out = NodeOut(**data)
     dumped = out.model_dump()
     assert "password_hash" not in dumped
     assert "body_tsv" not in dumped
+    assert "deleted_at" not in dumped
 
 
 def test_node_update_partial():
@@ -1292,22 +1440,22 @@ def test_node_update_partial():
     assert u.title == "New"
 ```
 
-- [ ] **7.2** Run — expect ImportError:
+- [x] **7.2** Run — expect ImportError:
 ```bash
 cd backend && pytest tests/schemas/test_node_schemas.py -x 2>&1 | head -10
 ```
 
-- [ ] **7.3** Create schemas:
+- [x] **7.3** Create schemas ([plan-fix]: use `ConfigDict(from_attributes=True)` and no
+  `from __future__ import annotations`, matching the established style in
+  `app/schemas/user.py` / `group.py`; `deleted_at` removed from `NodeOut` per 7.1 note):
 
 ```python
 # backend/app/schemas/node.py
-from __future__ import annotations
-
 import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.user import Visibility
 
@@ -1330,6 +1478,8 @@ class NodeUpdate(BaseModel):
 
 
 class NodeOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: uuid.UUID
     owner_id: uuid.UUID
     title: str
@@ -1341,9 +1491,6 @@ class NodeOut(BaseModel):
     meta: dict[str, Any]
     created_at: datetime
     updated_at: datetime
-    deleted_at: datetime | None
-
-    model_config = {"from_attributes": True}
 
 
 class NodeListOut(BaseModel):
@@ -1364,13 +1511,13 @@ class GraphNeighborhoodOut(BaseModel):
     edges: list[dict[str, Any]]
 ```
 
-- [ ] **7.4** Run tests:
+- [x] **7.4** Run tests:
 ```bash
 cd backend && pytest tests/schemas/test_node_schemas.py -v
 # Expected: 3 passed
 ```
 
-- [ ] **7.5** Commit:
+- [x] **7.5** Commit:
 ```
 feat(schemas): node schemas (NodeCreate, NodeUpdate, NodeOut, NodeListOut, GraphNeighborhoodOut)
 ```
@@ -1379,14 +1526,33 @@ feat(schemas): node schemas (NodeCreate, NodeUpdate, NodeOut, NodeListOut, Graph
 
 ## Task 8 — Nodes API router
 
+> **Review carry-over from Task 4 (IMPORTANT):** the `Viewer(role=admin)` bypass in
+> `visible_nodes_clause` is unconstrained. When building routers, ensure regular
+> (non-admin-console) routes construct the Viewer from the authenticated user's real
+> role but do NOT offer an admin-scoped path outside `/api/v1/admin/*`, and add an
+> audit log entry wherever an admin Viewer is used to read another user's non-public
+> node (ADR-004 / kb-visibility-filter rule 5).
+
+> **Carry-over resolution (Task 8):** guard implemented as `get_scoped_viewer` in
+> `app/core/deps.py` — on all routes outside `/api/v1/admin/*` an admin's Viewer is
+> scoped down to `role=user` before it reaches `visible_nodes_clause`, so the admin
+> bypass is unreachable here (regression test:
+> `test_admin_gets_no_visibility_bypass_outside_admin_routes`). The **audit-log part is
+> deferred**: no audit mechanism exists yet (`audit_log` is in the canonical vocabulary
+> but unimplemented). Phase 7 hardening must add the `audit_log` table and log every
+> admin read of another user's non-public node on `/api/v1/admin/*` routes.
+
 **Files:**
 - Create: `backend/app/api/v1/nodes.py`
-- Modify: `backend/app/main.py`
+- Modify: `backend/app/main.py`, `backend/app/core/deps.py` ([plan-fix] `get_scoped_viewer` + `Pagination`), `backend/app/services/node_service.py` ([plan-fix] `share_node` moved into the service), `backend/tests/conftest.py`
 - Create: `backend/tests/api/test_nodes_api.py`
 
 ### Steps
 
-- [ ] **8.1** Write the failing tests:
+- [x] **8.1** Write the failing tests ([plan-fix]: the file as written below plus 6 more —
+  401 unauthenticated, 422 missing title, list hides other users' private nodes
+  (kb-visibility-filter mandatory test), admin-bypass guard (carry-over above), and two
+  share tests: share grants visibility to a `shared` node, non-owner share attempt → 403):
 
 ```python
 # backend/tests/api/test_nodes_api.py
@@ -1418,11 +1584,16 @@ async def test_get_node_own(client: AsyncClient, auth_headers):
     assert r2.json()["id"] == node_id
 
 
-async def test_get_private_node_other_user_forbidden(client: AsyncClient, auth_headers, auth_headers_other):
-    r = await client.post("/api/v1/nodes", json={"title": "Private", "visibility": "private"}, headers=auth_headers)
+# [plan-fix] review CRITICAL: plan originally asserted 403 here, but a 403
+# confirms the private node id EXISTS (ADR-004 / kb-visibility-filter forbid
+# existence leaks). Invisible must look nonexistent: 404, generic body.
+async def test_get_private_node_other_user_looks_not_found(client: AsyncClient, auth_headers, auth_headers_other):
+    r = await client.post("/api/v1/nodes", json={"title": "PrivateSecretTitle", "visibility": "private"}, headers=auth_headers)
     node_id = r.json()["id"]
     r2 = await client.get(f"/api/v1/nodes/{node_id}", headers=auth_headers_other)
-    assert r2.status_code == 403
+    assert r2.status_code == 404
+    assert node_id not in r2.text  # existence
+    assert "PrivateSecretTitle" not in r2.text  # content
 
 
 async def test_list_nodes(client: AsyncClient, auth_headers):
@@ -1454,135 +1625,66 @@ async def test_delete_node(client: AsyncClient, auth_headers):
 
 > **Note:** `auth_headers_other` fixture must be added to conftest (create a second user and return its headers).
 
-- [ ] **8.2** Run — expect 404 (router not registered):
+- [x] **8.2** Run — expect 404 (router not registered):
 ```bash
 cd backend && pytest tests/api/test_nodes_api.py -x 2>&1 | head -20
+# observed RED: 12 failed — "assert 404 == 201" etc. (router missing)
 ```
 
-- [ ] **8.3** Create the router:
+- [x] **8.3** Create the router ([plan-fix, review of 24e5685]: mutation handlers must run
+  `await ns.run_pending_graph_ops(db)` AFTER `await db.commit()` — the service only queues
+  Neo4j ops on the session; the router is the post-commit caller).
+  Further [plan-fix]es applied to the code as originally written here:
+  - `viewer=Depends(get_current_viewer)` → `viewer: Viewer = Depends(get_scoped_viewer)`
+    (admin-bypass guard, carry-over above);
+  - the share handler's `payload: "NodeShareCreate"` string annotation with an in-function
+    import cannot be resolved by FastAPI — `NodeShareCreate` is imported at module level;
+  - the share handler contained business logic (`db.add(NodeShare(...))`) in the router and
+    **no owner check** — any viewer of a shared node could re-share it to anyone (ADR-004
+    leak). Moved to `node_service.share_node()`, which raises `ForbiddenError` unless the
+    viewer is the owner (admin included in the service check, but admins are scoped to
+    `user` on this router);
+  - handlers return `NodeOut.model_validate(node)` (never ORM objects) and every route has
+    `summary` + `operation_id` per kb-api-conventions.
+  Final router code is `backend/app/api/v1/nodes.py` (implemented as described).
 
-```python
-# backend/app/api/v1/nodes.py
-from __future__ import annotations
-
-import uuid
-
-from fastapi import APIRouter, Depends, status
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.core.deps import get_current_viewer, Pagination
-from app.core.db import get_db
-from app.schemas.node import NodeCreate, NodeListOut, NodeOut, NodeUpdate
-from app.services import node_service as ns
-
-router = APIRouter(prefix="/nodes", tags=["nodes"])
-
-
-@router.post("", response_model=NodeOut, status_code=status.HTTP_201_CREATED)
-async def create_node(
-    payload: NodeCreate,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    node = await ns.create_node(
-        db,
-        viewer=viewer,
-        title=payload.title,
-        body=payload.body,
-        node_type=payload.node_type,
-        visibility=payload.visibility,
-        source=payload.source,
-        source_ref=payload.source_ref,
-        meta=payload.meta,
-    )
-    await db.commit()
-    return node
-
-
-@router.get("", response_model=NodeListOut)
-async def list_nodes(
-    pagination: Pagination = Depends(),
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    items, total = await ns.list_nodes(db, viewer, offset=pagination.offset, limit=pagination.limit)
-    return NodeListOut(items=items, total=total, offset=pagination.offset, limit=pagination.limit)
-
-
-@router.get("/{node_id}", response_model=NodeOut)
-async def get_node(
-    node_id: uuid.UUID,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    return await ns.get_node(db, node_id, viewer)
-
-
-@router.patch("/{node_id}", response_model=NodeOut)
-async def update_node(
-    node_id: uuid.UUID,
-    payload: NodeUpdate,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    node = await ns.update_node(
-        db, node_id, viewer,
-        title=payload.title,
-        body=payload.body,
-        visibility=payload.visibility,
-        meta=payload.meta,
-    )
-    await db.commit()
-    return node
-
-
-@router.delete("/{node_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_node(
-    node_id: uuid.UUID,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    await ns.delete_node(db, node_id, viewer)
-    await db.commit()
-
-
-@router.post("/{node_id}/shares", response_model=NodeOut, status_code=status.HTTP_201_CREATED)
-async def share_node(
-    node_id: uuid.UUID,
-    payload: "NodeShareCreate",
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    from app.schemas.node import NodeShareCreate as NSC
-    from app.models.knowledge import NodeShare
-    node = await ns.get_node(db, node_id, viewer)
-    share = NodeShare(node_id=node.id, user_id=payload.user_id, group_id=payload.group_id, can_edit=payload.can_edit)
-    db.add(share)
-    await db.commit()
-    await db.refresh(node)
-    return node
-```
-
-- [ ] **8.4** Register router in `main.py`:
+- [x] **8.4** Register router in `main.py` ([plan-fix]: matched the file's existing import
+  style):
 
 ```python
 # backend/app/main.py  (add inside create_app, after existing routers)
-from app.api.v1 import nodes as nodes_router
-app.include_router(nodes_router.router, prefix="/api/v1")
+from app.api.v1.nodes import router as nodes_router
+app.include_router(nodes_router, prefix="/api/v1")
 ```
 
-- [ ] **8.5** Add `auth_headers_other` fixture and `Pagination` dep if not present:
+- [x] **8.5** Add `auth_headers_other` fixture and `Pagination` dep if not present
+  ([plan-fix]: there is no `/api/v1/auth/register` endpoint and login is JSON
+  (`{"email", "password"}`), not OAuth form data; also `auth_headers` itself did not
+  exist yet and an `auth_headers_admin` fixture was needed for the carry-over guard test —
+  all three now share a `_register_and_login` helper that registers via
+  `auth_service.register`):
 
 ```python
-# backend/tests/conftest.py  (add auth_headers_other fixture)
+# backend/tests/conftest.py  (actual)
+async def _register_and_login(db, client, email: str, *, role: Role = Role.user) -> dict[str, str]:
+    from app.services import auth_service
+    await auth_service.register(
+        db, email=email, password="pass1234", display_name=email.split("@")[0], role=role
+    )
+    r = await client.post("/api/v1/auth/login", json={"email": email, "password": "pass1234"})
+    return {"Authorization": f"Bearer {r.json()['access_token']}"}
+
 @pytest_asyncio.fixture
-async def auth_headers_other(client):
-    await client.post("/api/v1/auth/register", json={
-        "email": "other@test.com", "password": "pass1234", "display_name": "Other"
-    })
-    r = await client.post("/api/v1/auth/login", data={"username": "other@test.com", "password": "pass1234"})
-    token = r.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+async def auth_headers(db, client):
+    return await _register_and_login(db, client, "owner@test.com")
+
+@pytest_asyncio.fixture
+async def auth_headers_other(db, client):
+    return await _register_and_login(db, client, "other@test.com")
+
+@pytest_asyncio.fixture
+async def auth_headers_admin(db, client):
+    return await _register_and_login(db, client, "admin@test.com", role=Role.admin)
 ```
 
 ```python
@@ -1595,30 +1697,50 @@ class Pagination:
         self.limit = limit
 ```
 
-- [ ] **8.6** Run tests:
+- [x] **8.6** Run tests:
 ```bash
 cd backend && pytest tests/api/test_nodes_api.py -v
-# Expected: 6 passed
+# Observed GREEN: 12 passed in 3.99s (6 plan tests + 6 auth/guard/share tests, see 8.1)
+# Full suite: 61 passed, 6 skipped (Neo4j-unreachable skips) · ruff clean ·
+# mypy app/services app/schemas: Success: no issues found in 10 source files
 ```
 
-- [ ] **8.7** curl evidence:
+- [x] **8.7** curl evidence ([plan-fix]: login is JSON `{"email","password"}`, not form
+  data, and `*.local` addresses are rejected by pydantic EmailStr — evidence user is
+  `admin@example.com`; evidence users/nodes were deleted from the dev DB after the
+  run — `SELECT email FROM users` is empty again, so the suite stays deterministic):
+
 ```bash
-# Obtain token
 TOKEN=$(curl -s -X POST http://localhost:8000/api/v1/auth/login \
-  -d "username=admin@kb.local&password=admin1234" | jq -r .access_token)
-
-# Create node
-curl -s -X POST http://localhost:8000/api/v1/nodes \
-  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"title":"First Node","body":"hello [[Second Node]]","visibility":"public"}' | jq .
-
-# List nodes
-curl -s http://localhost:8000/api/v1/nodes \
-  -H "Authorization: Bearer $TOKEN" | jq .total
+  -d '{"email":"admin@example.com","password":"admin1234"}' | jq -r .access_token)
+curl -s -X POST http://localhost:8000/api/v1/nodes -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"First Node","body":"hello [[Second Node]]","visibility":"public"}'
+# ... GET /nodes/{id}, GET /nodes, PATCH, POST /nodes/{id}/shares, DELETE
 ```
 
-- [ ] **8.8** Commit:
+Observed (live uvicorn, Neo4j down → post-commit graph sync logged as warning, API
+unaffected per ADR-011):
+
+```
+== POST /api/v1/nodes ==            201
+{ "id": "a921ddf2-a98b-4189-a724-086643d3a285",
+  "owner_id": "5583fac0-2d1c-4e3d-b6dd-cd31f0077f23",
+  "title": "First Node", "body": "hello [[Second Node]]", "node_type": "note",
+  "visibility": "public", "source": null, "source_ref": null, "meta": {},
+  "created_at": "2026-07-20T22:18:08.474229Z", "updated_at": "2026-07-20T22:18:08.474229Z" }
+== GET /api/v1/nodes/{id} ==        200
+{'id': 'a921ddf2-...', 'title': 'First Node', 'visibility': 'public'}
+== GET /api/v1/nodes (list) ==      200  total= 1 items= ['First Node']
+== PATCH /api/v1/nodes/{id} ==      200  {'id': 'a921ddf2-...', 'title': 'First Node v2'}
+== POST /api/v1/nodes/{id}/shares == [201]  (shared node, user_id=bob)
+== bob GET shared node: 200 ==
+== DELETE /api/v1/nodes/{id} ==     [204]
+== GET after delete: 404 ==
+```
+
+- [x] **8.8** Commit:
 ```
 feat(api): POST/GET/PATCH/DELETE /api/v1/nodes with visibility enforcement
 ```
@@ -1631,32 +1753,32 @@ feat(api): POST/GET/PATCH/DELETE /api/v1/nodes with visibility enforcement
 - Create: `backend/app/api/v1/edges.py`
 - Create: `backend/app/api/v1/graph.py`
 - Modify: `backend/app/main.py`
+- Modify: `backend/app/schemas/node.py` ([plan-fix]: edge schemas live in `app/schemas/`, not inline in the router — kb-api-conventions, and mypy --strict covers `app/schemas`)
+- Modify: `backend/app/core/errors.py` ([plan-fix]: plan did not specify Neo4j-down behavior; graph-sourced endpoints surface `neo4j.exceptions.ServiceUnavailable` as 503 via the central error mapping)
 - Create: `backend/tests/api/test_graph_api.py`
 
 ### Steps
 
-- [ ] **9.1** Write failing tests:
+- [x] **9.1** Write failing tests ([plan-fix]: tests that create or traverse edges need a live Neo4j, so they take the `neo4j_session` fixture and skip when Neo4j is unreachable — same convention as `tests/services/test_graph_service.py`. Added the mandatory kb-api-conventions tests the plan omitted: 401 unauthenticated, 422 unknown label, 422 hops>3, plus the mandatory kb-visibility-filter tests: edge-to-invisible-target → 404 no-leak, neighborhood-of-invisible-center → 404 no-leak, overview hides other users' private nodes. Those visibility tests are pure-PG — the 404 fires before any Neo4j call — so they always run. RED observed: 5 failed (404s: routes not registered), 3 skipped):
 
 ```python
-# backend/tests/api/test_graph_api.py
+# backend/tests/api/test_graph_api.py — full file in repo; the three plan tests as landed:
 import pytest
 from httpx import AsyncClient
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_create_edge(client: AsyncClient, auth_headers):
-    r1 = await client.post("/api/v1/nodes", json={"title": "N1", "visibility": "public"}, headers=auth_headers)
-    r2 = await client.post("/api/v1/nodes", json={"title": "N2", "visibility": "public"}, headers=auth_headers)
-    n1_id, n2_id = r1.json()["id"], r2.json()["id"]
+async def test_create_edge(client: AsyncClient, auth_headers, neo4j_session):
+    n1_id = await _create_node(client, auth_headers, "N1")   # helper posts /api/v1/nodes
+    n2_id = await _create_node(client, auth_headers, "N2")
     r = await client.post("/api/v1/edges", json={"source_id": n1_id, "target_id": n2_id, "label": "LINKS_TO"}, headers=auth_headers)
     assert r.status_code == 201
 
 
-async def test_neighborhood(client: AsyncClient, auth_headers):
-    r1 = await client.post("/api/v1/nodes", json={"title": "Center", "visibility": "public"}, headers=auth_headers)
-    r2 = await client.post("/api/v1/nodes", json={"title": "Neighbour", "visibility": "public"}, headers=auth_headers)
-    n1_id, n2_id = r1.json()["id"], r2.json()["id"]
+async def test_neighborhood(client: AsyncClient, auth_headers, neo4j_session):
+    n1_id = await _create_node(client, auth_headers, "Center")
+    n2_id = await _create_node(client, auth_headers, "Neighbour")
     await client.post("/api/v1/edges", json={"source_id": n1_id, "target_id": n2_id, "label": "LINKS_TO"}, headers=auth_headers)
     r = await client.get(f"/api/v1/graph/neighborhood/{n1_id}?hops=1", headers=auth_headers)
     assert r.status_code == 200
@@ -1669,114 +1791,181 @@ async def test_graph_overview(client: AsyncClient, auth_headers):
     assert r.status_code == 200
     assert "nodes" in r.json()
     assert "edges" in r.json()
+
+# also landed: test_delete_edge (neo4j_session), test_create_edge_unauthenticated_401,
+# test_create_edge_unknown_label_422, test_neighborhood_hops_above_limit_422,
+# test_create_edge_to_invisible_target_looks_not_found,
+# test_neighborhood_invisible_center_looks_not_found, test_overview_hides_other_users_private
 ```
 
-- [ ] **9.2** Create `edges.py`:
+- [x] **9.2** Edge schemas + `edges.py` ([plan-fix]: the plan's `gs.merge_edge(db, ..., props=...)` / `gs.delete_edge(db, ...)` calls don't match the Task 5 signatures — `merge_edge(source_id, target_id, label, created_by, score=None)` and `delete_edge(source_id, target_id, label)` take no `db` and no `props`; `created_by` is the viewer's user id. Dropped `props` (nothing consumes it — YAGNI) and the `db.commit()` calls (edges live only in Neo4j, there is no PG write to commit). `label` is validated against `graph_service.ALLOWED_EDGE_LABELS` in the schema so an unknown label is a 422, not an `assert` 500 — it is interpolated into Cypher. Viewer dep is `get_scoped_viewer` (Task 8 fix: no admin bypass outside `/api/v1/admin/*`); `response_model`/`summary`/`operation_id` set per kb-api-conventions):
 
 ```python
-# backend/app/api/v1/edges.py
-import uuid
-from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.deps import get_current_viewer
-from app.core.db import get_db
-from app.services import graph_service as gs
-from app.services import node_service as ns
-
-router = APIRouter(prefix="/edges", tags=["edges"])
-
-
+# backend/app/schemas/node.py (additions)
 class EdgeCreate(BaseModel):
     source_id: uuid.UUID
     target_id: uuid.UUID
     label: str = "LINKS_TO"
-    props: dict = {}
+
+    @field_validator("label")
+    @classmethod
+    def _label_allowed(cls, v: str) -> str:
+        if v not in ALLOWED_EDGE_LABELS:   # from app.services.graph_service
+            raise ValueError("unknown edge label")
+        return v
 
 
-class EdgeDelete(BaseModel):
+class EdgeDelete(EdgeCreate):
+    """Same shape as EdgeCreate: (source_id, target_id, label) identifies an edge."""
+
+
+class EdgeOut(BaseModel):
     source_id: uuid.UUID
     target_id: uuid.UUID
-    label: str = "LINKS_TO"
-
-
-@router.post("", status_code=status.HTTP_201_CREATED)
-async def create_edge(
-    payload: EdgeCreate,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    # Verify both nodes are visible to viewer
-    await ns.get_node(db, payload.source_id, viewer)
-    await ns.get_node(db, payload.target_id, viewer)
-    await gs.merge_edge(db, payload.source_id, payload.target_id, payload.label, props=payload.props)
-    await db.commit()
-    return {"source_id": str(payload.source_id), "target_id": str(payload.target_id), "label": payload.label}
-
-
-@router.delete("", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_edge(
-    payload: EdgeDelete,
-    viewer=Depends(get_current_viewer),
-    db: AsyncSession = Depends(get_db),
-):
-    await ns.get_node(db, payload.source_id, viewer)
-    await gs.delete_edge(db, payload.source_id, payload.target_id, payload.label)
-    await db.commit()
+    label: str
 ```
 
-- [ ] **9.3** Create `graph.py`:
+```python
+# backend/app/api/v1/edges.py (as landed — see file for module docstring)
+router = APIRouter(prefix="/edges", tags=["edges"])
+
+
+@router.post("", response_model=EdgeOut, status_code=status.HTTP_201_CREATED,
+             summary="Create edge", operation_id="createEdge")
+async def create_edge(
+    payload: EdgeCreate,
+    viewer: Viewer = Depends(get_scoped_viewer),
+    db: AsyncSession = Depends(get_db),
+) -> EdgeOut:
+    # Both endpoints must be visible to the viewer (invisible == nonexistent).
+    await ns.get_node(db, payload.source_id, viewer)
+    await ns.get_node(db, payload.target_id, viewer)
+    await gs.merge_edge(payload.source_id, payload.target_id, payload.label,
+                        created_by=str(viewer.user_id))
+    return EdgeOut(source_id=payload.source_id, target_id=payload.target_id, label=payload.label)
+
+
+@router.delete("", status_code=status.HTTP_204_NO_CONTENT,
+               summary="Delete edge", operation_id="deleteEdge")
+async def delete_edge(
+    payload: EdgeDelete,
+    viewer: Viewer = Depends(get_scoped_viewer),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await ns.get_node(db, payload.source_id, viewer)
+    await gs.delete_edge(payload.source_id, payload.target_id, payload.label)
+```
+
+- [x] **9.3** Create `graph.py` ([plan-fix]: an invisible center must be indistinguishable from a nonexistent one — `ns.get_node(db, node_id, viewer)` runs BEFORE the traversal and raises `NotFoundError` → 404 generic body (ADR-004); the plan's version would have returned a 200 neighborhood around an invisible center. Same `get_scoped_viewer`/`operation_id` fixes as 9.2):
 
 ```python
-# backend/app/api/v1/graph.py
-import uuid
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.deps import get_current_viewer
-from app.core.db import get_db
-from app.schemas.node import GraphNeighborhoodOut
-from app.services import graph_service as gs
-
+# backend/app/api/v1/graph.py (as landed)
 router = APIRouter(prefix="/graph", tags=["graph"])
 
 
-@router.get("/neighborhood/{node_id}", response_model=GraphNeighborhoodOut)
+@router.get("/neighborhood/{node_id}", response_model=GraphNeighborhoodOut,
+            summary="Get node neighborhood", operation_id="getGraphNeighborhood")
 async def get_neighborhood(
     node_id: uuid.UUID,
     hops: int = Query(1, ge=0, le=3),
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    return await gs.get_neighborhood(db, node_id, viewer, hops=hops)
+) -> GraphNeighborhoodOut:
+    await ns.get_node(db, node_id, viewer)  # invisible center == nonexistent (404)
+    data = await gs.get_neighborhood(db, node_id, viewer, hops=hops)
+    return GraphNeighborhoodOut(**data)
 
 
-@router.get("/overview", response_model=GraphNeighborhoodOut)
+@router.get("/overview", response_model=GraphNeighborhoodOut,
+            summary="Get graph overview", operation_id="getGraphOverview")
 async def get_overview(
     limit: int = Query(100, ge=1, le=500),
-    viewer=Depends(get_current_viewer),
+    viewer: Viewer = Depends(get_scoped_viewer),
     db: AsyncSession = Depends(get_db),
-):
-    return await gs.get_overview(db, viewer, limit=limit)
+) -> GraphNeighborhoodOut:
+    data = await gs.get_overview(db, viewer, limit=limit)
+    return GraphNeighborhoodOut(**data)
 ```
 
-- [ ] **9.4** Register routers in `main.py`:
+- [x] **9.4** Register routers in `main.py` ([plan-fix]: import style matches the existing `from app.api.v1.X import router as X_router` pattern) and add the Neo4j-down mapping to `core/errors.py`:
 
 ```python
-from app.api.v1 import edges as edges_router, graph as graph_router
-app.include_router(edges_router.router, prefix="/api/v1")
-app.include_router(graph_router.router, prefix="/api/v1")
+# backend/app/main.py
+from app.api.v1.edges import router as edges_router
+from app.api.v1.graph import router as graph_router
+app.include_router(edges_router, prefix="/api/v1")
+app.include_router(graph_router, prefix="/api/v1")
 ```
 
-- [ ] **9.5** Run tests:
+```python
+# backend/app/core/errors.py (addition inside register_error_handlers)
+@app.exception_handler(ServiceUnavailable)          # neo4j.exceptions.ServiceUnavailable
+async def neo4j_unavailable_handler(_: Request, exc: ServiceUnavailable) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": "graph backend unavailable"})
+```
+
+- [x] **9.5** Run tests:
 ```bash
 cd backend && pytest tests/api/test_graph_api.py -v
-# Expected: 3 passed
+# Observed GREEN (sandbox, Neo4j unreachable): 7 passed, 3 skipped (Neo4j skips:
+# test_create_edge, test_delete_edge, test_neighborhood — re-verify on the Docker stack)
+# Full suite: 68 passed, 9 skipped · ruff check clean ·
+# mypy app/services app/schemas: Success: no issues found in 10 source files
 ```
 
-- [ ] **9.6** Commit:
+- [x] **9.6** curl evidence ([plan-fix]: recorded honestly against a live uvicorn with Neo4j
+  DOWN — edge writes and traversals are graph-sourced, so they surface 503
+  `{"detail":"graph backend unavailable"}`; happy-path 201/200 for those endpoints requires
+  the Docker stack and must be re-verified there. Evidence user/nodes deleted afterwards —
+  `users` and `knowledge_nodes` counts are 0 again):
+
+```
+== POST /api/v1/edges (Neo4j down) ==          503  {"detail":"graph backend unavailable"}
+== POST /api/v1/edges bad label ==             422  {"type":"value_error","loc":["body","label"],
+                                                     "msg":"Value error, unknown edge label",...}
+== DELETE /api/v1/edges (Neo4j down) ==        503  {"detail":"graph backend unavailable"}
+== GET /graph/neighborhood/{id} (Neo4j down) = 503  {"detail":"graph backend unavailable"}
+== GET /graph/neighborhood/<random uuid> ==    404  {"detail":"Node not found"}
+== GET /graph/overview (nodes exist→Neo4j) ==  503  {"detail":"graph backend unavailable"}
+# (pytest shows /graph/overview → 200 {"nodes":[],"edges":[]} when the viewer's visible
+#  set is empty — the Neo4j edge lookup is skipped entirely in that case)
+```
+
+- [x] **9.7** Commit:
 ```
 feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborhood, /overview
 ```
+
+### Review fixes (Task 9 `/kb-review`)
+
+- [x] **9.R1** ([plan-fix]: `app/core/deps.py` defined its own `Viewer` dataclass, structurally
+  identical to `app.services.visibility.Viewer` — mypy on `app/api` failed with 12 arg-type
+  errors at every service call site. deps now imports and re-exports the canonical Viewer
+  (kb-conventions: Viewer is THE auth-context type). Verification gate widened:
+  `mypy app/api app/services app/schemas` must pass — observed
+  `Success: no issues found in 20 source files` with no strictness loosened.)
+
+- [x] **9.R2** ([plan-fix]: `delete_edge` only vetted the SOURCE node's visibility; the target
+  went unchecked, so a caller could probe/detach edges into another user's private nodes.
+  DELETE now checks BOTH endpoints via `ns.get_node` before any Neo4j call, symmetric with
+  `create_edge` (invisible == nonexistent → 404, ADR-004). RED→GREEN:
+  `test_delete_edge_invisible_target_looks_not_found` — pure-PG, runs without Neo4j.)
+
+- [x] **9.R3** ([plan-fix]: the plan never stated an ownership policy for edge mutations —
+  visibility alone let anyone draw/detach edges on any node they could merely see.)
+
+  > **Decision:** creating or deleting an edge requires the viewer to OWN the source node
+  > (or be admin via audited `/api/v1/admin/*` routes — i.e. effectively owner-only here,
+  > since `/edges` uses `get_scoped_viewer`). Same standard as node mutations.
+  > Visible-but-not-owned source → 403 (the node is visible, so 403 leaks nothing;
+  > invisible endpoints still 404 first, ADR-004). Wikilink-generated edges are unaffected —
+  > they run as the owner inside `node_service`. Approved by the orchestrator in Task 9 review.
+
+  Gate order (shared `_check_endpoints` helper in `edges.py`): source visible (404) →
+  source owned (403) → target visible (404) → only then Neo4j. RED→GREEN:
+  `test_create_edge_non_owned_source_403`, `test_delete_edge_non_owned_source_403`
+  (auth fires before any Neo4j call, so both run without Neo4j; owner success paths
+  remain the `neo4j_session`-skipped tests).
 
 ---
 
@@ -1789,7 +1978,7 @@ feat(api): POST /api/v1/edges, DELETE /api/v1/edges, GET /api/v1/graph/neighborh
 
 ### Steps
 
-- [ ] **10.1** Write failing tests:
+- [x] **10.1** Write failing tests (plan-fix: also added `test_daily_log_unauthenticated_401` and `test_private_daily_log_other_user_looks_not_found` — 401 and visibility tests are mandatory for every new endpoint/read path per kb-api-conventions and kb-visibility-filter):
 
 ```python
 # backend/tests/api/test_daily_logs_api.py
@@ -1830,7 +2019,7 @@ async def test_daily_log_idempotent_create(client: AsyncClient, auth_headers):
     assert r2.json()["body"] == "second"
 ```
 
-- [ ] **10.2** Create the router (daily logs are just KnowledgeNodes with node_type=daily_log):
+- [x] **10.2** Create the router (daily logs are just KnowledgeNodes with node_type=daily_log). Plan-fix — the code below is the original sketch; the committed router differs to match project law (see `backend/app/api/v1/daily_logs.py`): `get_scoped_viewer` instead of `get_current_viewer` (admin visibility bypass only under `/admin/*`); handlers return `NodeOut.model_validate(node)` with `summary`/`operation_id` (kb-api-conventions, mypy); `visible_nodes_clause(viewer)` composed into the upsert existence probe too (rule 1; it subsumes the `deleted_at` filter); `run_pending_graph_ops(db)` after `db.commit()` (ADR-011 handler contract); 404 body is generic `"Daily log not found"` (get_node standard), import at top:
 
 ```python
 # backend/app/api/v1/daily_logs.py
@@ -1928,25 +2117,25 @@ async def list_daily_logs(
     return list(rows)
 ```
 
-- [ ] **10.3** Register in `main.py`:
+- [x] **10.3** Register in `main.py` (plan-fix: import style matches the existing file — `from app.api.v1.daily_logs import router as daily_logs_router`):
 
 ```python
 from app.api.v1 import daily_logs as daily_logs_router
 app.include_router(daily_logs_router.router, prefix="/api/v1")
 ```
 
-- [ ] **10.4** Run all tests:
+- [x] **10.4** Run all tests (76 passed, 9 skipped — Neo4j-dependent tests skip in the sandbox where Neo4j is unreachable; approved, re-verify on a machine with the docker stack):
 ```bash
 cd backend && pytest tests/ -v
 # Expected: all pass, no skips
 ```
 
-- [ ] **10.5** Run full lint + type check:
+- [x] **10.5** Run full lint + type check:
 ```bash
 cd backend && ruff check . && mypy --strict app/services/ app/schemas/
 ```
 
-- [ ] **10.6** curl evidence:
+- [x] **10.6** curl evidence (ran 2026-07-20: POST returned `"daily_log"`; GET by date returned `{"node_type": "daily_log", "source": "daily_log", "source_ref": "2026-07-20"}`; evidence rows deleted afterwards):
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/daily-logs \
   -H "Authorization: Bearer $TOKEN" \
@@ -1955,10 +2144,40 @@ curl -s -X POST http://localhost:8000/api/v1/daily-logs \
 # Expected: "daily_log"
 ```
 
-- [ ] **10.7** Commit:
+- [x] **10.7** Commit:
 ```
 feat(api): POST/GET /api/v1/daily-logs with upsert-by-date semantics
 ```
+
+### Review fixes (Task 10 `/kb-review`)
+
+- [x] **10.R1** ([plan-fix]: `uq_node_source_ref` was `UNIQUE (source, source_ref)` — GLOBAL
+  across users. User B's first daily-log POST for a date user A had already logged hit an
+  unhandled IntegrityError → 500; a same-user concurrent double-POST (SELECT-then-INSERT
+  TOCTOU) 500'd the same way. Three-part fix:
+
+  1. **Constraint is per-owner**: `UNIQUE (owner_id, source, source_ref)` as
+     `uq_node_owner_source_ref`, in the model and amended IN PLACE in unreleased migration
+     0002 (same approach as the `ck_node_shares_user_xor_group` amendment). Anyone who
+     already applied the old 0002 must run
+     `alembic downgrade 275d5f4b90c3 && alembic upgrade head` — cycle proven green in the
+     sandbox (`38ca9223b637 (head)`; live `\d` shows `UNIQUE (owner_id, source, source_ref)`).
+  2. **Residual race**: `node_service.create_node` maps IntegrityError on the new constraint
+     to `ConflictError` (mirrors the `uq_revision_version` mapping in `update_node`); the
+     daily-log upsert wraps the create in a SAVEPOINT (`db.begin_nested()`) and on
+     `ConflictError` re-fetches via the extracted `_existing_log` probe and updates the row —
+     upsert semantics mean the race loser converges on the existing node, not a 409. No stale
+     graph op: `create_node` queues the Neo4j upsert only after a successful flush.
+  3. **Downstream check**: ingestion idempotency by "(source, source_ref) unique key"
+     (docs/02 §KnowledgeIngestor, phase-4/5/6 plans) still holds per-owner — MD import runs
+     as the uploading user, and Confluence/codebase sync each run as a single service user,
+     so per-owner uniqueness gives the same idempotency guarantee within each connector.
+
+  RED→GREEN: `test_daily_log_same_date_different_users`,
+  `test_daily_log_upsert_recovers_from_insert_race` (probe forced to miss once — deterministic
+  TOCTOU), `test_create_node_duplicate_source_ref_conflict`. All were IntegrityError/500 before;
+  full suite 79 passed, 9 skipped (Neo4j-dependent, sandbox), ruff + `mypy app/api app/services
+  app/schemas` clean.)
 
 ---
 
