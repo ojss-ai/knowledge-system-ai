@@ -61,8 +61,13 @@ GraphOp = Callable[[], Coroutine[Any, Any, None]]
 _PENDING_KEY = "pending_graph_ops"
 
 
-def _queue_graph_op(db: AsyncSession, op: GraphOp) -> None:
-    """Queue a Neo4j op to run after the PG commit — never inside it (ADR-011)."""
+def queue_graph_op(db: AsyncSession, op: GraphOp) -> None:
+    """Queue a Neo4j op to run after the PG commit — never inside it (ADR-011).
+
+    Public: ingest services (app/services/ingest/) queue their edge MERGEs
+    through the same session mechanism, so run_pending_graph_ops() drains
+    node and ingest ops together, in order.
+    """
     db.info.setdefault(_PENDING_KEY, []).append(op)
 
 
@@ -122,7 +127,7 @@ async def create_node(
         raise
     # Neo4j vertex upsert runs AFTER db.commit(): queued here, executed by the
     # caller via run_pending_graph_ops(db) (module docstring, kb-neo4j-graph).
-    _queue_graph_op(db, partial(gs.upsert_vertex, node))
+    queue_graph_op(db, partial(gs.upsert_vertex, node))
     return node
 
 
@@ -211,7 +216,7 @@ async def update_node(
         if "uq_revision_version" in str(exc.orig):
             raise ConflictError(f"Concurrent revision conflict for node {node_id}") from exc
         raise
-    _queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
+    queue_graph_op(db, partial(gs.upsert_vertex, node))  # vertex props, post-commit
     return node
 
 
@@ -221,7 +226,7 @@ async def delete_node(db: AsyncSession, node_id: uuid.UUID, viewer: Viewer) -> N
         raise ForbiddenError("Only owner or admin can delete a node")
     node.deleted_at = datetime.now(UTC)
     await db.flush()
-    _queue_graph_op(db, partial(gs.soft_delete_vertex, node_id))
+    queue_graph_op(db, partial(gs.soft_delete_vertex, node_id))
 
 
 async def share_node(
@@ -257,7 +262,7 @@ async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewe
         return
 
     # Ensure source vertex exists (queued: runs post-commit, before the edges)
-    _queue_graph_op(db, partial(gs.upsert_vertex, node))
+    queue_graph_op(db, partial(gs.upsert_vertex, node))
 
     clause = visible_nodes_clause(viewer)
     for title in set(titles):
@@ -270,7 +275,7 @@ async def resolve_wikilinks(db: AsyncSession, node: KnowledgeNode, viewer: Viewe
         )
         if target is None or target.id == node.id:
             continue
-        _queue_graph_op(db, partial(gs.upsert_vertex, target))
-        _queue_graph_op(
+        queue_graph_op(db, partial(gs.upsert_vertex, target))
+        queue_graph_op(
             db, partial(gs.merge_edge, node.id, target.id, "LINKS_TO", created_by="wikilink")
         )

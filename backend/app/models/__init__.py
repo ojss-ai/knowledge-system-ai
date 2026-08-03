@@ -1,5 +1,6 @@
 from app.models.chunk import NodeChunk
 from app.models.group import Group, GroupMember, GroupRole
+from app.models.ingest import ApiToken, IngestionRun, RunStatus
 from app.models.knowledge import (
     KnowledgeNode,
     NodeRevision,
@@ -11,9 +12,11 @@ from app.models.knowledge import (
 from app.models.user import Role, User, Visibility
 
 __all__ = [
+    "ApiToken",
     "Group",
     "GroupMember",
     "GroupRole",
+    "IngestionRun",
     "KnowledgeNode",
     "NodeChunk",
     "NodeRevision",
@@ -21,6 +24,7 @@ __all__ = [
     "NodeTag",
     "NodeType",
     "Role",
+    "RunStatus",
     "Tag",
     "User",
     "Visibility",
