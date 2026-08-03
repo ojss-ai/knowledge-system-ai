@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret"
     jwt_access_ttl_seconds: int = 900
     jwt_refresh_ttl_seconds: int = 604800
+    embedding_backend: str = "sentence_transformers"  # fake | sentence_transformers | ollama
+    embedding_model: str = "sentence-transformers/all-MiniLM-L12-v2"
 
 
 settings = Settings()

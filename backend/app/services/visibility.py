@@ -24,6 +24,23 @@ class Viewer:
     group_ids: frozenset[uuid.UUID]
 
 
+SYSTEM_VIEWER = Viewer(
+    user_id=uuid.UUID(int=0),  # sentinel: never matches a real user's id
+    role=Role.admin,
+    group_ids=frozenset(),
+)
+"""Audited identity for system background jobs (kb-visibility-filter rule 1).
+
+System jobs (embedding, autolink seeding, graph consistency) must read every
+LIVE node regardless of ownership. Instead of bypassing the filter with a raw
+select, they pass SYSTEM_VIEWER through visible_nodes_clause(), which keeps
+this module the single choke point: soft-deleted rows stay excluded, and every
+system read path is greppable/auditable via this name. Each use site must carry
+a justification comment; never hand SYSTEM_VIEWER to a user-facing read path —
+workers acting on behalf of a user pass that user's Viewer.
+"""
+
+
 def visible_nodes_clause(viewer: Viewer) -> ColumnElement[bool]:
     """
     Return a SQLAlchemy WHERE clause that limits results to nodes visible

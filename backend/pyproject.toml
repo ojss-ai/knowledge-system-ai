@@ -13,8 +13,10 @@ dependencies = [
   "argon2-cffi>=23.1",
   "pyjwt>=2.8",
   "structlog>=24.1",
+  "pgvector>=0.2.5",
   "redis>=5.0",
   "neo4j>=5.20",
+  "celery>=5.4",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +39,14 @@ extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "f
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sentence_transformers.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

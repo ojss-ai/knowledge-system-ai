@@ -12,6 +12,7 @@ from app.core.db import get_db
 from app.core.neo4j import ensure_constraints, get_driver
 from app.main import create_app
 from app.models.user import Role, User, Visibility
+from app.services.embedding_service import FakeEmbedder
 
 TEST_DB_URL = settings.database_url  # same dockerized PG; tests roll back
 
@@ -25,6 +26,20 @@ def _neo4j_available() -> bool:
             return True
     except OSError:
         return False
+
+
+@pytest.fixture(autouse=True)
+def _fake_embedding_backend(monkeypatch):
+    """[plan-fix, Task 8.1]: the API search path calls get_embedder(), which reads
+    settings.embedding_backend at call time; the default would lazy-load the real
+    sentence-transformers model inside unit tests (kb-tdd-workflow: real model is
+    integration-only). Force the fake backend for every test."""
+    monkeypatch.setattr(settings, "embedding_backend", "fake")
+
+
+@pytest.fixture
+def fake_embedder():
+    return FakeEmbedder()
 
 
 @pytest.fixture

@@ -10,6 +10,7 @@ from app.api.v1.daily_logs import router as daily_logs_router
 from app.api.v1.edges import router as edges_router
 from app.api.v1.graph import router as graph_router
 from app.api.v1.nodes import router as nodes_router
+from app.api.v1.search import router as search_router
 from app.api.v1.users import router as users_router
 from app.core.errors import register_error_handlers
 from app.core.neo4j import close_driver, ensure_constraints
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     app.include_router(users_router, prefix="/api/v1")
     app.include_router(nodes_router, prefix="/api/v1")
     app.include_router(daily_logs_router, prefix="/api/v1")
+    app.include_router(search_router, prefix="/api/v1")
     app.include_router(edges_router, prefix="/api/v1")
     app.include_router(graph_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")

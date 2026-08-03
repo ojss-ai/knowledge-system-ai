@@ -1,3 +1,4 @@
+from app.models.chunk import NodeChunk
 from app.models.group import Group, GroupMember, GroupRole
 from app.models.knowledge import (
     KnowledgeNode,
@@ -14,6 +15,7 @@ __all__ = [
     "GroupMember",
     "GroupRole",
     "KnowledgeNode",
+    "NodeChunk",
     "NodeRevision",
     "NodeShare",
     "NodeTag",

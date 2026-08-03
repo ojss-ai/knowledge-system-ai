@@ -1,9 +1,16 @@
+import uuid
+
 import pytest
 from sqlalchemy import select
 
 from app.models.knowledge import KnowledgeNode
 from app.models.user import Role, Visibility
-from app.services.visibility import Viewer, shared_node_ids, visible_nodes_clause
+from app.services.visibility import (
+    SYSTEM_VIEWER,
+    Viewer,
+    shared_node_ids,
+    visible_nodes_clause,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -153,6 +160,30 @@ async def test_admin_sees_all(db, make_user, make_node):
     result = await db.scalars(select(KnowledgeNode).where(clause))
     ids = {r.id for r in result}
     assert node.id in ids, "Admin must see all nodes"
+
+
+async def test_system_viewer_is_audited_admin_sentinel():
+    """SYSTEM_VIEWER: explicit, audited identity for system jobs (kb-visibility-filter rule 1)."""
+    assert SYSTEM_VIEWER.role == Role.admin
+    assert SYSTEM_VIEWER.user_id == uuid.UUID(int=0), "sentinel id must never match a real user"
+    assert SYSTEM_VIEWER.group_ids == frozenset()
+
+
+async def test_system_viewer_sees_private_but_not_deleted(db, make_user, make_node):
+    from datetime import UTC, datetime
+
+    owner = await make_user(email="v_sys@test.com")
+    private_node = await make_node(owner, visibility=Visibility.private)
+    deleted_node = await make_node(owner, visibility=Visibility.public)
+    deleted_node.deleted_at = datetime.now(UTC)
+    await db.flush()
+
+    ids = {
+        r.id
+        for r in await db.scalars(select(KnowledgeNode).where(visible_nodes_clause(SYSTEM_VIEWER)))
+    }
+    assert private_node.id in ids, "System jobs must reach private live nodes"
+    assert deleted_node.id not in ids, "System jobs must never see soft-deleted nodes"
 
 
 async def test_deleted_nodes_excluded(db, make_user, make_node):
